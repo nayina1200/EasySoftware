@@ -627,7 +627,7 @@ $inputBox.Add_TextChanged({ Update-ExportAvailability })
 $codeCommentButton.Add_Click({
     $value = $inputBox.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($value) -or -not (Test-Path -LiteralPath $value)) {
-        [System.Windows.Forms.MessageBox]::Show("请先选择 RAR 压缩包或包含 RAR 的文件夹。", "EasySoftware", "OK", "Warning") | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("请先选择 RAR 压缩包、包含 RAR 的文件夹，或已解压的代码材料文件夹。", "EasySoftware", "OK", "Warning") | Out-Null
         return
     }
     $script:batchRoot = (Get-Item -LiteralPath $value).FullName

@@ -498,7 +498,14 @@ def discover_archives(source: Path) -> list[Path]:
         if source.suffix.casefold() != ".rar":
             raise ValueError("代码注释清理阶段当前只接受 RAR")
         return [source]
-    return sorted((path for path in source.rglob("*.rar") if "_已处理_" not in str(path)), key=lambda p: str(p).casefold())
+    rars = sorted((path for path in source.rglob("*.rar") if "_已处理_" not in str(path)), key=lambda p: str(p).casefold())
+    if rars:
+        return rars
+    # 文件夹没有 RAR 时，直接处理其中的已解压代码材料（无需解压）。
+    docx_files, pdf_files = _code_files(source)
+    if docx_files or pdf_files:
+        return [source]
+    return []
 
 
 def _write_report(path: Path, report: dict) -> None:
@@ -607,7 +614,7 @@ def run(
 ) -> dict:
     archives = discover_archives(source.resolve())
     if not archives:
-        raise ValueError("未找到 RAR 压缩包")
+        raise ValueError("未找到 RAR 压缩包，且所选文件夹内也没有可直接处理的代码材料（名称以“代码.docx”或“代码.pdf”结尾的文件）")
     report = {"version": RULE_VERSION, "created_at": datetime.now().astimezone().isoformat(), "source": str(source.resolve()), "applied": apply, "archives": []}
     prepared = []
     failures = 0
@@ -616,7 +623,7 @@ def run(
     for archive in archives:
         archive_row = {"archive": str(archive), "status": "READY", "documents": [], "output": None}
         try:
-            extracted = extract_cached(archive, work, app_root)
+            extracted = archive if archive.is_dir() else extract_cached(archive, work, app_root)
             root = material_root(extracted)
             archive_row["documents"] = _document_rows(root, inspect=False)
             prepared.append((archive, archive_row, root))
@@ -644,10 +651,11 @@ def run(
         try:
             if apply:
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                output = archive.parent / f"{archive.stem}_已处理_{stamp}"
+                output_base = archive.name if archive.is_dir() else archive.stem
+                output = archive.parent / f"{output_base}_已处理_{stamp}"
                 suffix = 2
                 while output.exists():
-                    output = archive.parent / f"{archive.stem}_已处理_{stamp}_{suffix}"
+                    output = archive.parent / f"{output_base}_已处理_{stamp}_{suffix}"
                     suffix += 1
                 shutil.copytree(root, output)
                 applied_documents = []

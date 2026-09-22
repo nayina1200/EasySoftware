@@ -47,7 +47,7 @@ python scripts\unified_workflow.py "C:\材料\批次.rar" --clean-code-comments
 python scripts\unified_workflow.py "C:\材料\批次.rar" --apply-comment-cleanup
 ```
 
-也可在主窗口选择 RAR 或文件夹后，点击“清理代码中文注释”。程序只删除“代码.docx”中含汉字的真实注释，保护字符串、模板字符串、正则、HTML 页面文字和 Python 三引号内容。不确定项保留在文档中并列入报告。输出为同级的“原名_已处理_时间戳”目录，原 RAR 不移动、不修改；本阶段不重新压缩。清理后先修改 DOCX，再用 Word 优先、LibreOffice 兜底重新生成同名 PDF，只有新 PDF 验证有效后才替换输出副本中的旧 PDF。
+也可在主窗口选择 RAR、文件夹或已解压的材料目录后，点击“清理代码中文注释”。输入为压缩包时只接受 RAR；输入为文件夹时优先处理其中递归找到的 RAR，若无 RAR 但文件夹内已有“代码.docx/代码.pdf”则直接处理该已解压材料（无需解压）。程序只删除“代码.docx”中含汉字的真实注释，保护字符串、模板字符串、正则、HTML 页面文字和 Python 三引号内容。不确定项保留在文档中并列入报告。输出为同级的“原名_已处理_时间戳”目录，原 RAR 不移动、不修改；本阶段不重新压缩。清理后先修改 DOCX，再用 Word 优先、LibreOffice 兜底重新生成同名 PDF，只有新 PDF 验证有效后才替换输出副本中的旧 PDF。
 
 任一 DOCX 处理失败或 PDF 无法重新导出时，批次状态为 `CODE_COMMENT_CLEANUP_PARTIAL`并返回非零退出码；GUI 会显示警告而不会报“完成”。单个文件或 RAR 的失败不会中断其他文件，总报告会保留每项失败原因。
 

@@ -302,6 +302,40 @@ class WorkflowSafetyTests(unittest.TestCase):
             self.assertEqual(report["archives"][0]["status"], "PARTIAL")
             self.assertEqual(report["archives"][0]["documents"][0]["status"], "MISSING_CODE_DOCX")
 
+    def test_extracted_folder_is_scanned_directly_without_rar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            make_docx(base / "项目代码.docx", ["run();"])
+            (base / "项目代码.pdf").write_bytes(b"pdf")
+            result = MODULE.run(base, base / "work", ROOT, apply=False)
+            report = __import__("json").loads(Path(result["report_json"]).read_text(encoding="utf-8"))
+            self.assertEqual(len(report["archives"]), 1)
+            self.assertEqual(report["archives"][0]["archive"], str(base.resolve()))
+            self.assertEqual(report["archives"][0]["documents"][0]["status"], "READY")
+
+    def test_extracted_folder_with_project_subfolders_is_scanned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            for project in ("甲项目", "乙项目"):
+                folder = base / project
+                folder.mkdir()
+                make_docx(folder / "代码.docx", ["run();"])
+                (folder / "代码.pdf").write_bytes(b"pdf")
+            result = MODULE.run(base, base / "work", ROOT, apply=False)
+            report = __import__("json").loads(Path(result["report_json"]).read_text(encoding="utf-8"))
+            self.assertEqual(len(report["archives"]), 1)
+            documents = report["archives"][0]["documents"]
+            self.assertEqual(len(documents), 2)
+            self.assertTrue(all(item["status"] == "READY" for item in documents))
+
+    def test_folder_without_rar_or_code_material_raises_clear_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / "项目说明.txt").write_text("不处理", encoding="utf-8")
+            with self.assertRaises(ValueError) as raised:
+                MODULE.run(base, base / "work", ROOT, apply=False)
+            self.assertIn("未找到 RAR", str(raised.exception))
+
 
 class LauncherTests(unittest.TestCase):
     def test_cmd_launcher_uses_windows_crlf_line_endings(self):
