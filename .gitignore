@@ -1,6 +1,6 @@
-# Python 字节码与缓存
+# Python 字节码与缓存（注意：不能排除 .pyd，它是 C 扩展模块，便携版运行必需）
 __pycache__/
-*.py[cod]
+*.pyc
 .pytest_cache/
 
 # 运行时生成的临时/输出目录
