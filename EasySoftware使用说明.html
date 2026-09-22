@@ -1,0 +1,624 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EasySoftware 软件著作权审核程序 · 使用说明</title>
+<style>
+  :root {
+    --ink: #172033; --muted: #657085; --line: #dfe4ea; --bg: #f4f6f8;
+    --card: #fff; --accent: #165dff; --bad: #b42318; --ok: #087443;
+    --warn-bg: #fff8e6; --warn-line: #eab308;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.7 "Microsoft YaHei", "微软雅黑", sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 32px 20px 90px; }
+  h1 { font-size: 28px; margin: 0 0 6px; }
+  .subtitle { color: var(--muted); margin: 0 0 20px; font-size: 16px; }
+  h2 { font-size: 21px; margin: 46px 0 8px; padding-bottom: 8px; border-bottom: 2px solid var(--line); scroll-margin-top: 70px; }
+  h3 { font-size: 17px; margin: 24px 0 8px; }
+  p { margin: 8px 0; }
+  a { color: var(--accent); }
+  .lead { color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin: 16px 0; box-shadow: 0 2px 10px #1720330a; }
+  .tip { background: #eef6ff; border-left: 4px solid var(--accent); padding: 10px 14px; border-radius: 6px; margin: 12px 0; }
+  .warn { background: var(--warn-bg); border-left: 4px solid var(--warn-line); padding: 10px 14px; border-radius: 6px; margin: 12px 0; }
+  .bad { background: #fff1f0; border-left: 4px solid var(--bad); padding: 10px 14px; border-radius: 6px; margin: 12px 0; }
+  code { background: #eef2f7; padding: 2px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 13px; color: #163a70; }
+
+  /* ===== 一句话 & 学习路径 ===== */
+  .oneline { background: linear-gradient(180deg,#f0f6ff,#eaf2ff); border: 1px solid #c7d7ff; border-left: 5px solid var(--accent); border-radius: 12px; padding: 16px 20px; margin: 0 0 18px; }
+  .oneline b.cap { color: var(--accent); }
+  .oneline .do { color: var(--ok); font-weight: 700; }
+  .oneline .dont { color: var(--bad); font-weight: 700; }
+  .path { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 20px; margin: 0 0 26px; box-shadow: 0 2px 10px #1720330a; }
+  .path h3 { margin: 0 0 6px; font-size: 16px; }
+  .path p { margin: 4px 0; }
+  .path .steps { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+  .path .step-pill { flex: 1 1 160px; background: #f7f9fc; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-size: 13px; }
+  .path .step-pill b { display: block; color: var(--accent); margin-bottom: 2px; font-size: 14px; }
+  .path .arrow { align-self: center; color: var(--muted); font-size: 18px; }
+
+  /* ===== 导航 ===== */
+  .nav { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 18px; margin: 0 0 10px; }
+  .nav .nav-group { margin: 8px 0; }
+  .nav .nav-label { font-size: 12px; color: var(--muted); letter-spacing: 1px; margin-bottom: 6px; }
+  .nav a { text-decoration: none; display: inline-block; background: #f7f9fc; border: 1px solid var(--line); border-radius: 16px; padding: 4px 12px; font-size: 13px; color: var(--ink); margin: 3px 4px 3px 0; }
+  .nav a:hover { border-color: var(--accent); color: var(--accent); }
+  .nav a.must { border-color: var(--accent); background: #eef4ff; color: var(--accent); font-weight: 600; }
+
+  /* ===== 节引导 ===== */
+  .section-guide { display: flex; gap: 12px; background: #f7f9fc; border: 1px dashed #c8d0dc; border-radius: 10px; padding: 12px 14px; margin: 12px 0 18px; font-size: 14px; }
+  .section-guide .sg-icon { font-size: 20px; line-height: 1.4; }
+  .section-guide .sg-time { margin-left: auto; white-space: nowrap; color: var(--muted); font-size: 12px; align-self: center; }
+
+  /* ===== 步骤 / 清单 ===== */
+  .steps { counter-reset: step; margin: 16px 0; }
+  .step { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin: 12px 0; }
+  .step-title { font-weight: 700; font-size: 16px; margin-bottom: 6px; }
+  .step-title::before { counter-increment: step; content: "第 " counter(step) " 步"; color: var(--accent); font-weight: 800; margin-right: 8px; }
+  .step-num { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; background: var(--accent); color: #fff; font-weight: 800; margin-right: 8px; vertical-align: -6px; }
+  .checklist { list-style: none; padding: 0; margin: 12px 0; }
+  .checklist li { background: #fbfcfe; border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; margin: 6px 0; display: flex; gap: 10px; align-items: flex-start; }
+  .checklist input { margin-top: 4px; width: 16px; height: 16px; accent-color: var(--accent); }
+  .checklist b { color: var(--ink); }
+
+  /* ===== 流程进度条 ===== */
+  .flow { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0; }
+  .flow span { padding: 4px 9px; border: 1px solid #c7d7ff; background: #fff; color: #516078; font-size: 12px; border-radius: 5px; }
+  .flow span.current { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700; }
+  .flow span.done { background: #e7f6ee; border-color: #a6e0bc; color: var(--ok); }
+  .mini-flow { display: flex; gap: 4px; margin: 4px 0 8px; flex-wrap: wrap; }
+  .mini-flow .mf { font-size: 11px; padding: 2px 7px; border-radius: 4px; color: var(--muted); border: 1px solid var(--line); }
+  .mini-flow .mf.on { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 700; }
+  .mini-flow .mf.done { background: #e7f6ee; color: var(--ok); border-color: #a6e0bc; }
+
+  /* ===== 窗口示意图 ===== */
+  .win { border: 2px solid #8a95a5; border-radius: 10px; background: #f8fafc; margin: 14px 0; overflow: hidden; }
+  .win-title { background: #e8ecf2; padding: 8px 14px; font-size: 13px; color: #475467; border-bottom: 1px solid #d5dce6; display: flex; gap: 6px; align-items: center; }
+  .win-title .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .dot-red { background: #e5484d; } .dot-yellow { background: #f5a524; } .dot-green { background: #30a46c; }
+  .win-title span.txt { margin-left: 8px; }
+  .win-body { padding: 14px 16px; }
+  .app-title { font-size: 20px; font-weight: 700; color: var(--ink); }
+  .app-sub { font-size: 13px; color: var(--muted); margin: 2px 0 10px; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+  .input { flex: 1 1 200px; min-width: 160px; border: 1px solid #c8d0dc; background: #fff; border-radius: 6px; padding: 7px 10px; font-size: 13px; color: #34445e; }
+  .btn { border: 1px solid #c8d0dc; background: #fff; border-radius: 6px; padding: 7px 12px; font-size: 13px; cursor: default; white-space: nowrap; color: #34445e; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .btn.dim { color: #a0a9b8; }
+  .flowbar { background: #eef4ff; color: #31428a; border: 1px solid #c7d7ff; border-radius: 6px; padding: 6px 10px; font-size: 12px; margin: 10px 0 6px; }
+  .flowbar b { color: var(--accent); }
+  .bar { height: 16px; background: #e6ebf2; border-radius: 8px; overflow: hidden; margin: 6px 0; }
+  .bar .fill { height: 100%; width: 62%; background: var(--accent); border-radius: 8px; }
+  .progress-detail { font-size: 12px; color: var(--muted); }
+  .log { background: #101623; color: #c6d2e3; font-family: Consolas, monospace; font-size: 12px; border-radius: 6px; padding: 10px 12px; height: 120px; overflow: hidden; margin: 6px 0; }
+  .log div { line-height: 1.5; }
+  .win-footer { border-top: 1px solid #d5dce6; background: #f2f5f9; padding: 10px 14px; }
+
+  /* ===== 表格 ===== */
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; background: #fff; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: #eef2f7; }
+
+  /* ===== 页面示意 ===== */
+  .page-screenshot { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin: 10px 0; background: #fff; }
+  .page-screenshot .screenshot-head { background: #eef2f7; padding: 8px 12px; font-size: 13px; font-weight: 700; border-bottom: 1px solid var(--line); }
+  .page-screenshot .screenshot-body { padding: 12px; }
+  .mock-project { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0; background: #fbfcfe; }
+  .mock-project .pname { font-weight: 700; }
+  .mock-project .pstatus { font-size: 12px; color: var(--ok); }
+  .pimg { width: 100%; height: 80px; background: repeating-linear-gradient(45deg, #e8ecf2, #e8ecf2 8px, #f0f3f8 8px, #f0f3f8 16px); border: 1px dashed #c8d0dc; border-radius: 6px; margin: 6px 0; display: flex; align-items: center; justify-content: center; color: #8a95a5; font-size: 12px; }
+  .qacc { margin-top: 6px; font-size: 13px; }
+  .qacc summary { cursor: pointer; font-weight: 600; color: var(--ink); padding: 8px; background: #f7f9fc; border: 1px solid var(--line); border-radius: 8px; }
+  .qacc[open] summary { border-radius: 8px 8px 0 0; border-bottom-color: transparent; }
+  .qacc .qacc-body { border: 1px solid var(--line); border-top: none; border-radius: 0 0 8px 8px; padding: 10px 12px; }
+  @media (max-width: 700px) { main { padding: 20px 12px 60px; } .row { flex-direction: column; align-items: stretch; } .btn { text-align: center; } .path .arrow { display: none; } }
+</style>
+</head>
+<body>
+<main>
+
+<h1>EasySoftware 软件著作权审核程序</h1>
+<p class="subtitle">一步一步教你把一批软件著作权材料，从「压缩包」审核、修复成「合格交付包」。无需任何技术背景。</p>
+
+<!-- 一句话总结 -->
+<div class="oneline">
+  <p style="margin:0;font-size:16px"><b class="cap">一句话：</b> 这个程序<span class="do">能</span>自动检查并修复软著材料的<strong>文字、说明书、代码和页眉页码</strong>，最后帮你打包成<strong>交付压缩包</strong>；<span class="dont">不能</span>替你判断<strong>界面图片</strong>好不好看、不能自动改图——那些要你人眼看、人工定。原文件永远原封不动，只改副本。</p>
+</div>
+
+<!-- 学习路径 -->
+<div class="path">
+  <h3>🧭 新手上路：按这个顺序读</h3>
+  <p>第一次用，顺着三条路走，5 分钟内就能跑通一次完整流程。</p>
+  <div class="steps">
+    <div class="step-pill"><b>① 直接上手</b>「三分钟快速上手」<br>→ 先跑通一次</div>
+    <div class="arrow">→</div>
+    <div class="step-pill"><b>② 看懂界面</b>「认识程序主窗口」<br>→ 知道每个按钮是干嘛的</div>
+    <div class="arrow">→</div>
+    <div class="step-pill"><b>③ 知道怎么验收</b>「六步完整流程」<br>→ 学会看图、看修改、判断合格</div>
+  </div>
+  <p style="margin-top:10px">遇到问题直接跳到 <a href="#faq">「常见问题」</a>。全部内容约 10 分钟读完。</p>
+</div>
+
+<!-- 目录 -->
+<div class="nav">
+  <div class="nav-group">
+    <div class="nav-label">⭐ 新手必看（第一次用）</div>
+    <a href="#quick" class="must">三分钟快速上手</a>
+    <a href="#window" class="must">认识主窗口</a>
+    <a href="#review1" class="must">首轮图片审核页</a>
+    <a href="#review2" class="must">最终审核页（怎么看图验收）</a>
+  </div>
+  <div class="nav-group">
+    <div class="nav-label">📖 完整理解</div>
+    <a href="#intro">程序能做什么</a>
+    <a href="#install">开始前准备</a>
+    <a href="#step1">六步完整流程</a>
+    <a href="#output">交付成果在哪</a>
+    <a href="#special">三个备用按钮</a>
+    <a href="#faq">常见问题</a>
+  </div>
+</div>
+
+<!-- ==================== 一、简介 ==================== -->
+<h2 id="intro">一、这个程序是做什么的？</h2>
+
+<div class="section-guide">
+  <div class="sg-icon">📄</div>
+  <div>这一节讲程序的能力边界——哪些它自动做、哪些必须你判断。约 1 分钟。</div>
+  <div class="sg-time">~1 分钟</div>
+</div>
+
+<div class="card">
+<p><strong>EasySoftware</strong> 是一个「软著材料审核助手」。它的工作是：帮你把一批软件著作权登记材料（TXT 文字、说明书、代码），自动检查、自动修改、最后打包成一个可以直接交付的压缩包。</p>
+<p>如果你收到的材料长这样——一个压缩包里装着好几个软件项目，每个项目里又有 TXT、Word 文档、PDF 文档、图片——那么 EasySoftware 就是为你准备的。</p>
+</div>
+
+<h3>它能帮你自动完成的事情</h3>
+<table>
+  <tr><th>材料</th><th>程序自动检查什么</th><th>程序自动修什么</th></tr>
+  <tr><td>TXT 文字</td><td>编码是否正常、软件名称、主要功能描述</td><td>清理多余序号、引号、括号、重复标点</td></tr>
+  <tr><td>说明书（Word + PDF）</td><td>封面是否规范、软件名称和版本、页眉页码、正文结构</td><td>补封面、统一页眉页码、调整排版</td></tr>
+  <tr><td>代码（Word + PDF）</td><td>代码第一页和最后一页的页眉、版本、页码</td><td>统一页眉（含软件名和 V1.0）、修正页码</td></tr>
+  <tr><td>界面截图（图片）</td><td>图片是否存在、是否重复、配色是否一致、登录页是否正常</td><td>不自动改图，<strong>由你人工判断</strong>，不合格的退回</td></tr>
+</table>
+
+<div class="tip">
+  <strong>记住一个原则：</strong> 界面图片 <u>只能人眼判断</u>，程序负责把它整整齐齐列出来给你看；文档类问题程序尽量自动修，修完再给你复核一遍。
+</div>
+
+<h3>它不会做这些</h3>
+<ul class="tight" style="margin:8px 0 8px 20px">
+  <li>不会改变你<strong>原始压缩包</strong>里的任何文件（原文件永远原封不动）。</li>
+  <li>不会直接在你的图片上写字或画东西。</li>
+  <li>不会替你判断「这张图好不好看」——这个判断永远交给你。</li>
+</ul>
+
+<!-- ==================== 二、准备 ==================== -->
+<h2 id="install">二、开始前要准备什么</h2>
+
+<div class="section-guide">
+  <div class="sg-icon">🧰</div>
+  <div>准备工作只要三步，确认你电脑上都有就行。约 1 分钟。</div>
+  <div class="sg-time">~1 分钟</div>
+</div>
+
+<div class="card">
+<p>只需要三样东西：</p>
+<ol class="tight" style="margin:8px 0 8px 20px">
+  <li><strong>一台 Windows 电脑</strong>（Win10 / Win11）。</li>
+  <li><strong>装了 Microsoft Word</strong>（程序要用 Word 打开文档、导出 PDF）。</li>
+  <li><strong>一个待处理的材料压缩包</strong>，格式是 <code>.zip</code> 或 <code>.rar</code>；也可以是一个装着很多压缩包的<strong>文件夹</strong>。</li>
+</ol>
+</div>
+
+<h3>怎么启动程序</h3>
+<p>找到程序的文件夹，<strong>双击 <code>EasySoftware.lnk</code></strong>（桌面快捷方式），或双击 <code>启动EasySoftware.cmd</code>。</p>
+<p>看到下面这个窗口，就说明程序启动成功了。</p>
+
+<div class="checklist">
+  <li><input type="checkbox"><span>电脑是 Windows 10 / 11，且已安装 Microsoft Word</span></li>
+  <li><input type="checkbox"><span>手上有待处理的 <code>.zip</code> 或 <code>.rar</code> 材料包</span></li>
+  <li><input type="checkbox"><span>双击 <code>EasySoftware.lnk</code>，程序窗口能正常打开</span></li>
+</div>
+
+<!-- ==================== 三、快速上手 ==================== -->
+<h2 id="quick">三、三分钟快速上手（最短路径）</h2>
+
+<div class="section-guide">
+  <div class="sg-icon">🚀</div>
+  <div>赶时间就照抄这一节，<strong>5 个步骤跑通一次完整流程</strong>。每一步配了「做完了吗」小方框，边做边勾。</div>
+  <div class="sg-time">~3 分钟</div>
+</div>
+
+<div class="card">
+<div class="steps">
+  <div class="step"><div class="step-title">点「选择压缩包」，选中你的 <code>.zip</code> 或 <code>.rar</code></div>
+    窗口中间有一条输入框，点右边的<strong>「选择压缩包」</strong>蓝色按钮，在电脑里找到你的材料压缩包。选完后输入框里会出现这个压缩包的地址。</div>
+  <div class="step"><div class="step-title">点「开始处理」</div>
+    程序开始解压、检查每个项目。完成后会自动在浏览器里打开一个「首轮图片审核」页面。</div>
+  <div class="step"><div class="step-title">在浏览器里看图片，勾选「不合格要退回」的项目，然后回到程序点「继续处理其余项目」</div>
+    把每个项目的界面截图过一遍，<strong>只勾选图片明显不合格的项目</strong>（不勾就代表通过）。回到程序窗口，输入框会自动填好 <code>none</code>，点「继续处理其余项目」。</div>
+  <div class="step"><div class="step-title">等程序自动修复，浏览器再打开「最终审核页」</div>
+    这次是修复结果：哪个项目修了什么、现在合不合格，一页看清。</div>
+  <div class="step"><div class="step-title">在程序窗口的「最终通过项目序号」输入 <code>all</code>，点「打包通过项目」</div>
+    程序把通过的项目打包成一个新的压缩包，并弹窗告诉你交付文件在哪里、校验码是多少。<strong>完成！</strong></div>
+</div>
+</div>
+
+<div class="warn">
+  <strong>重要：</strong> 打包时输入序号，可以填 <code>all</code>（全部打包），也可以填 <code>1,3-5</code>（只打包第 1、3、4、5 项）。注意——这里填的是「<strong>通过</strong>」的序号，不是退回的。
+</div>
+
+<div class="checklist">
+  <li><input type="checkbox"><span>点「选择压缩包」选中材料，输入框出现地址</span></li>
+  <li><input type="checkbox"><span>点「开始处理」，浏览器打开了首轮图片审核页</span></li>
+  <li><input type="checkbox"><span>看过图片，勾选了不合格项目，回到程序点了「继续处理其余项目」</span></li>
+  <li><input type="checkbox"><span>程序自动修复完成，浏览器打开了最终审核页</span></li>
+  <li><input type="checkbox"><span>填了 <code>all</code>，点「打包通过项目」，程序弹出交付文件地址</span></li>
+</div>
+
+<div class="tip">🚩 想要更稳、更正规的用法？往下看 <a href="#step1">第五节「六步完整流程详解」</a>，它会教你怎么核对每一个项目。</div>
+
+<!-- ==================== 四、主窗口 ==================== -->
+<h2 id="window">四、认识程序主窗口</h2>
+
+<div class="section-guide">
+  <div class="sg-icon">🖥️</div>
+  <div>整个程序就是一个窗口，你几乎不会离开它（审核页面在浏览器里）。先对照示意图把每个区域认熟。</div>
+  <div class="sg-time">~2 分钟</div>
+</div>
+
+<div class="win">
+  <div class="win-title"><span class="dot dot-red"></span><span class="dot dot-yellow"></span><span class="dot dot-green"></span><span class="txt">EasySoftware 3.2</span></div>
+  <div class="win-body">
+    <div class="app-title">EasySoftware 3.2</div>
+    <div class="app-sub">选择一个 RAR / ZIP 压缩包，或选择一个批次文件夹。</div>
+    <div class="row">
+      <span class="input">C:\材料\某某批次.rar</span>
+      <span class="btn primary">选择压缩包</span>
+      <span class="btn primary">选择文件夹</span>
+    </div>
+    <div class="row">
+      <span class="btn primary">开始处理</span>
+      <span class="btn">从第二轮开始</span>
+      <span class="btn">从解压版继续</span>
+      <span class="btn">打开统一审核页</span>
+      <span class="btn">修改版 Word 导出 PDF</span>
+      <span class="btn">翻新失败业务助手</span>
+    </div>
+    <div class="flowbar">工作流：1 选择材料 &gt; <b>2 首轮看图并微调 Word</b> &gt; 3 二次处理 &gt; 4 终审 &gt; 5 导出 PDF &gt; 6 压缩交付</div>
+    <div class="bar"><div class="fill"></div></div>
+    <div class="progress-detail">本模块已处理 2 个 · 本模块待处理 1 个 · 最近完成：某某项目 · 模块：说明书处理 · 预计剩余 10 秒</div>
+    <div class="log">
+      <div>&gt; python "scripts\unified_workflow.py" "C:\材料\某某批次.rar" --work-dir ...</div>
+      <div>正在提取压缩包……</div>
+      <div>项目 1/3：某某项目 —— 说明书处理</div>
+    </div>
+    <div class="win-footer">
+      <div class="row">
+        <span>通过的项目序号：</span>
+        <span class="input" style="flex:0 1 220px">all</span>
+        <span class="btn">重新验收修改版</span>
+        <span class="btn primary">打包通过项目</span>
+        <span style="color:#98a2b3;font-size:12px">例如：1,3-5 或 all</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p class="lead">从上到下，对照认识每个区域（蓝色 = 你常用，灰色 = 偶尔用）：</p>
+
+<table>
+  <tr><th style="width:190px">区域</th><th>它是什么</th><th>你需要做什么</th><th style="width:70px">频率</th></tr>
+  <tr><td>输入框 + 「选择压缩包 / 选择文件夹」</td><td>告诉程序要处理哪批材料</td><td>二选一点一下，找到材料</td><td>常用</td></tr>
+  <tr><td>「开始处理」按钮</td><td>正式开工：解压、检查、生成审核页</td><td>第一步就点它</td><td>常用</td></tr>
+  <tr><td>工作流提示条（蓝色横条）</td><td>当前进行到哪一步，<strong>高亮的</strong>就是现在</td><td>看一眼，心里有数</td><td>了解</td></tr>
+  <tr><td>进度条 + 进度明细</td><td>实时显示处理到第几个、还剩多少、预计多久</td><td>等着就行</td><td>了解</td></tr>
+  <tr><td>黑色日志框</td><td>程序的完整操作记录（可滚动）</td><td>一般不用管；出问题时看这里</td><td>备用</td></tr>
+  <tr><td>底部「通过的项目序号」+ 「打包通过项目」</td><td>最后一步：挑出要交付的项目并打包</td><td>终审后在这里填序号、点打包</td><td>常用</td></tr>
+  <tr><td>「重新验收修改版」</td><td>终审时手动改了文档后，重新检查一遍</td><td>终审环节才用</td><td>偶尔</td></tr>
+</table>
+
+<div class="tip"><strong>记住 3 个最常用的：</strong>「选择压缩包」→「开始处理」→「打包通过项目」。其他按钮第一次用可以先不管。</div>
+
+<div class="card" style="border-left:5px solid var(--bad)">
+  <h3 style="margin-top:0">💡 可以多开程序，同时处理多个资料包</h3>
+  <p>程序<strong>支持多次双击快捷方式多开</strong>：每个窗口处理一个资料包，可以同时开多个窗口，一起处理多份材料，互不冲突。</p>
+  <div class="warn" style="margin-top:10px">
+    <strong>⚠ 但处理期间千万不要自己打开 Word！</strong>
+    <p style="margin-bottom:0">程序在处理材料时会自动调用 Word 去修复文档、导出 PDF。如果你在这段时间自己手动打开 Word 文档（或任何软件占用 Word），<strong>可能会让正在修复的 Word 文件损坏</strong>。请等程序处理完一个批次、看到结果后，再自己打开 Word 查看或微调。</p>
+  </div>
+  <p class="lead" style="margin-bottom:0"><strong>正确做法：</strong>处理期间让程序独自运行，别碰 Word；程序弹窗说处理完成、或到「终审」阶段要你人工微调时，才打开 Word。</p>
+</div>
+
+<!-- ==================== 五、六步完整流程 ==================== -->
+<h2 id="step1">五、六步完整流程详解</h2>
+
+<div class="section-guide">
+  <div class="sg-icon">🗺️</div>
+  <div>快速上手做完了？这一节是<strong>完整、正规</strong>的用法，重点教你<strong>怎么验收</strong>——这是最关键的一步。</div>
+  <div class="sg-time">~5 分钟</div>
+</div>
+
+<div class="flow">
+  <span class="done">1 选择材料</span><span class="done">2 首轮看图并微调 Word</span><span>3 二次处理</span><span>4 终审</span><span>5 导出 PDF</span><span>6 压缩交付</span>
+</div>
+
+<p class="lead">按顺序走即可；如果你赶时间，用第三节的「快速上手」也一样。</p>
+
+<h3><span class="step-num">1</span>选择材料</h3>
+<div class="card">
+<p>点「<strong>选择压缩包</strong>」或「<strong>选择文件夹</strong>」：</p>
+<table>
+  <tr><th>你的材料长什么样</th><th>点哪个按钮</th></tr>
+  <tr><td>一个 <code>.zip</code> 或 <code>.rar</code> 压缩包，里面装着多个软件项目</td><td>「选择压缩包」</td></tr>
+  <tr><td>一个文件夹，里面装着许多压缩包（每个是一个软件项目）</td><td>「选择文件夹」</td></tr>
+</table>
+<div class="tip"><strong>小提示：</strong>选好后，输入框会出现材料地址。这时检查一下地址对不对，再点「开始处理」。</div>
+</div>
+
+<h3><span class="step-num">2</span>首轮看图并微调 Word</h3>
+<div class="card">
+<div class="mini-flow"><span class="mf done">1 选材料</span><span class="mf on">2 看图微调</span><span class="mf">3 二次处理</span><span class="mf">4 终审</span><span class="mf">5 导出 PDF</span><span class="mf">6 打包</span></div>
+<p>点「<strong>开始处理</strong>」后，程序解压并逐项检查。完成后会自动在浏览器打开<strong>「首轮图片审核」</strong>页面（详见<a href="#review1">第六节</a>）。</p>
+<p>这一步的核心是<strong>你看图</strong>：每个项目的界面截图都平铺在页面上，你一张张过目。</p>
+<ul class="tight" style="margin:8px 0 8px 20px">
+  <li>图片<strong>没问题</strong> → 不用勾选，就是默认通过。</li>
+  <li>图片<strong>有问题</strong>（重复、串图、配色混乱、登录页缺失）→ 在项目前面的小方框里<strong>勾选</strong>。</li>
+  <li>如果你发现哪个项目的 Word 需要微调，页面里可以<strong>直接打开它的说明书 Word</strong> 修改。</li>
+</ul>
+<p>看完后，回到程序窗口，点「<strong>继续处理其余项目</strong>」（此时它顶替了「打包通过项目」的位置）。</p>
+</div>
+
+<h3><span class="step-num">3</span>二次处理（程序自动修复）</h3>
+<div class="card">
+<div class="mini-flow"><span class="mf done">1 选材料</span><span class="mf done">2 看图微调</span><span class="mf on">3 二次处理</span><span class="mf">4 终审</span><span class="mf">5 导出 PDF</span><span class="mf">6 打包</span></div>
+<p>程序开始正式修复文档：清理 TXT、修说明书、修代码页眉、导出 PDF。进度条会告诉你进展。</p>
+<p><strong>这段时间不用管它。</strong>每个项目的修复结果会在完成后汇总。</p>
+</div>
+
+<h3><span class="step-num">4</span>终审 <span class="tag" style="display:inline-block;background:var(--warn-line);color:#7a4b00;font-size:11px;padding:1px 8px;border-radius:10px;vertical-align:2px">关键一步，认真看</span></h3>
+<div class="card">
+<div class="mini-flow"><span class="mf done">1 选材料</span><span class="mf done">2 看图微调</span><span class="mf done">3 二次处理</span><span class="mf on">4 终审</span><span class="mf">5 导出 PDF</span><span class="mf">6 打包</span></div>
+<p>修复完成后，浏览器自动打开<strong>「项目整改结果」</strong>页面（详见<a href="#review2">第七节</a>）。它会清楚地告诉你每个项目：<strong>发现了什么 → 修了什么 → 现在合不合格</strong>。</p>
+<div class="warn"><strong>⚠ 注意：</strong>页面顶部表格里的文字状态只是程序自动判定，<strong>不够准确，不能只看它</strong>。请务必往下滚动，逐项核对页面里渲染出来的证据——<strong>拼接图片</strong>（「修复后说明书封面前两页」「最终代码 PDF 首尾页」）确认封面、页眉、版本、页码，<strong>文字修改对比</strong>（TXT「主要功能模块修改对比」、说明书「正文修改对比」）确认名称和正文改对了。<strong>以图和修改对比为准。</strong>需要严格复核时，直接打开「修改版」文件夹里修复后的 TXT 和说明书 Word 逐字核对。</div>
+<p>如果终审发现还有问题，你有两个选择：</p>
+<ul class="tight" style="margin:8px 0 8px 20px">
+  <li>打开该项目的修改版 Word 手动改，改完回程序点「<strong>重新验收修改版</strong>」再检查。</li>
+  <li>改完直接点「<strong>修改版 Word 导出 PDF</strong>」，把改好的 Word 重新变成 PDF。</li>
+</ul>
+</div>
+
+<h3><span class="step-num">5</span>导出 PDF</h3>
+<div class="card">
+<div class="mini-flow"><span class="mf done">1 选材料</span><span class="mf done">2 看图微调</span><span class="mf done">3 二次处理</span><span class="mf done">4 终审</span><span class="mf on">5 导出 PDF</span><span class="mf">6 打包</span></div>
+<p>正常情况下程序在第 3 步已经自动导出了 PDF。如果你在第 4 步手动改过 Word，才需要点「<strong>修改版 Word 导出 PDF</strong>」重新导出，确保交付的 PDF 和改好的 Word 一致。</p>
+</div>
+
+<h3><span class="step-num">6</span>压缩交付</h3>
+<div class="card">
+<div class="mini-flow"><span class="mf done">1 选材料</span><span class="mf done">2 看图微调</span><span class="mf done">3 二次处理</span><span class="mf done">4 终审</span><span class="mf done">5 导出 PDF</span><span class="mf on">6 打包</span></div>
+<p>这是最后一步：在底部「通过的项目序号」里填写要交付的项目，然后点「<strong>打包通过项目</strong>」。</p>
+<p>填写规则：</p>
+<table>
+  <tr><th>想交付的项目</th><th>填什么</th></tr>
+  <tr><td>全部通过</td><td><code>all</code></td></tr>
+  <tr><td>只要第 1、3、4、5 项</td><td><code>1,3-5</code></td></tr>
+  <tr><td>只要第 2 项</td><td><code>2</code></td></tr>
+</table>
+<p>打包完成后，程序会弹窗告诉你：<strong>交付文件在哪、校验码（SHA-256）是多少</strong>。把这个交付压缩包交出去即可。</p>
+<div class="warn"><strong>格式规则：</strong>原来是 ZIP 就交付 ZIP，原来是 RAR 就交付 RAR。如果批次里 ZIP 和 RAR 都有，程序会弹窗问你选哪个格式。</div>
+</div>
+
+<!-- ==================== 六、首轮审核页 ==================== -->
+<h2 id="review1">六、第一轮：首轮图片审核页（在浏览器里）</h2>
+
+<div class="section-guide">
+  <div class="sg-icon">🖼️</div>
+  <div>这个页面的唯一任务：<strong>把不合格的界面图片挑出来</strong>。你会自动被带到这个页面。</div>
+  <div class="sg-time">~2 分钟</div>
+</div>
+
+<div class="page-screenshot">
+  <div class="screenshot-head">首轮图片审核 — 浏览器页面</div>
+  <div class="screenshot-body">
+    <div class="flow"><span class="done">1 选择材料</span><span class="current">2 看图并微调 Word</span><span>3 自动二次处理</span><span>4 终审</span><span>5 导出 PDF</span><span>6 压缩交付</span></div>
+    <p style="font-size:13px;color:var(--muted)">图片无明显问题时，可先点项目旁的「打开说明 Word」微调；完成后回到程序继续二次处理。只勾选图片不合格、需要退回的项目。</p>
+    <div class="mock-project">
+      <div class="pname">1. 某某软件系统</div>
+      <div class="pstatus">✓ 图片主配色和大体未发现明显不一致 · 登录界面正常</div>
+      <div class="pimg">界面截图预览（说明 PDF 第 2 页截图缩略图）</div>
+      <div class="pimg">界面截图预览（说明 PDF 第 3 页截图缩略图）</div>
+      <div style="font-size:13px"><span style="color:var(--muted)">☐ 勾选退回</span> &nbsp; <a>打开说明 Word</a></div>
+    </div>
+    <div class="mock-project">
+      <div class="pname">2. 某某管理系统</div>
+      <div class="pstatus" style="color:var(--bad)">✗ 有 2 个图片与项目主流截图的配色和大体明显不一致</div>
+      <div class="pimg">界面截图预览</div>
+      <div class="pimg">界面截图预览</div>
+      <div style="font-size:13px"><span style="color:var(--bad);font-weight:700">☑ 勾选退回（此项目图片有问题）</span> &nbsp; <a>打开说明 Word</a></div>
+    </div>
+    <div class="row" style="justify-content:flex-end">
+      <span class="btn primary">复制并继续（复制勾选的序号，回到程序）</span>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+<h3>怎么判断「图片不合格」</h3>
+<ul class="tight" style="margin:8px 0 8px 20px">
+  <li><strong>图片重复</strong>：同一个界面截图出现了好几次。</li>
+  <li><strong>图片串了</strong>：图跟别的项目对不上。</li>
+  <li><strong>配色明显不一致</strong>：一两张图风格和整体完全不是一回事（页面顶部会直接提示你）。</li>
+  <li><strong>登录界面异常或缺失</strong>：要求有登录页的项目没有，或登录页明显有问题。</li>
+</ul>
+<div class="tip"><strong>别把全部项目都勾上。</strong>默认不勾=通过。只有真正需要退回的才勾。</div>
+</div>
+
+<div class="card">
+<h3>看完之后怎么做</h3>
+<ol class="tight" style="margin:8px 0 8px 20px">
+  <li>在需要退回的项目前勾选。</li>
+  <li>回到程序窗口——「图片未通过项目序号」输入框会自动填好勾选的序号（一个没勾就是 <code>none</code>）。</li>
+  <li>点「<strong>继续处理其余项目</strong>」。</li>
+</ol>
+</div>
+
+<!-- ==================== 七、最终审核页 ==================== -->
+<h2 id="review2">七、第二轮：最终审核页（项目整改结果）</h2>
+
+<div class="section-guide">
+  <div class="sg-icon">🔍</div>
+  <div><strong>最重要的页面。</strong>它回答你三个问题：每个项目<strong>发现了什么、程序修了什么、现在合格没有</strong>。学会这一节，你就学会了验收。</div>
+  <div class="sg-time">~3 分钟</div>
+</div>
+
+<div class="page-screenshot">
+  <div class="screenshot-head">项目整改结果 — 浏览器页面</div>
+  <div class="screenshot-body">
+    <div class="flow"><span class="done">1 选择材料</span><span class="done">2 首轮图审与 Word 微调</span><span class="done">3 自动二次处理</span><span class="current">4 终审与人工微调</span><span>5 导出 PDF</span><span>6 压缩交付</span></div>
+    <p style="font-size:13px;color:var(--muted)">终审发现问题时，先修改修改版 Word，再回程序选择「重新验收修改版」或「直接导出 PDF」。</p>
+    <div class="mock-project">
+      <div class="pname">项目总成果</div>
+      <table>
+        <tr><th>序号</th><th>名称</th><th>TXT</th><th>代码 PDF</th><th>说明书</th></tr>
+        <tr><td>1</td><td>某某软件系统</td><td>✅ 通过</td><td>✅ 页眉已统一</td><td>✅ 封面已补</td></tr>
+        <tr><td>2</td><td>某某管理系统</td><td>⚠ 需人工处理</td><td>—</td><td>—</td></tr>
+      </table>
+    </div>
+    <div class="mock-project">
+      <div class="pname">修复后说明书封面前两页</div>
+      <div class="pimg">说明书封面修复结果预览</div>
+      <div class="pimg">说明书第 2 页修复结果预览</div>
+    </div>
+    <div class="mock-project">
+      <div class="pname">最终代码 PDF 首尾页</div>
+      <div class="pimg">代码 PDF 第一页预览</div>
+      <div class="pimg">代码 PDF 最后一页预览</div>
+    </div>
+    <div class="row" style="justify-content:flex-end">
+      <span class="btn">全部标为不通过</span>
+      <span class="btn">全部通过</span>
+      <span class="btn primary">复制打包命令</span>
+    </div>
+  </div>
+</div>
+
+<div class="warn">
+  <strong>⚠ 重要：不要只看表格，要看拼接图片和文字对比。</strong>
+  <p>页面顶部的「项目总成果」表格里那一格一格的文字状态，只是程序的<strong>自动判定</strong>，可能判断不准确，<u>不能作为最终验收依据</u>。</p>
+  <p><strong>真正要看的证据</strong>是页面里实际渲染出来的<strong>拼接图片</strong>和<strong>文字修改对比</strong>，都要逐个核对：</p>
+  <ul class="tight" style="margin:8px 0 8px 20px">
+    <li><strong>「修复后说明书封面前两页」</strong>组图 —— 用眼睛确认封面、软件名称、版本、页眉页码是否真的修好了；</li>
+    <li><strong>「最终代码 PDF 首尾页」</strong>组图 —— 每个项目一组，确认代码第一页和最后一页的页眉、版本、页码是否正确；</li>
+    <li><strong>「主要功能模块修改对比」</strong>（TXT）—— 每个项目卡片里有修改前后的文字对比，确认软件名称、主要功能描述被改对、改干净；</li>
+    <li><strong>「说明书正文修改对比」</strong>—— 同样在项目卡片里，确认正文被修改的段落确实改对了。</li>
+  </ul>
+  <p>图片是程序把 PDF 页面直接渲染出来拼成的，文字对比是修改前后并排给你看，<strong>都以它们为准</strong>。表格说「通过」但图或文字看着不对，就按没通过处理。</p>
+  <p style="margin-bottom:0"><strong>更稳妥的做法：</strong> 需要严格复核时，直接到「修改版」文件夹里打开该项目修复后的 <code>.txt</code> 和说明书 Word，逐字核对最终文字。</p>
+</div>
+
+<div class="card">
+<h3>每一格只回答三件事（参考，非验收依据）</h3>
+<table>
+  <tr><th>状态</th><th>意思</th><th>你要做什么</th></tr>
+  <tr><td>✅ 通过 / 已修复</td><td>程序检查过了，认为符合要求</td><td><strong>仍需对照拼接图片和文字对比确认</strong>；都对才算过</td></tr>
+  <tr><td>⚠ 需人工处理</td><td>程序发现了问题但没把握自动改好</td><td>打开该项目的修改版 Word 手动改，再看图片复核</td></tr>
+  <tr><td>—（无材料）</td><td>这个项目缺了对应材料</td><td>回去补材料，或确认是否还要交付</td></tr>
+</table>
+<div class="tip"><strong>手动改完 Word 之后</strong>：回到程序窗口点「重新验收修改版」重新检查；确认没问题后，点「修改版 Word 导出 PDF」让 PDF 同步。最后回到「打包通过项目」。</div>
+</div>
+
+<!-- ==================== 八、交付成果 ==================== -->
+<h2 id="output">八、交付的成果在哪里？</h2>
+
+<div class="section-guide">
+  <div class="sg-icon">📦</div>
+  <div>处理完后程序会在材料旁边生成几个文件夹，搞清楚哪个能碰、哪个不能碰。</div>
+  <div class="sg-time">~1 分钟</div>
+</div>
+
+<div class="card">
+<p>程序处理完后，会在你的材料旁边生成几个文件夹：</p>
+<table>
+  <tr><th>文件夹</th><th>是什么</th><th>能动吗</th></tr>
+  <tr><td><code>某某批次_解压版</code>（或 <code>解压版</code>）</td><td>材料解开后的副本，程序看图的来源</td><td>❌ 不要动，程序可能还要用</td></tr>
+  <tr><td><code>某某批次_修改版</code>（或 <code>修改版</code>）</td><td>程序修复后的成果，你的交付从这里来</td><td>✅ 终审时可手动微调里面的 Word</td></tr>
+  <tr><td>交付压缩包</td><td>程序最后打包出来的成品（弹窗告诉你的地址）</td><td>✅ 就是它，交出去</td></tr>
+</table>
+<div class="warn"><strong>千万别删、别改「解压版」。</strong> 续跑、重新审核都要靠它。原压缩包也请保留一份。</div>
+</div>
+
+<!-- ==================== 九、特殊按钮 ==================== -->
+<h2 id="special">九、三个「备用」按钮，什么时候用</h2>
+
+<div class="section-guide">
+  <div class="sg-icon">🎛️</div>
+  <div>这几个按钮第一次用基本碰不到，等你有需要时再回来看。</div>
+  <div class="sg-time">备用</div>
+</div>
+
+<div class="card">
+<table>
+  <tr><th style="width:170px">按钮</th><th>什么时候用</th><th>点了会怎样</th></tr>
+  <tr><td>「从第二轮开始」</td><td>图片你已经全部确认过没问题，不想再从头看图</td><td>跳过首轮看图，直接开始二次处理（相当于图片全部通过）</td></tr>
+  <tr><td>「从解压版继续」</td><td>上次处理到一半中断了，解压好的材料还在</td><td>直接接着解压版继续，不用重新解压</td></tr>
+  <tr><td>「打开统一审核页」</td><td>审核页被关掉了，想重新打开</td><td>重新在浏览器打开上一次的审核页</td></tr>
+</table>
+</div>
+
+<!-- ==================== 十、常见问题 ==================== -->
+<h2 id="faq">十、常见问题</h2>
+
+<div class="section-guide">
+  <div class="sg-icon">❓</div>
+  <div>遇到问题先来这里翻一翻。点问题标题展开答案。</div>
+  <div class="sg-time">随时查</div>
+</div>
+
+<details class="qacc" open>
+  <summary>Q1：双击启动后没反应，或一闪而过</summary>
+  <div class="qacc-body">先确认电脑装了 <strong>Microsoft Word</strong>。然后双击 <code>启动EasySoftware.cmd</code> 试试，窗口里会显示原因；也可以右键 <code>启动EasySoftware.ps1</code> →「使用 PowerShell 运行」查看报错。</div>
+</details>
+
+<details class="qacc">
+  <summary>Q2：点「开始处理」后提示缺少某个软件 / 找不到文件</summary>
+  <div class="qacc-body">程序需要几样底层工具（7-Zip 解压、Poppler 或 pdfium 渲染 PDF）。提示里会直接写明缺哪个。装上对应软件后重试即可。</div>
+</details>
+
+<details class="qacc">
+  <summary>Q3：我填了序号，但打包没成功</summary>
+  <div class="qacc-body">检查序号格式是否正确（如 <code>1,3-5</code> 或 <code>all</code>）。另外在「首轮图片审核」阶段，如果没有任何项目被勾选退回，这里要填 <code>none</code> 再点继续。</div>
+</details>
+
+<details class="qacc">
+  <summary>Q4：修改版里的 Word 改了，交付的 PDF 还是旧的</summary>
+  <div class="qacc-body">点「<strong>修改版 Word 导出 PDF</strong>」，让程序用改好的 Word 重新生成 PDF，再打包。</div>
+</details>
+
+<details class="qacc">
+  <summary>Q5：什么时候应该用「选择文件夹」而不是「选择压缩包」？</summary>
+  <div class="qacc-body">你手上一整批很多个项目、每个是独立压缩包时，用「选择文件夹」一次搞定；只有一两个压缩包时，用「选择压缩包」更直观。</div>
+</details>
+
+<details class="qacc">
+  <summary>Q6：程序说「交付格式需要选择」，怎么办？</summary>
+  <div class="qacc-body">这是因为你的批次里 <code>.zip</code> 和 <code>.rar</code> 都有。程序会弹窗，<strong>选「是」= 交付 ZIP，选「否」= 交付 RAR</strong>。</div>
+</details>
+
+<!-- ==================== 附：翻新助手 ==================== -->
+<h2 id="refurbish">附：翻新失败业务助手</h2>
+
+<div class="bad">
+  <strong>⚠ 注意：该功能尚未完成开发，当前不能使用。</strong>
+  <p style="margin-bottom:0">「翻新失败业务助手」位于主窗口右上角。它是一个对接已登录业务系统、批量处理「翻新批次」失败订单的内部工具。目前功能未开发完成，请勿点击使用；等开发完成后，本说明会补充详细操作指南。</p>
+</div>
+
+<p class="lead">（本节为占位说明。功能上线后，会在此说明令牌获取、批次筛选、预览与正式提交的完整流程。）</p>
+
+</main>
+</body>
+</html>

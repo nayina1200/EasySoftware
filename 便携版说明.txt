@@ -1,0 +1,44 @@
+EasySoftware 绿色便携版 · 使用说明
+===================================
+
+【这是什么】
+这是一个「解压即用」的 EasySoftware 软件著作权审核程序完整版。
+已经把 Python 运行时和所有依赖都打包进去了，不需要安装任何东西，
+拷到任何 Windows 电脑（Win10/11）解压即可使用。
+
+【怎么用】
+1. 把整个文件夹复制到目标电脑任意位置（例如 D:\EasySoftware）。
+2. 双击「start.bat」启动程序（推荐，兼容性最好）。
+   （也可以双击「启动EasySoftware.cmd」，两者效果相同）
+3. 按程序界面操作：选择压缩包 → 开始处理 → 看图审核 → 打包交付。
+4. 第一次用，先双击「打开教程.bat」看图文快速开始，或在浏览器打开
+   「便携版快速开始.html」。详细图文教程见「EasySoftware使用说明.html」。
+
+【目录结构】
+  start.bat                   推荐双击启动入口（兼容性最好）
+  启动EasySoftware.cmd        备用启动入口
+  打开教程.bat                双击打开图文快速开始教程
+  run.ps1 / 启动EasySoftware.ps1  启动脚本（已配置使用内置 Python）
+  便携版快速开始.html         图文快速开始教程（5 分钟上手）
+  EasySoftware使用说明.html   完整图文教程
+  python\                     内置 Python 运行时 + 依赖（lxml/Pillow/pypdf/pypdfium2）
+  tools\7z\                   内置 7-Zip（解压 RAR/7z 用）
+  tools\rar\                  内置 Rar.exe（打包 RAR 交付用）
+  scripts\                    程序核心脚本
+  references\                 材料规则
+  SKILL.md / 开发维护规则.md / README.md
+  本文件.txt                  这份说明
+
+【重要提醒】
+1. 目标电脑需要安装 Microsoft Word —— 程序修复文档、导出 PDF 必须靠它。
+2. 程序可以多开（多次双击启动），同时处理多个资料包。
+3. 处理材料期间请勿自己打开 Word，否则可能导致正在修复的 Word 文件损坏。
+4. 本文件夹可以随意移动、改名，不影响使用；不要单独移动里面的文件。
+5. 目标电脑如果装有 Python，程序会优先用本文件夹内置的 Python，
+   避免环境差异导致的问题。
+6. 如果双击后窗口一闪而过或提示找不到命令，请双击「start.bat」
+   并确认已把整个文件夹解压完整（不要只复制个别文件）。
+
+【版本信息】
+  打包日期：2026-08-12
+  程序版本：EasySoftware 3.4.x

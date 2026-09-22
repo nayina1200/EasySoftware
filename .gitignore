@@ -1,0 +1,9 @@
+# Python 字节码与缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 运行时生成的临时/输出目录
+解压版/
+修改版/
+.Temp/

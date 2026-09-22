@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EasySoftware 绿色便携版 · 快速开始</title>
+<style>
+  :root {
+    --ink: #172033; --muted: #657085; --line: #dfe4ea; --bg: #f4f6f8;
+    --card: #fff; --accent: #165dff; --bad: #b42318; --ok: #087443;
+    --warn-bg: #fff8e6; --warn-line: #eab308;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.7 "Microsoft YaHei", "微软雅黑", sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 32px 20px 90px; }
+  h1 { font-size: 28px; margin: 0 0 6px; }
+  .subtitle { color: var(--muted); margin: 0 0 20px; font-size: 16px; }
+  h2 { font-size: 21px; margin: 46px 0 8px; padding-bottom: 8px; border-bottom: 2px solid var(--line); scroll-margin-top: 70px; }
+  h3 { font-size: 17px; margin: 24px 0 8px; }
+  p { margin: 8px 0; }
+  a { color: var(--accent); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin: 16px 0; box-shadow: 0 2px 10px #1720330a; }
+  .tip { background: #eef6ff; border-left: 4px solid var(--accent); padding: 10px 14px; border-radius: 6px; margin: 12px 0; }
+  .warn { background: var(--warn-bg); border-left: 4px solid var(--warn-line); padding: 10px 14px; border-radius: 6px; margin: 12px 0; }
+  .bad { background: #fff1f0; border-left: 4px solid var(--bad); padding: 10px 14px; border-radius: 6px; margin: 12px 0; }
+  code { background: #eef2f7; padding: 2px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 13px; color: #163a70; }
+  .steps { counter-reset: step; margin: 16px 0; }
+  .step { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin: 12px 0; }
+  .step-title { font-weight: 700; font-size: 16px; margin-bottom: 6px; }
+  .step-title::before { counter-increment: step; content: "第 " counter(step) " 步"; color: var(--accent); font-weight: 800; margin-right: 8px; }
+  .checklist { list-style: none; padding: 0; margin: 12px 0; }
+  .checklist li { background: #fbfcfe; border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; margin: 6px 0; display: flex; gap: 10px; align-items: flex-start; }
+  .checklist input { margin-top: 4px; width: 16px; height: 16px; accent-color: var(--accent); }
+  .win { border: 2px solid #8a95a5; border-radius: 10px; background: #f8fafc; margin: 14px 0; overflow: hidden; }
+  .win-title { background: #e8ecf2; padding: 8px 14px; font-size: 13px; color: #475467; border-bottom: 1px solid #d5dce6; display: flex; gap: 6px; align-items: center; }
+  .win-title .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .dot-red { background: #e5484d; } .dot-yellow { background: #f5a524; } .dot-green { background: #30a46c; }
+  .win-title span.txt { margin-left: 8px; }
+  .win-body { padding: 14px 16px; }
+  .app-title { font-size: 20px; font-weight: 700; color: var(--ink); }
+  .app-sub { font-size: 13px; color: var(--muted); margin: 2px 0 10px; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+  .input { flex: 1 1 200px; min-width: 160px; border: 1px solid #c8d0dc; background: #fff; border-radius: 6px; padding: 7px 10px; font-size: 13px; color: #34445e; }
+  .btn { border: 1px solid #c8d0dc; background: #fff; border-radius: 6px; padding: 7px 12px; font-size: 13px; cursor: default; white-space: nowrap; color: #34445e; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .flowbar { background: #eef4ff; color: #31428a; border: 1px solid #c7d7ff; border-radius: 6px; padding: 6px 10px; font-size: 12px; margin: 10px 0 6px; }
+  .bar { height: 16px; background: #e6ebf2; border-radius: 8px; overflow: hidden; margin: 6px 0; }
+  .bar .fill { height: 100%; width: 62%; background: var(--accent); border-radius: 8px; }
+  .progress-detail { font-size: 12px; color: var(--muted); }
+  .log { background: #101623; color: #c6d2e3; font-family: Consolas, monospace; font-size: 12px; border-radius: 6px; padding: 10px 12px; height: 110px; overflow: hidden; margin: 6px 0; }
+  .log div { line-height: 1.5; }
+  .win-footer { border-top: 1px solid #d5dce6; background: #f2f5f9; padding: 10px 14px; }
+  .flow { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0; }
+  .flow span { padding: 4px 9px; border: 1px solid #c7d7ff; background: #fff; color: #516078; font-size: 12px; border-radius: 5px; }
+  .flow span.current { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700; }
+  .flow span.done { background: #e7f6ee; border-color: #a6e0bc; color: var(--ok); }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; background: #fff; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: #eef2f7; }
+  .oneline { background: linear-gradient(180deg,#f0f6ff,#eaf2ff); border: 1px solid #c7d7ff; border-left: 5px solid var(--accent); border-radius: 12px; padding: 16px 20px; margin: 0 0 18px; }
+  .oneline .do { color: var(--ok); font-weight: 700; }
+  .oneline .dont { color: var(--bad); font-weight: 700; }
+  @media (max-width: 700px) { main { padding: 20px 12px 60px; } .row { flex-direction: column; align-items: stretch; } }
+</style>
+</head>
+<body>
+<main>
+
+<h1>EasySoftware 绿色便携版 · 快速开始</h1>
+<p class="subtitle">5 分钟教会你：解压、启动、处理材料、交付。不用懂任何技术。</p>
+
+<div class="oneline">
+  <p style="margin:0;font-size:16px">这个便携版<strong>已经把程序本体和运行环境都打包好了</strong>，拷到任何电脑都能用。你只需要记住一句话：<strong>双击 <code>start.bat</code> 就能启动程序</strong>。它<span class="do">能</span>自动检查和修复软著材料，<span class="dont">不能</span>替你看图判断——界面图片要你自己看、自己定。</p>
+</div>
+
+<h2>一、解压</h2>
+
+<div class="card">
+<p>你拿到的是一个压缩包 <code>EasySoftware_绿色便携版.zip</code>：</p>
+<ol style="margin:8px 0 8px 20px">
+  <li>右键压缩包 → <strong>「解压到当前文件夹」</strong>（或「全部解压」）。</li>
+  <li>解压后会得到一个大文件夹 <code>EasySoftware_绿色便携版</code>。</li>
+  <li>这个文件夹可以<strong>移动、改名、拷到别的电脑</strong>，不影响使用。</li>
+</ol>
+<div class="warn"><strong>注意：</strong>不要只把里面的单个文件拖出来用，要整个文件夹一起用。</div>
+</div>
+
+<h2>二、启动程序（关键一步）</h2>
+
+<div class="card">
+<p>打开解压后的文件夹，找到下面这个文件：</p>
+
+<div class="win">
+  <div class="win-title"><span class="dot dot-red"></span><span class="dot dot-yellow"></span><span class="dot dot-green"></span><span class="txt">EasySoftware_绿色便携版 文件夹</span></div>
+  <div class="win-body">
+    <div class="row">
+      <span class="input">📁 EasySoftware_绿色便携版</span>
+    </div>
+    <div class="row" style="background:#e7f6ee;border:2px solid var(--ok);border-radius:8px;padding:8px 10px">
+      <span class="btn" style="background:var(--ok);color:#fff;font-weight:800;font-size:14px">▶ start.bat　（双击这个！）</span>
+      <span class="btn dim">启动EasySoftware.cmd（备用）</span>
+      <span class="btn dim">EasySoftware使用说明.html（教程）</span>
+    </div>
+    <div class="row">
+      <span class="input" style="flex:0 1 auto">python\　内置运行环境</span>
+      <span class="input" style="flex:0 1 auto">tools\　内置工具</span>
+      <span class="input" style="flex:0 1 auto">scripts\　程序本体</span>
+    </div>
+  </div>
+</div>
+
+<p><strong>双击 <code>start.bat</code></strong>。它会先弹出一个黑色命令行窗口（一闪而过属正常），然后打开 EasySoftware 主窗口。</p>
+</div>
+
+<div class="tip">
+  <strong>如果双击 start.bat 没反应，或窗口一闪而过：</strong>先确认你把<strong>整个文件夹完整解压</strong>了（不是只拖出几个文件）。还不行就双击 <code>启动EasySoftware.cmd</code> 试试，效果一样。
+</div>
+
+<h2>三、你看到的程序窗口</h2>
+
+<div class="win">
+  <div class="win-title"><span class="dot dot-red"></span><span class="dot dot-yellow"></span><span class="dot dot-green"></span><span class="txt">EasySoftware 3.2</span></div>
+  <div class="win-body">
+    <div class="app-title">EasySoftware 3.2</div>
+    <div class="app-sub">选择一个 RAR / ZIP 压缩包，或选择一个批次文件夹。</div>
+    <div class="row">
+      <span class="input">C:\材料\某某批次.rar</span>
+      <span class="btn primary">选择压缩包</span>
+      <span class="btn primary">选择文件夹</span>
+    </div>
+    <div class="row">
+      <span class="btn primary">开始处理</span>
+      <span class="btn">从第二轮开始</span>
+      <span class="btn">从解压版继续</span>
+      <span class="btn">打开统一审核页</span>
+      <span class="btn">修改版 Word 导出 PDF</span>
+    </div>
+    <div class="flowbar">工作流：1 选择材料 &gt; <b>2 首轮看图并微调 Word</b> &gt; 3 二次处理 &gt; 4 终审 &gt; 5 导出 PDF &gt; 6 压缩交付</div>
+    <div class="bar"><div class="fill"></div></div>
+    <div class="progress-detail">本模块已处理 2 个 · 本模块待处理 1 个 · 最近完成：某某项目 · 预计剩余 10 秒</div>
+    <div class="log">
+      <div>&gt; python "scripts\unified_workflow.py" "C:\材料\某某批次.rar" ...</div>
+      <div>正在提取压缩包……</div>
+      <div>项目 1/3：某某项目 —— 说明书处理</div>
+    </div>
+    <div class="win-footer">
+      <div class="row">
+        <span>通过的项目序号：</span>
+        <span class="input" style="flex:0 1 220px">all</span>
+        <span class="btn">重新验收修改版</span>
+        <span class="btn primary">打包通过项目</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="tip"><strong>记住 3 个常用操作：</strong>「选择压缩包」→「开始处理」→「打包通过项目」。其他按钮第一次用可以先不管。</div>
+
+<h2>四、五分钟跑完一次</h2>
+
+<div class="steps">
+  <div class="step"><div class="step-title">点「选择压缩包」，选中你的材料 <code>.zip</code> 或 <code>.rar</code></div>
+    输入框右边点「选择压缩包」，找到你的材料包。选完后输入框出现地址。</div>
+  <div class="step"><div class="step-title">点「开始处理」</div>
+    程序开始解压、检查。完成后自动在浏览器打开「首轮图片审核」页。</div>
+  <div class="step"><div class="step-title">看图，只勾选「不合格要退回」的项目，回程序点「继续处理其余项目」</div>
+    图片没问题就不勾（默认通过）。回到程序窗口，点「继续处理其余项目」。</div>
+  <div class="step"><div class="step-title">等程序自动修复，浏览器打开「最终审核页」</div>
+    这里告诉你每个项目发现了什么、修了什么、合不合格。</div>
+  <div class="step"><div class="step-title">在「最终通过项目序号」填 <code>all</code>，点「打包通过项目」</div>
+    程序打包出交付压缩包并弹窗告诉你位置。<strong>完成！</strong></div>
+</div>
+
+<div class="warn">
+  <strong>填序号的规则：</strong><code>all</code> = 全部打包；<code>1,3-5</code> = 打包第 1、3、4、5 项。注意填的是「通过」的序号。首轮看图阶段，一个都没勾时填 <code>none</code>。
+</div>
+
+<h2>五、最重要的验收提醒</h2>
+
+<div class="bad">
+  <strong>⚠ 不要只看表格，要看图和文字！</strong>
+  <p style="margin-bottom:0">最终审核页顶部的表格只是程序自动判断，<strong>可能不准确</strong>。请往下滚动，对照渲染出来的<strong>拼接图片</strong>（说明书封面前两页、代码 PDF 首尾页）和<strong>文字修改对比</strong>（TXT、说明书正文）确认真的改好了。表格说通过但图片不对，就按没通过处理。</p>
+</div>
+
+<h2>六、常见问题</h2>
+
+<div class="card">
+<h3>Q1：双击 start.bat 后窗口一闪而过 / 没反应</h3>
+<p>先确认<strong>整个文件夹解压完整</strong>。然后右键 <code>start.bat</code> →「编辑」，看内容是不是下面这样（少一行都不行）：</p>
+<code>@echo off
+chcp 65001 &gt;nul
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0run.ps1" %*
+pause &gt;nul</code>
+<p>如果内容不对，或文件不见了，请重新解压整个压缩包。</p>
+</div>
+
+<div class="card">
+<h3>Q2：提示找不到 Microsoft Word</h3>
+<p>程序修复文档、导出 PDF 必须靠 Word。目标电脑需要<strong>先安装 Word</strong>（Office 即可），再启动程序。</p>
+</div>
+
+<div class="card">
+<h3>Q3：程序能开，但点「开始处理」报错</h3>
+<p>多半是材料包本身的问题（格式、损坏）。看黑色日志框里的提示，或者检查压缩包能正常打开。</p>
+</div>
+
+<div class="card">
+<h3>Q4：可以同时开多个程序吗？</h3>
+<p>可以。<strong>多次双击 start.bat 就能多开</strong>，每个窗口处理一个资料包，互不冲突。但处理期间<strong>不要自己打开 Word</strong>，否则可能损坏正在修复的文档。</p>
+</div>
+
+<div class="card">
+<h3>Q5：更多细节在哪看？</h3>
+<p>同目录的 <code>EasySoftware使用说明.html</code> 是完整图文教程；<code>便携版说明.txt</code> 是速查。也可以随时双击 <code>打开教程.bat</code> 重新打开本页。</p>
+</div>
+
+</main>
+</body>
+</html>
