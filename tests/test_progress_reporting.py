@@ -13,6 +13,9 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# 被测模块按文件路径加载，需要把 scripts 加入 sys.path，
+# 否则被测模块内部的同级 import（如 archive_types）无法解析。
+sys.path.insert(0, str(ROOT / "scripts"))
 SPEC = importlib.util.spec_from_file_location("unified_workflow_progress_tests", ROOT / "scripts" / "unified_workflow.py")
 WORKFLOW = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(WORKFLOW)

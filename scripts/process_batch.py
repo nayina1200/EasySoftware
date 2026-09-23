@@ -31,6 +31,8 @@ from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 Image.MAX_IMAGE_PIXELS = None
 from pypdf import PdfReader
 
+import archive_types
+
 
 VERSION = "3.4.26"
 CODE_WORD_TIMEOUT_SECONDS = 20
@@ -55,7 +57,7 @@ MANUAL_LABELS = (
 LABEL_RE = re.compile(r"^[【\[]?(?:" + "|".join(map(re.escape, MANUAL_LABELS)) + r")[】\]]?$")
 LEGACY_LABEL_RE = re.compile(r"^[【\[]?(?:" + "|".join(map(re.escape, MANUAL_LABELS + ("说明书",))) + r")[】\]]?$")
 SIMSUN_NAMES = {"宋体", "SimSun", "NSimSun", "宋体-简"}
-ARCHIVE_SUFFIXES = {".zip", ".rar", ".7z"}
+ARCHIVE_SUFFIXES = archive_types.ARCHIVE_SUFFIXES
 RELEVANT_SUFFIXES = {".txt", ".pdf", ".docx"}
 MAIN_FUNCTION_RE = re.compile(r"^\s*(?:主要功能|软件主要功能)\s*[:：]\s*(.*)$")
 MAIN_FUNCTION_VERB_RE = re.compile(r"(?:管理|查询|录入|维护|统计|分析|生成|导出|导入|审核|审批|发布|展示|监控|处理|配置|登录|注册|提醒|计算|检索|编辑|保存|删除|上传|下载|同步|控制|服务)")
@@ -214,7 +216,11 @@ def decode_process_output(value: str | bytes | None) -> str:
 
 
 @contextlib.contextmanager
-def word_automation_lock(progress: ProgressReporter | None, module: str):
+def word_automation_lock(
+    progress: ProgressReporter | None,
+    module: str,
+    timeout_seconds: int = 180,
+):
     """Allow only one EasySoftware batch to automate Microsoft Word at once."""
     if os.name != "nt":
         yield
@@ -228,6 +234,7 @@ def word_automation_lock(progress: ProgressReporter | None, module: str):
     if not handle:
         raise RuntimeError("无法创建 Word 处理队列")
     acquired = False
+    started = time.monotonic()
     try:
         while True:
             result = kernel32.WaitForSingleObject(handle, 5_000)
@@ -237,6 +244,11 @@ def word_automation_lock(progress: ProgressReporter | None, module: str):
             if result == 0x102:
                 if progress:
                     progress.update("等待其他任务完成 Word 导出", 0, module or "Word处理")
+                if time.monotonic() - started >= timeout_seconds:
+                    raise TimeoutError(
+                        f"等待 Word 处理队列超时（>{timeout_seconds}秒）。"
+                        "请关闭其他 EasySoftware 任务或 Word 的阻塞窗口后重试。"
+                    )
                 continue
             raise RuntimeError("等待 Word 处理队列时发生异常")
         yield
@@ -364,7 +376,7 @@ def expand_nested_archives(
     for depth in range(1, max_depth + 1):
         jobs = []
         for archive in sorted(
-            (path for path in extracted.rglob("*") if path.is_file() and path.suffix.lower() in ARCHIVE_SUFFIXES),
+            (path for path in extracted.rglob("*") if path.is_file() and archive_types.is_archive_file(path)),
             key=lambda path: str(path.relative_to(extracted)).casefold(),
         ):
             key = str(archive.resolve()).casefold()
@@ -414,7 +426,7 @@ def expand_nested_archives(
     else:
         remaining = [
             path for path in extracted.rglob("*")
-            if path.is_file() and path.suffix.lower() in ARCHIVE_SUFFIXES and str(path.resolve()).casefold() not in expanded
+            if path.is_file() and archive_types.is_archive_file(path) and str(path.resolve()).casefold() not in expanded
         ]
         if remaining:
             raise RuntimeError(f"嵌套压缩层级超过{max_depth}层")
@@ -442,17 +454,22 @@ def ensure_extracted(batch_root: Path, extracted: Path, work: Path, hashes: Hash
     if input_archives:
         archives = sorted((path.resolve() for path in input_archives), key=lambda path: str(path).casefold())
         for archive in archives:
-            if not archive.is_file() or archive.suffix.lower() not in ARCHIVE_SUFFIXES:
+            if not archive.is_file() or not archive_types.is_archive_file(archive):
                 raise RuntimeError(f"指定的输入压缩包无效：{archive}")
             try:
                 archive.relative_to(batch_root)
             except ValueError as exc:
                 raise RuntimeError(f"输入压缩包不在批次目录内：{archive}") from exc
     else:
-        archives = sorted(
-            (p for p in batch_root.rglob("*") if p.is_file() and p.suffix.lower() in ARCHIVE_SUFFIXES and is_input_file(p)),
+        all_archives = sorted(
+            (p for p in batch_root.rglob("*") if p.is_file() and archive_types.is_archive_file(p) and is_input_file(p)),
             key=lambda p: str(p.relative_to(batch_root)).lower(),
         )
+        # 文件夹入口以已解压材料为准：同名目录已存在的压缩包按"就地解压后的残留"
+        # 处理，不再重复解压（压缩包有独立的选择入口）。
+        leftover = {str(p) for p in all_archives if archive_types.is_leftover_archive(p)}
+        archives = [p for p in all_archives if str(p) not in leftover]
+        ignored_archives = [p for p in all_archives if str(p) in leftover]
     archive_state = [
         {"name": str(p.relative_to(batch_root)), "size": p.stat().st_size, "sha256": hashes.sha256(p)}
         for p in archives
@@ -464,7 +481,7 @@ def ensure_extracted(batch_root: Path, extracted: Path, work: Path, hashes: Hash
     source_state = [
         {"name": str(p.relative_to(batch_root)), "size": p.stat().st_size, "sha256": hashes.sha256(p)}
         for p in source_files
-    ] if not archives else []
+    ]
     state_path = work / "extraction.json"
     old_state = load_json(state_path, {})
 
@@ -499,22 +516,28 @@ def ensure_extracted(batch_root: Path, extracted: Path, work: Path, hashes: Hash
 
     if not archives:
         if not source_files:
-            raise RuntimeError(f"批次目录没有压缩包或已解压软著材料，且解压版为空：{batch_root}")
+            raise RuntimeError(f"批次目录没有压缩包，也没有已解压的软著材料（txt/pdf/docx）：{batch_root}")
         if extracted.exists():
             extracted.rmdir()
 
         def ignore_outputs(directory: str, names: list[str]) -> set[str]:
+            # 残留压缩包留在原目录，不复制进只读审计副本。
+            ignored = {name for name in names if archive_types.is_archive_file(name)}
             if Path(directory).resolve() == batch_root.resolve():
-                return {name for name in names if name in excluded_top_level}
-            return set()
+                ignored |= {name for name in names if name in excluded_top_level}
+            return ignored
 
         shutil.copytree(batch_root, extracted, ignore=ignore_outputs)
-        result = {"source": str(batch_root), "target": str(extracted), "mode": "PREEXTRACTED_COPY", "files": len(source_files)}
+        result = {
+            "source": str(batch_root), "target": str(extracted), "mode": "PREEXTRACTED_COPY",
+            "files": len(source_files),
+        }
         atomic_json(state_path, {
             "version": VERSION,
             "archives": [],
             "source_files": source_state,
             "results": [result],
+            "ignored_archives": [str(p.relative_to(batch_root)) for p in ignored_archives],
             "at": now_iso(),
         })
         return [result]
@@ -533,7 +556,15 @@ def ensure_extracted(batch_root: Path, extracted: Path, work: Path, hashes: Hash
     results.sort(key=lambda row: row["archive"])
     nested_results = expand_nested_archives(extracted, seven_zip, workers, hashes)
     results.extend(row for row in nested_results if row.get("status") == "EXTRACTED")
-    atomic_json(state_path, {"version": VERSION, "archives": archive_state, "source_files": [], "results": results, "nested_archives": nested_results, "at": now_iso()})
+    atomic_json(state_path, {
+        "version": VERSION,
+        "archives": archive_state,
+        "source_files": [],
+        "results": results,
+        "nested_archives": nested_results,
+        "ignored_archives": [str(p.relative_to(batch_root)) for p in ignored_archives],
+        "at": now_iso(),
+    })
     return results
 
 
@@ -1133,17 +1164,24 @@ def inspect_docx(path: Path, title: str, check_login: bool) -> dict:
         if not is_cover_title(row["text"], title):
             continue
         for j in range(i + 1, min(len(paragraph_rows), i + 7)):
-            if is_manual_label_candidate(paragraph_rows[j]["text"]):
+            candidate_text = paragraph_rows[j]["text"]
+            if not candidate_text:
+                continue
+            if is_manual_label_candidate(candidate_text):
                 legacy_blocks.append({
                     "title_paragraph": row["index"],
                     "label_paragraph": paragraph_rows[j]["index"],
-                    "label": paragraph_rows[j]["text"],
+                    "label": candidate_text,
                     "title_text": row["text"],
-                    "accepted_label": LABEL_RE.fullmatch(paragraph_rows[j]["text"]) is not None,
+                    "accepted_label": LABEL_RE.fullmatch(candidate_text) is not None,
                     "title_props": row["props"],
                     "label_props": paragraph_rows[j]["props"],
                 })
-                break
+            # Once visible non-label content starts, a later label belongs to
+            # the body and must not be paired with the earlier title as a
+            # cover. This also prevents the repair stage from deleting it as a
+            # supposed duplicate cover fragment.
+            break
     # A supplied "software name + 说明书/手册" page is already a cover.  Keep
     # it instead of inserting another cover merely because its label is an
     # older naming variant.
@@ -3146,7 +3184,7 @@ def default_work_dir(batch_root: Path) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="程序优先、低Token的软著材料批量审查与修复")
-    parser.add_argument("batch_root", type=Path, help="包含RAR/ZIP/7z压缩包的批次目录")
+    parser.add_argument("batch_root", type=Path, help="批次目录：压缩包（RAR/ZIP/7z 等）或已解压的软著材料")
     parser.add_argument("--stage", choices=("preview", "audit", "repair", "verify", "all"), default="all")
     parser.add_argument("--extracted", type=Path, help="解压版目录；默认 BATCH_ROOT/解压版")
     parser.add_argument("--modified", type=Path, help="修改版目录；默认 BATCH_ROOT/修改版")

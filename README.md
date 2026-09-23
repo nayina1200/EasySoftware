@@ -1,4 +1,4 @@
-# EasySoftware 3.5.0
+# EasySoftware 3.6.0
 
 中国软件著作权材料批量审计、修复、两轮审核与交付打包程序。
 
@@ -38,6 +38,23 @@ python scripts\unified_workflow.py "C:\材料\批次文件夹" --reject-images n
 python scripts\unified_workflow.py "C:\材料\批次文件夹" --approve "1,3-5" --format rar
 ```
 
+### 说明书与代码统一处理
+
+主窗口的“处理说明和代码”使用一个入口、一个时间戳输出目录。处理前可勾选说明书、代码和 TXT 占位；未勾选的流程跳过，所选流程按“说明书 → 代码 → TXT 占位”执行。至少选择说明书或代码。默认先生成预览，确认后再落盘：
+
+```powershell
+python scripts\unified_workflow.py "C:\材料\批次.rar" --process-documents
+python scripts\unified_workflow.py "C:\材料\批次.rar" --apply-document-processing
+python scripts\unified_workflow.py "C:\材料\批次.rar" --process-documents --document-stages manual,code
+```
+
+- 说明书先等距抽查约四分之一界面图，离线 OCR 无文字时只记录“无法判断”，不会拦截；只有置信度不低于 0.85 的不相关结论才参与项目拦截和批次熔断。
+- 单项目超过一半有效抽样不相关时不修改该项目图片日期；全批超过 20% 项目不相关时，在任何图片日期修改前熔断。
+- 正文年份只在“当前、最新、截至”等高置信时效语境中替换为 2025；历史、标准、版权、版本和记录年份保留，不确定项进入人工复核。
+- 图片中只有早于 2025 的有效日期会把年份改为 2025，2025 和未来日期保留；修改时只处理年份字符，保留月、日和时间。报告展示原稿与处理后图片的对比；封面修复后由 Word 从 DOCX 重新导出 PDF。
+- 标题与正文的主题冲突会列为人工复核。本地视觉模型可抽样辅助判断 OCR 疑难图，结果仅展示为复核证据，不参与自动拦截。
+- 代码阶段复用既有中文注释清理规则。TXT 是第三期工程，本阶段只登记文件，不读取或修改内容。
+
 ### 独立代码中文注释清理
 
 该阶段不进入 TXT、说明书、终审或打包流程。默认先生成执行前预览，确认后再处理：
@@ -47,7 +64,7 @@ python scripts\unified_workflow.py "C:\材料\批次.rar" --clean-code-comments
 python scripts\unified_workflow.py "C:\材料\批次.rar" --apply-comment-cleanup
 ```
 
-也可在主窗口选择 RAR、文件夹或已解压的材料目录后，点击“清理代码中文注释”。输入为压缩包时只接受 RAR；输入为文件夹时优先处理其中递归找到的 RAR，若无 RAR 但文件夹内已有“代码.docx/代码.pdf”则直接处理该已解压材料（无需解压）。程序只删除“代码.docx”中含汉字的真实注释，保护字符串、模板字符串、正则、HTML 页面文字和 Python 三引号内容。不确定项保留在文档中并列入报告。输出为同级的“原名_已处理_时间戳”目录，原 RAR 不移动、不修改；本阶段不重新压缩。清理后先修改 DOCX，再用 Word 优先、LibreOffice 兜底重新生成同名 PDF，只有新 PDF 验证有效后才替换输出副本中的旧 PDF。
+旧命令行参数仍兼容独立代码阶段；主窗口已将它合并到“处理说明和代码”按钮。输入为压缩包时只接受 RAR；输入为文件夹时优先处理其中递归找到的 RAR，若无 RAR 但文件夹内已有“代码.docx/代码.pdf”则直接处理该已解压材料（无需解压）。程序只删除“代码.docx”中含汉字的真实注释，保护字符串、模板字符串、正则、HTML 页面文字和 Python 三引号内容。不确定项保留在文档中并列入报告。输出为同级的“原名_已处理_时间戳”目录，原 RAR 不移动、不修改；本阶段不重新压缩。清理后先修改 DOCX，再用 Word 优先、LibreOffice 兜底重新生成同名 PDF，只有新 PDF 验证有效后才替换输出副本中的旧 PDF。
 
 任一 DOCX 处理失败或 PDF 无法重新导出时，批次状态为 `CODE_COMMENT_CLEANUP_PARTIAL`并返回非零退出码；GUI 会显示警告而不会报“完成”。单个文件或 RAR 的失败不会中断其他文件，总报告会保留每项失败原因。
 

@@ -12,6 +12,9 @@ from lxml import etree
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# 被测模块按文件路径加载，需要把 scripts 加入 sys.path，
+# 否则被测模块内部的同级 import（如 archive_types）无法解析。
+sys.path.insert(0, str(ROOT / "scripts"))
 SPEC = importlib.util.spec_from_file_location("code_comment_cleaner", ROOT / "scripts" / "code_comment_cleaner.py")
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
@@ -328,13 +331,17 @@ class WorkflowSafetyTests(unittest.TestCase):
             self.assertEqual(len(documents), 2)
             self.assertTrue(all(item["status"] == "READY" for item in documents))
 
-    def test_folder_without_rar_or_code_material_raises_clear_error(self):
+    def test_folder_without_archive_or_code_material_raises_clear_error(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             (base / "项目说明.txt").write_text("不处理", encoding="utf-8")
             with self.assertRaises(ValueError) as raised:
                 MODULE.run(base, base / "work", ROOT, apply=False)
-            self.assertIn("未找到 RAR", str(raised.exception))
+            message = str(raised.exception)
+            self.assertIn("没有压缩包", message)
+            self.assertIn("代码材料", message)
+            # 文案不再把用户限定到 RAR：压缩包类型是宽集合
+            self.assertNotIn("未找到 RAR", message)
 
 
 class LauncherTests(unittest.TestCase):

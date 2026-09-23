@@ -6,6 +6,8 @@ import subprocess
 import zipfile
 from pathlib import Path
 
+import archive_types
+
 
 def safe_zip_extract(archive: Path, target: Path) -> None:
     target_resolved = target.resolve()
@@ -45,9 +47,9 @@ def main() -> None:
     args.destination.mkdir(parents=True, exist_ok=True)
     if any(args.destination.iterdir()):
         raise SystemExit("destination must be empty")
-    archives = [p for p in sorted(args.source.iterdir()) if p.is_file() and p.suffix.lower() in {".zip", ".rar", ".7z"}]
+    archives = [p for p in sorted(args.source.iterdir()) if p.is_file() and archive_types.is_archive_file(p)]
     if not archives:
-        raise SystemExit("no archives found")
+        raise SystemExit("批次目录没有可解压的压缩包")
     for archive in archives:
         target = args.destination / archive.stem
         extract_one(archive, target)

@@ -22,6 +22,8 @@ from pathlib import Path
 
 from lxml import etree
 
+import archive_types
+
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 NS = {"w": W_NS}
@@ -417,17 +419,23 @@ def clean_docx(path: Path) -> dict:
 
 
 def _find_7z(app_root: Path) -> Path:
-    candidates = [app_root / "tools/7z/7z.exe", Path(shutil.which("7z.exe") or ""), Path(shutil.which("7z") or "")]
+    candidates = [
+        app_root / "tools/7z/7z.exe",
+        Path(shutil.which("7z.exe") or ""),
+        Path(shutil.which("7z") or ""),
+        Path(r"C:\Program Files 7-Zip\7z.exe"),
+        Path(r"C:\Program Files (x86)\7-Zip\7z.exe"),
+    ]
     for candidate in candidates:
         if candidate.is_file():
             return candidate
-    raise RuntimeError("未找到 7-Zip，无法解压 RAR")
+    raise RuntimeError("未找到 7-Zip，无法解压压缩包")
 
 
 def _validate_archive_members(seven_zip: Path, archive: Path) -> None:
     result = subprocess.run([str(seven_zip), "l", "-slt", str(archive)], text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if result.returncode != 0:
-        raise RuntimeError(f"无法读取 RAR 目录：{archive.name}")
+        raise RuntimeError(f"无法读取压缩包目录：{archive.name}")
     member_listing = result.stdout.split("----------", 1)[-1] if "----------" in result.stdout else ""
     for match in re.finditer(r"(?m)^Path = (.+)$", member_listing):
         value = match.group(1).strip()
@@ -475,7 +483,7 @@ def extract_cached(archive: Path, work: Path, app_root: Path) -> Path:
     result = subprocess.run(command, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if result.returncode != 0:
         shutil.rmtree(temporary, ignore_errors=True)
-        raise RuntimeError(f"RAR 解压失败：{archive.name}\n{result.stdout[-1000:]}")
+        raise RuntimeError(f"压缩包解压失败：{archive.name}\n{result.stdout[-1000:]}")
     _validate_extracted_tree(temporary)
     target.parent.mkdir(parents=True, exist_ok=True)
     os.replace(temporary, target)
@@ -495,13 +503,19 @@ def material_root(extracted: Path) -> Path:
 
 def discover_archives(source: Path) -> list[Path]:
     if source.is_file():
-        if source.suffix.casefold() != ".rar":
-            raise ValueError("代码注释清理阶段当前只接受 RAR")
+        if not archive_types.is_archive_file(source):
+            raise ValueError("代码注释清理阶段接受压缩包（RAR/ZIP/7z 等）或已解压的代码材料文件夹")
         return [source]
-    rars = sorted((path for path in source.rglob("*.rar") if "_已处理_" not in str(path)), key=lambda p: str(p).casefold())
-    if rars:
-        return rars
-    # 文件夹没有 RAR 时，直接处理其中的已解压代码材料（无需解压）。
+    archives = sorted(
+        (path for path in source.rglob("*")
+         if path.is_file() and archive_types.is_archive_file(path) and "_已处理_" not in str(path)),
+        key=lambda p: str(p).casefold(),
+    )
+    # 文件夹入口以已解压材料为准：压缩包有独立的选择入口，
+    # 就地解压后残留的压缩包不再重复解压。
+    pending = [path for path in archives if not archive_types.is_leftover_archive(path)]
+    if pending:
+        return pending
     docx_files, pdf_files = _code_files(source)
     if docx_files or pdf_files:
         return [source]
@@ -614,7 +628,7 @@ def run(
 ) -> dict:
     archives = discover_archives(source.resolve())
     if not archives:
-        raise ValueError("未找到 RAR 压缩包，且所选文件夹内也没有可直接处理的代码材料（名称以“代码.docx”或“代码.pdf”结尾的文件）")
+        raise ValueError("所选路径内没有压缩包，也没有可直接处理的代码材料（名称以“代码.docx”或“代码.pdf”结尾的文件）")
     report = {"version": RULE_VERSION, "created_at": datetime.now().astimezone().isoformat(), "source": str(source.resolve()), "applied": apply, "archives": []}
     prepared = []
     failures = 0
@@ -646,7 +660,7 @@ def run(
             failures += 1
             completed += 1
             if progress:
-                progress.update("读取RAR失败", completed, "无法读取项目", status="FAILED", active=False, failures=failures, archive=archive.name, error=archive_row.get("error"))
+                progress.update("读取压缩包失败", completed, "无法读取项目", status="FAILED", active=False, failures=failures, archive=archive.name, error=archive_row.get("error"))
             continue
         try:
             if apply:

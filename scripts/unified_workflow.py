@@ -17,10 +17,12 @@ import time
 import contextlib
 from pathlib import Path
 
+import archive_types
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
 
-VERSION = "3.5.0"
+VERSION = "3.6.0"
 HERE = Path(__file__).resolve().parent
 PROCESS = HERE / "process_batch.py"
 PACKAGE = HERE / "package_approved_modified.py"
@@ -152,6 +154,36 @@ def atomic_json(path: Path, value) -> None:
     os.replace(temporary, path)
 
 
+def resolve_modified_directory(batch_root: Path, source: Path | None = None) -> Path:
+    """定位修改版目录：优先返回真实存在的目录，不把已解压目录命名为
+    “解压版”作为前提；名称约定只作为最后的兜底猜测。"""
+    candidates: list[Path] = []
+    if source is not None and source.is_dir():
+        if source.name.endswith("修改版"):
+            candidates.append(source)
+        name = source.name
+        if name.endswith("_解压版"):
+            candidates.append(batch_root / f"{name[:-4]}_修改版")
+        elif name.endswith("解压版"):
+            candidates.append(batch_root / f"{name[:-3]}修改版")
+        candidates.append(batch_root / f"{source.stem}_修改版")
+        candidates.append(source / "修改版")
+    candidates.append(batch_root / "修改版")
+    candidates.append(batch_root.parent / f"{batch_root.stem}_修改版")
+    candidates.append(batch_root.parent / "修改版")
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            ordered.append(candidate)
+    for candidate in ordered:
+        if candidate.is_dir() and any(candidate.iterdir()):
+            return candidate
+    return ordered[0]
+
+
 def default_work_dir(batch_root: Path) -> Path:
     digest = hashlib.sha1(str(batch_root.resolve()).lower().encode("utf-8")).hexdigest()[:16]
     return Path(tempfile.gettempdir()) / "codex-softcopyright" / digest
@@ -218,8 +250,11 @@ def run_json(command: list[str]) -> dict:
 
 
 def detect_format(batch_root: Path) -> str | None:
+    # 交付格式只有 ZIP/RAR；7z 等只读输入格式不参与交付格式判断，
+    # 否则纯 7z 批次会推导出无法交付的格式。
     archives = sorted(
-        (path for path in batch_root.iterdir() if path.is_file() and path.suffix.lower() in {".zip", ".rar"}),
+        (path for path in batch_root.iterdir()
+         if path.is_file() and path.suffix.lower() in archive_types.DELIVERY_SUFFIXES),
         key=lambda path: (path.stem.casefold() != batch_root.name.casefold(), -path.stat().st_mtime_ns),
     )
     formats = {path.suffix.lower().lstrip(".") for path in archives}
@@ -663,7 +698,7 @@ def package_approved(args, python: Path, input_target: Path, batch_root: Path, m
         return {"status": "FAILED", "error": "统一审核页不存在或已失效，请重新运行处理", "work_dir": str(work)}
     indexes = parse_indexes(args.approve, len(projects))
     if args.format == "auto":
-        archive_format = ("rar" if selected_archive.suffix.lower() == ".rar" else "zip") if selected_archive is not None else detect_format(batch_root)
+        archive_format = (archive_types.delivery_format(selected_archive) or "zip") if selected_archive is not None else detect_format(batch_root)
     else:
         archive_format = args.format
     if archive_format is None:
@@ -681,6 +716,35 @@ def package_approved(args, python: Path, input_target: Path, batch_root: Path, m
     return result
 
 
+def exportable_docx_files(directory: Path) -> list[Path]:
+    """目录下可导出的 Word 文档，跳过临时文件和备份副本。"""
+    if not directory.is_dir():
+        return []
+    return [
+        path for path in directory.rglob("*.docx")
+        if not path.name.startswith("~$")
+        and not any(part.casefold().startswith(("backup", ".easysoftware-")) for part in path.parts)
+    ]
+
+
+def resolve_export_directory(modified: Path, input_target: Path) -> Path:
+    """导出 PDF 的目标目录。
+
+    不要求目录名以“修改版”“解压版”结尾：优先用户实际选择的目录
+    （其“修改版”子目录更精确时用它），推导出的修改版位置只作兜底，
+    避免为了找修改版而导出到用户没有选择的兄弟目录。
+    """
+    if input_target.is_dir():
+        nested = input_target / "修改版"
+        if exportable_docx_files(nested):
+            return nested
+        if exportable_docx_files(input_target):
+            return input_target
+    if exportable_docx_files(modified):
+        return modified
+    return input_target
+
+
 def export_modified_pdfs(modified: Path, work: Path, progress: ProgressReporter | None = None) -> dict:
     """Export only modified DOCX files and replace their sibling PDFs."""
     def failed_result(error: str) -> dict:
@@ -695,14 +759,12 @@ def export_modified_pdfs(modified: Path, work: Path, progress: ProgressReporter 
         return {"version": VERSION, "status": "FAILED", "error": error, "work_dir": str(work)}
 
     if not modified.is_dir():
-        return failed_result(f"未找到修改版目录：{modified}")
+        return failed_result(f"未找到修改版目录，也没有可直接导出的 Word 文档：{modified}")
+    docx_files = exportable_docx_files(modified)
+    if not docx_files:
+        return failed_result(f"目录内没有 Word 文档，无法导出 PDF：{modified}")
     if progress:
-        docx_total = sum(
-            1 for path in modified.rglob("*.docx")
-            if not path.name.startswith("~$")
-            and not any(part.casefold().startswith(("backup", ".easysoftware-")) for part in path.parts)
-        )
-        progress.set_total(max(1, docx_total))
+        progress.set_total(max(1, len(docx_files)))
     shell = shutil.which("powershell.exe") or shutil.which("pwsh") or shutil.which("powershell")
     if not shell:
         return failed_result("未找到 PowerShell")
@@ -771,10 +833,14 @@ def main() -> int:
     parser.add_argument("--clean-code-comments", action="store_true", help="独立预览代码DOCX中含汉字的真实注释，不进入其他流程")
     parser.add_argument("--apply-comment-cleanup", action="store_true", help="确认后执行代码注释清理并重新导出代码PDF")
     parser.add_argument("--skip-comment-preview", action="store_true", help="跳过代码注释清理预览（规则稳定后可用）")
+    parser.add_argument("--process-documents", action="store_true", help="预览说明书、代码、TXT占位统一处理流程")
+    parser.add_argument("--apply-document-processing", action="store_true", help="确认后按说明书、代码、TXT占位顺序执行统一处理")
+    parser.add_argument("--document-stages", default="manual,code,txt_placeholder",
+                        help="选择文档处理阶段，逗号分隔：manual,code,txt_placeholder；至少包含 manual 或 code")
     args = parser.parse_args()
 
     input_target = args.batch_root.resolve()
-    if not input_target.exists() and input_target.suffix.lower() in {".zip", ".rar"}:
+    if not input_target.exists() and archive_types.is_archive_file(input_target):
         nested = input_target.parent / input_target.stem / input_target.name
         if nested.is_file():
             input_target = nested.resolve()
@@ -796,13 +862,25 @@ def main() -> int:
                 status="FAILED", error=str(exc), active=False, failures=progress.failures + 1,
             )
             return emit({"version": VERSION, "status": "FAILED", "error": str(exc), "work_dir": str(work)}, 2)
-    selected_archive = input_target if input_target.is_file() and input_target.suffix.lower() in {".zip", ".rar"} else None
-    if input_target.is_file() and input_target.suffix.lower() == ".7z":
-        return emit({
-            "version": VERSION,
-            "status": "FAILED",
-            "error": "7z 可用于批次内嵌套解压，但最终交付只支持保留 ZIP 或 RAR 格式；请提供 ZIP/RAR 输入。",
-        }, 2)
+    if args.process_documents or args.apply_document_processing:
+        work = (args.work_dir or default_work_dir(input_target) / "document-processing").resolve()
+        progress = ProgressReporter(work)
+        try:
+            from combined_document_workflow import run as run_combined_document_workflow
+            result = run_combined_document_workflow(
+                input_target, work, HERE.parent,
+                apply=bool(args.apply_document_processing), progress=progress,
+                document_stages=args.document_stages,
+            )
+            return emit(result, 0 if result.get("status") == "DOCUMENT_PROCESSING_OK" else 2)
+        except Exception as exc:
+            progress.set_total(max(1, progress.total, progress.completed))
+            progress.update(
+                "材料统一处理失败", progress.total, "处理终止",
+                status="FAILED", error=str(exc), active=False, failures=progress.failures + 1,
+            )
+            return emit({"version": VERSION, "status": "FAILED", "error": str(exc), "work_dir": str(work)}, 2)
+    selected_archive = input_target if input_target.is_file() and archive_types.is_archive_file(input_target) else None
     if selected_archive is not None:
         selected_archive = prepare_archive_workspace(selected_archive)
         input_target = selected_archive
@@ -811,23 +889,15 @@ def main() -> int:
             return emit({"version": VERSION, "status": "FAILED", "error": f"已解压材料目录不存在或为空：{input_target}"}, 2)
         batch_root = input_target.parent
         extracted = input_target
-        name = input_target.name
-        if name.endswith("_解压版"):
-            default_modified = input_target.parent / f"{name[:-4]}_修改版"
-        elif name.endswith("解压版"):
-            default_modified = input_target.parent / f"{name[:-3]}修改版"
-        else:
-            default_modified = input_target.parent / "修改版"
-        modified = (args.modified or default_modified).resolve()
+        modified = (args.modified or resolve_modified_directory(batch_root, input_target)).resolve()
     else:
         batch_root = selected_archive.parent if selected_archive is not None else input_target
         if selected_archive is not None:
             extracted = (args.extracted or batch_root / f"{selected_archive.stem}_解压版").resolve()
-            modified = (args.modified or batch_root / f"{selected_archive.stem}_修改版").resolve()
+            modified = (args.modified or resolve_modified_directory(batch_root, batch_root / f"{selected_archive.stem}_解压版")).resolve()
         else:
             extracted = (args.extracted or batch_root / "解压版").resolve()
-        default_modified = input_target if input_target.is_dir() and input_target.name.endswith("修改版") else batch_root / "修改版"
-        modified = (args.modified or default_modified).resolve()
+            modified = (args.modified or resolve_modified_directory(batch_root, input_target if input_target.is_dir() else None)).resolve()
     work = (args.work_dir or default_work_dir(input_target)).resolve()
     python = find_python(args.python)
     if python is None:
@@ -835,7 +905,7 @@ def main() -> int:
     try:
         if args.export_modified_pdfs:
             progress = ProgressReporter(work)
-            result = export_modified_pdfs(modified, work, progress)
+            result = export_modified_pdfs(resolve_export_directory(modified, input_target), work, progress)
         elif args.recheck_modified:
             result = recheck_modified(args, python, input_target, batch_root, extracted, modified, work)
         else:

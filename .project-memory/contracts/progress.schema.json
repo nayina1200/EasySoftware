@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EasySoftware progress.json contract",
+  "type": "object",
+  "required": ["status", "phase", "current", "total", "failures", "current_project_active"],
+  "properties": {
+    "status": {"enum": ["RUNNING", "DONE", "FAILED"]},
+    "phase": {"type": "string"},
+    "current": {"type": "integer", "minimum": 0},
+    "total": {"type": "integer", "minimum": 0},
+    "failures": {"type": "integer", "minimum": 0},
+    "current_project_active": {"type": "boolean"},
+    "archive_name": {"type": "string"},
+    "project_name": {"type": "string"},
+    "completed_projects": {"type": "integer", "minimum": 0},
+    "remaining_projects": {"type": "integer", "minimum": 0},
+    "elapsed_seconds": {"type": "number", "minimum": 0},
+    "estimated_remaining_seconds": {"type": ["number", "null"], "minimum": 0},
+    "error": {"type": "string"}
+  },
+  "x-invariants": [
+    "Prepare a stable total before processing when the total is knowable.",
+    "current is monotonic and equals total at a terminal state.",
+    "failures is cumulative and never decreases.",
+    "Preview, scan, apply, and PDF export share this contract.",
+    "Future phases must not replace this with an unrelated marquee-only progress system."
+  ]
+}

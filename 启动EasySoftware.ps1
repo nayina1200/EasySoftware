@@ -47,6 +47,37 @@ function Quote-Argument([string]$Value) {
     return '"' + ($Value -replace '"', '\"') + '"'
 }
 
+# 可作为输入的全部压缩包类型。必须与 scripts/archive_types.py 的 ARCHIVE_SUFFIXES 保持一致。
+# 交付（打包输出）仍然只有 RAR/ZIP，其余类型只作为输入读取。
+$script:ArchiveExtensions = @(
+    '.tar.gz', '.tar.bz2', '.tar.xz', '.tar.lz4',
+    '.7z', '.rar', '.rarx', '.zip', '.jar', '.iso', '.cab',
+    '.tar', '.gz', '.tgz', '.bz2', '.tbz', '.tbz2', '.xz', '.txz',
+    '.lz4', '.lzma', '.lz', '.zst', '.zstd', '.z', '.pax', '.zpaq',
+    '.ace', '.arj', '.lzh', '.lha', '.wim', '.msi', '.deb', '.rpm',
+    '.dmg', '.hfs', '.pet', '.vhd', '.vhdx', '.gem'
+)
+
+function Test-ArchivePath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $false }
+    $item = Get-Item -LiteralPath $Path
+    if ($item.PSIsContainer) { return $false }
+    $name = $item.Name.ToLowerInvariant()
+    foreach ($ext in $script:ArchiveExtensions) {
+        if ($name.EndsWith($ext)) { return $true }
+    }
+    return $false
+}
+
+function Test-ArchiveName([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $leaf = ([IO.Path]::GetFileName($Value.Trim())).ToLowerInvariant()
+    foreach ($ext in $script:ArchiveExtensions) {
+        if ($leaf.EndsWith($ext)) { return $true }
+    }
+    return $false
+}
+
 function Prepare-ArchiveWorkspace([System.IO.FileInfo]$Archive) {
     while ($Archive.Directory.Name -ieq $Archive.BaseName -and $Archive.Directory.Parent.Name -ieq $Archive.BaseName) {
         $target = Join-Path $Archive.Directory.Parent.FullName $Archive.Name
@@ -118,7 +149,7 @@ $title.AutoSize = $true
 $form.Controls.Add($title)
 
 $subtitle = New-Object System.Windows.Forms.Label
-$subtitle.Text = "选择一个 RAR / ZIP 压缩包，或选择一个批次文件夹。"
+$subtitle.Text = "选择一个压缩包（RAR / ZIP / 7z 等），或选择一个已解压的材料文件夹。"
 $subtitle.ForeColor = [System.Drawing.Color]::DimGray
 $subtitle.Location = New-Object System.Drawing.Point(25, 55)
 $subtitle.AutoSize = $true
@@ -197,7 +228,7 @@ $refurbishButton.FlatStyle = "Flat"
 $form.Controls.Add($refurbishButton)
 
 $codeCommentButton = New-Object System.Windows.Forms.Button
-$codeCommentButton.Text = "清理代码中文注释"
+$codeCommentButton.Text = "处理说明和代码"
 $codeCommentButton.Location = New-Object System.Drawing.Point(796, 135)
 $codeCommentButton.Size = New-Object System.Drawing.Size(160, 38)
 $codeCommentButton.Anchor = "Top,Right"
@@ -206,18 +237,54 @@ $codeCommentButton.ForeColor = [System.Drawing.Color]::White
 $codeCommentButton.FlatStyle = "Flat"
 $form.Controls.Add($codeCommentButton)
 
+$documentStageLabel = New-Object System.Windows.Forms.Label
+$documentStageLabel.Text = "材料处理流程（勾选后预览）："
+$documentStageLabel.Location = New-Object System.Drawing.Point(26, 179)
+$documentStageLabel.AutoSize = $true
+$documentStageLabel.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
+$form.Controls.Add($documentStageLabel)
+
+$manualStageCheck = New-Object System.Windows.Forms.CheckBox
+$manualStageCheck.Text = "说明书"
+$manualStageCheck.Location = New-Object System.Drawing.Point(248, 176)
+$manualStageCheck.Size = New-Object System.Drawing.Size(100, 27)
+$manualStageCheck.Checked = $true
+$form.Controls.Add($manualStageCheck)
+
+$codeStageCheck = New-Object System.Windows.Forms.CheckBox
+$codeStageCheck.Text = "代码"
+$codeStageCheck.Location = New-Object System.Drawing.Point(355, 176)
+$codeStageCheck.Size = New-Object System.Drawing.Size(85, 27)
+$codeStageCheck.Checked = $true
+$form.Controls.Add($codeStageCheck)
+
+$txtStageCheck = New-Object System.Windows.Forms.CheckBox
+$txtStageCheck.Text = "TXT占位"
+$txtStageCheck.Location = New-Object System.Drawing.Point(447, 176)
+$txtStageCheck.Size = New-Object System.Drawing.Size(120, 27)
+$txtStageCheck.Checked = $true
+$form.Controls.Add($txtStageCheck)
+
+$stageSelectionHint = New-Object System.Windows.Forms.Label
+$stageSelectionHint.Text = "未勾选的流程将跳过"
+$stageSelectionHint.ForeColor = [System.Drawing.Color]::DimGray
+$stageSelectionHint.Location = New-Object System.Drawing.Point(587, 180)
+$stageSelectionHint.AutoSize = $true
+$stageSelectionHint.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 8.5)
+$form.Controls.Add($stageSelectionHint)
+
 $workflowGuide = New-Object System.Windows.Forms.Label
 $workflowGuide.Text = "工作流：1 选择材料  >  2 首轮看图并微调 Word  >  3 二次处理  >  4 终审  >  5 导出 PDF  >  6 压缩交付"
 $workflowGuide.ForeColor = [System.Drawing.Color]::FromArgb(49, 82, 138)
 $workflowGuide.BackColor = [System.Drawing.Color]::FromArgb(238, 244, 255)
-$workflowGuide.Location = New-Object System.Drawing.Point(26, 176)
+$workflowGuide.Location = New-Object System.Drawing.Point(26, 216)
 $workflowGuide.Size = New-Object System.Drawing.Size(710, 18)
 $workflowGuide.Anchor = "Top,Left,Right"
 $workflowGuide.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 8.5)
 $form.Controls.Add($workflowGuide)
 
 $progress = New-Object System.Windows.Forms.ProgressBar
-$progress.Location = New-Object System.Drawing.Point(26, 198)
+$progress.Location = New-Object System.Drawing.Point(26, 238)
 $progress.Size = New-Object System.Drawing.Size(914, 22)
 $progress.Anchor = "Top,Left,Right"
 $progress.Style = "Continuous"
@@ -229,14 +296,14 @@ $form.Controls.Add($progress)
 $progressDetail = New-Object System.Windows.Forms.Label
 $progressDetail.Text = "等待开始"
 $progressDetail.ForeColor = [System.Drawing.Color]::DimGray
-$progressDetail.Location = New-Object System.Drawing.Point(26, 224)
+$progressDetail.Location = New-Object System.Drawing.Point(26, 264)
 $progressDetail.Size = New-Object System.Drawing.Size(914, 24)
 $progressDetail.Anchor = "Top,Left,Right"
 $form.Controls.Add($progressDetail)
 
 $logBox = New-Object System.Windows.Forms.TextBox
-$logBox.Location = New-Object System.Drawing.Point(26, 252)
-$logBox.Size = New-Object System.Drawing.Size(914, 323)
+$logBox.Location = New-Object System.Drawing.Point(26, 292)
+$logBox.Size = New-Object System.Drawing.Size(914, 283)
 $logBox.Anchor = "Top,Bottom,Left,Right"
 $logBox.Multiline = $true
 $logBox.ReadOnly = $true
@@ -294,6 +361,25 @@ $script:workDir = $null
 $script:reviewStage = $null
 $script:fromExtracted = $false
 $script:exportWorkDir = $null
+$script:documentStages = $null
+
+function Get-SelectedDocumentStages {
+    $selected = @()
+    if ($manualStageCheck.Checked) { $selected += "manual" }
+    if ($codeStageCheck.Checked) { $selected += "code" }
+    if ($txtStageCheck.Checked) { $selected += "txt_placeholder" }
+    return ($selected -join ",")
+}
+
+function Get-DocumentStageSummary([string]$Stages) {
+    $selected = @($Stages -split ",")
+    $run = @()
+    $skip = @()
+    foreach ($stage in @(@("manual", "说明书"), @("code", "代码"), @("txt_placeholder", "TXT占位"))) {
+        if ($selected -contains $stage[0]) { $run += $stage[1] } else { $skip += $stage[1] }
+    }
+    return "执行：$($run -join ' → ')；跳过：$(if ($skip.Count) { $skip -join '、' } else { '无' })"
+}
 
 function Append-Log([string]$Text) {
     if ([string]::IsNullOrWhiteSpace($Text)) { return }
@@ -339,6 +425,10 @@ function Set-Busy([bool]$Busy, [string]$Status) {
     $folderButton.Enabled = -not $Busy
     $refurbishButton.Enabled = -not $Busy
     $codeCommentButton.Enabled = -not $Busy
+    $stageChecksEnabled = (-not $Busy) -and ($script:reviewStage -ne "documents")
+    $manualStageCheck.Enabled = $stageChecksEnabled
+    $codeStageCheck.Enabled = $stageChecksEnabled
+    $txtStageCheck.Enabled = $stageChecksEnabled
     $exportButton.Enabled = (-not $Busy) -and (-not [string]::IsNullOrWhiteSpace($inputBox.Text))
     $packageButton.Enabled = (-not $Busy) -and ($null -ne $script:reviewPath)
     $recheckButton.Enabled = (-not $Busy) -and ($script:reviewStage -eq "final")
@@ -355,6 +445,9 @@ function Set-Busy([bool]$Busy, [string]$Status) {
         $progress.Value = 100
     }
     $statusLabel.Text = $Status
+    if (-not $Busy -and $script:reviewStage -in @("documents", "documents-done")) {
+        $progressDetail.Text = $Status
+    }
 }
 
 function Update-ExportAvailability {
@@ -373,6 +466,31 @@ function Get-MainWorkDir {
     return Join-Path ([IO.Path]::GetTempPath()) ("codex-softcopyright\" + $key + $suffix)
 }
 
+function Resolve-ModifiedDirectory([string]$BatchRoot, [string]$Source = "") {
+    # 定位修改版目录：优先返回真实存在的目录，不把已解压目录命名为
+    # “解压版”作为前提；名称约定只作为最后的兜底猜测。
+    $candidates = @()
+    if ($Source -and (Test-Path -LiteralPath $Source -PathType Container)) {
+        $item = Get-Item -LiteralPath $Source
+        if ($item.Name.EndsWith("修改版")) { $candidates += $item.FullName }
+        $name = $item.Name
+        if ($name.EndsWith("_解压版")) { $candidates += (Join-Path $item.Parent.FullName ($name.Substring(0, $name.Length - 4) + "_修改版")) }
+        elseif ($name.EndsWith("解压版")) { $candidates += (Join-Path $item.Parent.FullName ($name.Substring(0, $name.Length - 3) + "修改版")) }
+        $candidates += (Join-Path $item.Parent.FullName ($item.BaseName + "_修改版"))
+        $candidates += (Join-Path $item.FullName "修改版")
+    }
+    $candidates += (Join-Path $BatchRoot "修改版")
+    $candidates += (Join-Path (Split-Path -Parent $BatchRoot) (([IO.Path]::GetFileName($BatchRoot.TrimEnd('\', '/'))) + "_修改版"))
+    $candidates += (Join-Path (Split-Path -Parent $BatchRoot) "修改版")
+    $ordered = @($candidates | Where-Object { $_ } | Select-Object -Unique)
+    foreach ($candidate in $ordered) {
+        if (Test-Path -LiteralPath $candidate -PathType Container -ErrorAction SilentlyContinue) {
+            if (Get-ChildItem -LiteralPath $candidate -Force -ErrorAction SilentlyContinue | Select-Object -First 1) { return $candidate }
+        }
+    }
+    return ($ordered | Select-Object -First 1)
+}
+
 function Get-ActiveModifiedDirectory {
     $manifestPath = if ($null -ne $script:workDir) { Join-Path $script:workDir "unified_review.json" } else { $null }
     if ($manifestPath -and (Test-Path -LiteralPath $manifestPath)) {
@@ -385,15 +503,9 @@ function Get-ActiveModifiedDirectory {
     }
     $source = Get-Item -LiteralPath $script:batchRoot -ErrorAction SilentlyContinue
     if ($null -eq $source) { return $null }
-    if ($script:fromExtracted) {
-        $name = $source.Name
-        if ($name.EndsWith("_解压版")) { return (Join-Path $source.Parent.FullName ($name.Substring(0, $name.Length - 4) + "_修改版")) }
-        if ($name.EndsWith("解压版")) { return (Join-Path $source.Parent.FullName ($name.Substring(0, $name.Length - 3) + "修改版")) }
-        return (Join-Path $source.Parent.FullName "修改版")
-    }
     if (-not $source.PSIsContainer) { return (Join-Path $source.DirectoryName ($source.BaseName + "_修改版")) }
-    if ($source.Name.EndsWith("修改版")) { return $source.FullName }
-    return (Join-Path $source.FullName "修改版")
+    $batchRoot = if ($script:fromExtracted) { $source.Parent.FullName } else { $source.FullName }
+    return (Resolve-ModifiedDirectory $batchRoot $source.FullName)
 }
 
 function Confirm-PdfFreshness {
@@ -485,12 +597,14 @@ $timer.Add_Tick({
                     $activity = if ($active) { "正在处理：$project" } else { "最近完成：$project" }
                     $failed = if ($null -ne $state.failures) { [int]$state.failures } else { 0 }
                     $archive = if (-not [string]::IsNullOrWhiteSpace([string]$state.archive_name)) { [string]$state.archive_name } else { "-" }
-                    $progressDetail.Text = "已处理 $done 件 · 待处理 $left 件 · 失败 $failed 件 · RAR：$archive · $activity · 阶段：$displayPhase$eta · 已用 $elapsed 秒"
+                    $selectionDetail = if ($script:documentStages -and $script:operation -match "所选材料流程") { " · " + (Get-DocumentStageSummary $script:documentStages) } else { "" }
+                    $progressDetail.Text = "已处理 $done 件 · 待处理 $left 件 · 失败 $failed 件 · 压缩包：$archive · $activity · 阶段：$displayPhase$eta · 已用 $elapsed 秒$selectionDetail"
                 } else {
                     $progress.Style = "Marquee"
                     $progress.MarqueeAnimationSpeed = 30
                     $statusLabel.Text = $displayPhase
-                    $progressDetail.Text = "正在准备项目清单 · 模块：$displayPhase · 已用 $elapsed 秒"
+                    $selectionDetail = if ($script:documentStages -and $script:operation -match "所选材料流程") { " · " + (Get-DocumentStageSummary $script:documentStages) } else { "" }
+                    $progressDetail.Text = "正在准备项目清单 · 模块：$displayPhase · 已用 $elapsed 秒$selectionDetail"
                 }
             } catch { }
         }
@@ -535,6 +649,28 @@ $timer.Add_Tick({
         $packageButton.Enabled = $true
         Set-Busy $false ("预览完成：预计删除 " + [string]$result.deletions + " 处")
         if ($reviewButton.Enabled) { Start-Process -FilePath $script:reviewPath }
+    } elseif ($result.status -eq "NEEDS_DOCUMENT_PROCESSING_REVIEW") {
+        $script:reviewPath = [string]$result.report
+        $script:reviewStage = "documents"
+        $reviewButton.Text = "打开材料处理预览"
+        $reviewButton.Enabled = Test-Path -LiteralPath $script:reviewPath
+        $approvalBox.Enabled = $false
+        $approvalLabel.Text = "材料处理流程："
+        $approvalBox.Text = ""
+        $packageButton.Text = "确认并开始处理"
+        $packageButton.Enabled = $true
+        Set-Busy $false ("预检完成：" + (Get-DocumentStageSummary $script:documentStages))
+        if ($reviewButton.Enabled) { Start-Process -FilePath $script:reviewPath }
+    } elseif ($result.status -in @("DOCUMENT_PROCESSING_OK", "DOCUMENT_PROCESSING_PARTIAL")) {
+        $script:reviewPath = [string]$result.report
+        $script:reviewStage = "documents-done"
+        $reviewButton.Text = "打开材料处理报告"
+        $reviewButton.Enabled = Test-Path -LiteralPath $script:reviewPath
+        $approvalBox.Enabled = $false
+        $caption = if ($result.status -eq "DOCUMENT_PROCESSING_OK") { "材料统一处理完成" } else { "材料处理部分完成，请复核异常" }
+        Set-Busy $false ($caption + "：失败/待处理 " + [string]$result.failures + " 项；" + (Get-DocumentStageSummary $script:documentStages))
+        $packageButton.Enabled = $false
+        [System.Windows.Forms.MessageBox]::Show(($caption + "。`n`n输出目录：`n" + [string]$result.output + "`n`n报告：`n" + [string]$result.report), "EasySoftware", "OK", $(if ($result.status -eq "DOCUMENT_PROCESSING_OK") { "Information" } else { "Warning" })) | Out-Null
     } elseif ($result.status -eq "CODE_COMMENT_CLEANUP_OK") {
         $script:reviewPath = [string]$result.report
         $script:reviewStage = "code-comments-done"
@@ -602,7 +738,7 @@ $timer.Add_Tick({
 $archiveButton.Add_Click({
     $dialog = New-Object System.Windows.Forms.OpenFileDialog
     $dialog.Title = "选择软著材料压缩包"
-    $dialog.Filter = "软著压缩包 (*.rar;*.zip)|*.rar;*.zip|RAR (*.rar)|*.rar|ZIP (*.zip)|*.zip|所有文件 (*.*)|*.*"
+    $dialog.Filter = "软著压缩包|*.rar;*.zip;*.7z;*.tar;*.gz;*.tgz;*.tar.gz;*.bz2;*.xz;*.lz4;*.zst|RAR (*.rar)|*.rar|ZIP (*.zip)|*.zip|7z (*.7z)|*.7z|所有文件 (*.*)|*.*"
     $dialog.CheckFileExists = $true
     if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         $inputBox.Text = $dialog.FileName
@@ -627,47 +763,55 @@ $inputBox.Add_TextChanged({ Update-ExportAvailability })
 $codeCommentButton.Add_Click({
     $value = $inputBox.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($value) -or -not (Test-Path -LiteralPath $value)) {
-        [System.Windows.Forms.MessageBox]::Show("请先选择 RAR 压缩包、包含 RAR 的文件夹，或已解压的代码材料文件夹。", "EasySoftware", "OK", "Warning") | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("请先选择压缩包，或已解压的软著材料文件夹。", "EasySoftware", "OK", "Warning") | Out-Null
         return
     }
+    $selectedStages = Get-SelectedDocumentStages
+    if ([string]::IsNullOrWhiteSpace($selectedStages)) {
+        [System.Windows.Forms.MessageBox]::Show("请至少勾选一个材料处理流程。", "EasySoftware", "OK", "Warning") | Out-Null
+        return
+    }
+    if (-not $manualStageCheck.Checked -and -not $codeStageCheck.Checked) {
+        [System.Windows.Forms.MessageBox]::Show("TXT 流程目前仅作占位登记，请至少勾选说明书或代码。", "EasySoftware", "OK", "Warning") | Out-Null
+        return
+    }
+    $script:documentStages = $selectedStages
     $script:batchRoot = (Get-Item -LiteralPath $value).FullName
     $bytes = [Text.Encoding]::UTF8.GetBytes($script:batchRoot.ToLowerInvariant())
     $hash = [Security.Cryptography.SHA1]::Create().ComputeHash($bytes)
     $key = ((-join ($hash | ForEach-Object { $_.ToString("x2") })).Substring(0, 16))
-    $script:workDir = Join-Path ([IO.Path]::GetTempPath()) ("codex-softcopyright\" + $key + "-code-comments")
+    $script:workDir = Join-Path ([IO.Path]::GetTempPath()) ("codex-softcopyright\" + $key + "-documents")
     $script:reviewPath = $null
     $script:reviewStage = $null
     $reviewButton.Enabled = $false
     $packageButton.Enabled = $false
     $approvalBox.Enabled = $false
     $logBox.Clear()
-    Append-Log ("代码注释清理预览：" + $script:batchRoot)
-    Start-Operation -Arguments @($script:batchRoot, "--work-dir", $script:workDir, "--clean-code-comments") -Operation "正在扫描代码中文注释..."
+    Append-Log ("材料统一处理预览：" + $script:batchRoot)
+    Append-Log (Get-DocumentStageSummary $script:documentStages)
+    Start-Operation -Arguments @($script:batchRoot, "--work-dir", $script:workDir, "--process-documents", "--document-stages", $script:documentStages) -Operation "正在预检所选材料流程..."
 })
 
 $exportButton.Add_Click({
     $value = $inputBox.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($value) -or -not (Test-Path -LiteralPath $value)) {
-        [System.Windows.Forms.MessageBox]::Show("请先选择原批次文件夹或压缩包。", "EasySoftware", "OK", "Warning") | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("请先选择要导出 PDF 的文件夹或压缩包。", "EasySoftware", "OK", "Warning") | Out-Null
         return
     }
     $item = Get-Item -LiteralPath $value
-    if (-not $item.PSIsContainer -and $item.Extension.ToLowerInvariant() -in @('.zip', '.rar')) {
+    if (Test-ArchivePath $value) {
         try { $value = Prepare-ArchiveWorkspace $item; $inputBox.Text = $value } catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "EasySoftware", "OK", "Error") | Out-Null; return }
     }
     $selected = Get-Item -LiteralPath $value
-    # Use the batch root from the last processing step so the export matches the
-    # same modified directory. Never overwrite $script:batchRoot or $script:workDir
-    # here: packaging and re-verification rely on them. The export report goes to
-    # a separate "-export" directory instead.
-    if ([string]::IsNullOrWhiteSpace($script:batchRoot)) {
-        $script:batchRoot = if ($selected.PSIsContainer -and $selected.Name.EndsWith("修改版")) { $selected.Parent.FullName } else { $selected.FullName }
-    }
-    $bytes = [Text.Encoding]::UTF8.GetBytes($script:batchRoot.ToLowerInvariant())
+    # 导出只跟随本次选择的目录，不要求目录名叫“解压版”或“修改版”：程序按
+    # 目录内容推导导出位置。这里不改 $script:batchRoot 与 $script:workDir，
+    # 打包与复验仍沿用上一次流程的批次根目录；导出报告写入独立的 -export 目录。
+    $exportBatchRoot = $selected.FullName
+    $bytes = [Text.Encoding]::UTF8.GetBytes($exportBatchRoot.ToLowerInvariant())
     $hash = [Security.Cryptography.SHA1]::Create().ComputeHash($bytes)
     $key = ((-join ($hash | ForEach-Object { $_.ToString("x2") })).Substring(0, 16))
     $script:exportWorkDir = Join-Path ([IO.Path]::GetTempPath()) ("codex-softcopyright\" + $key + "-export")
-    $arguments = @($script:batchRoot, "--work-dir", $script:exportWorkDir, "--export-modified-pdfs")
+    $arguments = @($exportBatchRoot, "--work-dir", $script:exportWorkDir, "--export-modified-pdfs")
     if ($script:fromExtracted) { $arguments += "--from-extracted" }
     Set-WorkflowGuide "export"
     Start-Operation -Arguments $arguments -Operation "正在将修改版 Word 导出并覆盖 PDF..."
@@ -675,7 +819,7 @@ $exportButton.Add_Click({
 
 $startButton.Add_Click({
     $value = $inputBox.Text.Trim()
-    if (-not (Test-Path -LiteralPath $value) -and [IO.Path]::GetExtension($value).ToLowerInvariant() -in @('.zip', '.rar')) {
+    if (Test-ArchiveName $value) {
         $nested = Join-Path (Join-Path (Split-Path -Parent $value) ([IO.Path]::GetFileNameWithoutExtension($value))) ([IO.Path]::GetFileName($value))
         if (Test-Path -LiteralPath $nested) { $value = $nested; $inputBox.Text = $nested }
     }
@@ -684,7 +828,7 @@ $startButton.Add_Click({
         return
     }
     $item = Get-Item -LiteralPath $value
-    if (-not $item.PSIsContainer -and $item.Extension.ToLowerInvariant() -in @('.zip', '.rar')) {
+    if (Test-ArchivePath $value) {
         try {
             $prepared = Prepare-ArchiveWorkspace $item
             $item = Get-Item -LiteralPath $prepared
@@ -718,7 +862,7 @@ $startButton.Add_Click({
 
 $fromSecondButton.Add_Click({
     $value = $inputBox.Text.Trim()
-    if (-not (Test-Path -LiteralPath $value) -and [IO.Path]::GetExtension($value).ToLowerInvariant() -in @('.zip', '.rar')) {
+    if (Test-ArchiveName $value) {
         $nested = Join-Path (Join-Path (Split-Path -Parent $value) ([IO.Path]::GetFileNameWithoutExtension($value))) ([IO.Path]::GetFileName($value))
         if (Test-Path -LiteralPath $nested) { $value = $nested; $inputBox.Text = $nested }
     }
@@ -727,7 +871,7 @@ $fromSecondButton.Add_Click({
         return
     }
     $item = Get-Item -LiteralPath $value
-    if (-not $item.PSIsContainer -and $item.Extension.ToLowerInvariant() -in @('.zip', '.rar')) {
+    if (Test-ArchivePath $value) {
         try {
             $prepared = Prepare-ArchiveWorkspace $item
             $item = Get-Item -LiteralPath $prepared
@@ -845,6 +989,12 @@ $recheckButton.Add_Click({
 })
 
 $packageButton.Add_Click({
+    if ($script:reviewStage -eq "documents") {
+        $packageButton.Enabled = $false
+        Append-Log ("确认处理，" + (Get-DocumentStageSummary $script:documentStages))
+        Start-Operation -Arguments @($script:batchRoot, "--work-dir", $script:workDir, "--apply-document-processing", "--document-stages", $script:documentStages) -Operation "正在处理所选材料流程..."
+        return
+    }
     if ($script:reviewStage -eq "code-comments") {
         $packageButton.Enabled = $false
         Start-Operation -Arguments @($script:batchRoot, "--work-dir", $script:workDir, "--apply-comment-cleanup") -Operation "正在清理注释并重新导出代码 PDF..."

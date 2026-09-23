@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "stage_order": ["manual", "code", "txt_placeholder"],
+  "word_com_parallel": false,
+  "manual": {
+    "sample_fraction": 0.25,
+    "sampling": "equidistant_include_ends",
+    "minimum_samples_when_images_exist": 4,
+    "ocr_unknown_blocks": false,
+    "irrelevant_confidence_threshold": 0.85,
+    "project_block_rule": "irrelevant / decisive > 0.5",
+    "batch_fuse_rule": "blocked_projects / projects > 0.2",
+    "target_year": 2025,
+    "screenshot_date_policy": "replace_year_only_keep_month_day_and_format",
+    "body_year_decisions": ["UPDATE_TO_2025", "KEEP", "REVIEW"],
+    "body_year_write_rule": "UPDATE_TO_2025 and confidence >= 0.85",
+    "preserve_page_size": true,
+    "complete_missing_subtitle": false,
+    "pdf_export": true
+  },
+  "txt": {
+    "implemented": false,
+    "read_content": false,
+    "modify_content": false
+  },
+  "output": {
+    "copy_count": 1,
+    "timestamped_directory": true,
+    "repack_rar": false
+  }
+}
