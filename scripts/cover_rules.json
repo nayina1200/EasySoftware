@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "maximum_label_length": 32,
+  "wrappers": [
+    ["《", "》"],
+    ["「", "」"],
+    ["『", "』"],
+    ["【", "】"],
+    ["[", "]"],
+    ["（", "）"],
+    ["(", ")"]
+  ],
+  "purpose_terms": [
+    "需求规格", "产品技术", "系统设计", "技术", "设计", "使用", "用户", "操作", "安装", "部署", "维护", "产品", "系统"
+  ],
+  "document_types": ["需求规格说明书", "说明书", "手册", "指南", "指引", "文档"],
+  "full_labels": [
+    "说明书", "软件说明书", "使用说明书", "软件使用说明书", "用户说明书", "用户使用说明书",
+    "使用手册", "软件使用手册", "用户手册", "软件用户手册", "用户使用手册", "用户操作手册",
+    "操作手册", "软件操作手册", "操作说明书", "用户操作说明", "软件设计说明", "软件设计说明书",
+    "设计说明书", "设计手册", "技术说明书", "技术手册", "技术指南", "技术指引", "产品技术文档",
+    "系统设计文档", "需求规格说明书", "安装指南", "安装指引", "部署指南", "部署手册", "维护手册",
+    "维护指南", "用户指南", "使用指南", "操作指南", "产品说明书", "系统说明书", "技术说明手册"
+  ],
+  "allowed_prefixes": ["软件"],
+  "exclude_terms": ["目录", "文档编号", "页眉", "页脚", "第", "页码"],
+  "sentence_punctuation": ["。", "！", "？", "!", "?", "；", ";", "，", ",", "：", ":"],
+  "cover_version_pattern": "(?i)(?:\\s*(?:V|版本)\\s*\\d+(?:\\.\\d+)*|\\s*\\d+\\.\\d+(?:\\.\\d+)*)$",
+  "cover_ordinal_pattern": "^(?:\\d+[、.．)）]|[（(](?:\\d+|[一二三四五六七八九十]+)[）)]|第[一二三四五六七八九十]+[章节部分、，.]?|[一二三四五六七八九十]+[、.．)）])",
+  "golden_cases": [
+    {"text": "《系统设计文档》", "title": null, "normalized": "系统设计文档", "kind": "manual_label", "reason": "完整标签“系统设计文档”"},
+    {"text": "产品技术文档", "title": null, "normalized": "产品技术文档", "kind": "manual_label", "reason": "完整标签“产品技术文档”"},
+    {"text": "【用户手册】", "title": null, "normalized": "用户手册", "kind": "manual_label", "reason": "完整标签“用户手册”"},
+    {"text": "需求规格说明书", "title": null, "normalized": "需求规格说明书", "kind": "manual_label", "reason": "完整标签“需求规格说明书”"},
+    {"text": "技术说明手册", "title": null, "normalized": "技术说明手册", "kind": "manual_label", "reason": "完整标签“技术说明手册”"},
+    {"text": "项目文档", "title": null, "normalized": "项目文档", "kind": "other", "reason": "缺少明确文档用途词"},
+    {"text": "文档", "title": null, "normalized": "文档", "kind": "other", "reason": "缺少明确文档用途词"},
+    {"text": "这是用户手册的介绍。", "title": null, "normalized": "这是用户手册的介绍。", "kind": "other", "reason": "含句末标点或文档编号字符，不是完整标签"},
+    {"text": "用户手册", "title": "患者服务平台", "normalized": "用户手册", "kind": "manual_label", "reason": "完整标签“用户手册”"},
+    {"text": "示例软件 V1.2", "title": "示例软件", "normalized": "示例软件V1.2", "kind": "cover_title", "reason": "与软件全称完整匹配（末尾版本号可移除）"},
+    {"text": "1、示例软件", "title": "示例软件", "normalized": "1、示例软件", "kind": "cover_title", "reason": "与软件全称完整匹配（封面编号可移除）"},
+    {"text": "《示例软件》", "title": "示例软件", "normalized": "示例软件", "kind": "cover_title", "reason": "与软件全称完整匹配"},
+    {"text": "软件设计说明书", "title": null, "normalized": "软件设计说明书", "kind": "manual_label", "reason": "完整标签“软件设计说明书”"},
+    {"text": "目录", "title": null, "normalized": "目录", "kind": "excluded", "reason": "命中排除词“目录”"}
+  ]
+}

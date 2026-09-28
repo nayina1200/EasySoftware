@@ -1,8 +1,9 @@
 param(
     [Parameter(Mandatory = $true)][string]$DocxPath,
-    [Parameter(Mandatory = $true)][string]$TemporaryPdfPath,
+    [string]$TemporaryPdfPath = "",
     [Parameter(Mandatory = $true)][string]$ResultPath,
-    [string]$PidPath = ""
+    [string]$PidPath = "",
+    [switch]$CountOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,7 +42,13 @@ namespace EasySoftware {
         [IO.File]::WriteAllText([IO.Path]::GetFullPath($PidPath), [string]$wordPid, (New-Object Text.UTF8Encoding($false)))
     }
 
-    $doc = $word.Documents.Open((Resolve-Path -LiteralPath $DocxPath).Path, $false, $false)
+    $doc = $word.Documents.Open((Resolve-Path -LiteralPath $DocxPath).Path, $false, [bool]$CountOnly)
+    if ($CountOnly) {
+        $doc.Repaginate()
+        $pages = [int]$doc.ComputeStatistics(2)
+        Write-Result @{ status = "OK"; docx = [IO.Path]::GetFullPath($DocxPath); pages = $pages }
+        exit 0
+    }
     try { [void]$doc.Fields.Update() } catch {}
     foreach ($section in $doc.Sections) {
         foreach ($story in @($section.Headers) + @($section.Footers)) {

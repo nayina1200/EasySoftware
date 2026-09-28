@@ -1,6 +1,8 @@
 import importlib.util
 import sys
 import json
+import base64
+import io
 import tempfile
 import unittest
 import zipfile
@@ -8,12 +10,14 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest import mock
 from pathlib import Path
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
 # 被测模块按文件路径加载，需要把 scripts 加入 sys.path，
 # 否则被测模块内部的同级 import（如 archive_types）无法解析。
 sys.path.insert(0, str(ROOT / "scripts"))
+import process_batch as BATCH_MODULE
 SPEC = importlib.util.spec_from_file_location("manual_content_stage", ROOT / "scripts" / "manual_content_stage.py")
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader
@@ -37,6 +41,66 @@ class SamplingTests(unittest.TestCase):
         self.assertEqual(MODULE.equidistant_sample_indexes(3), [0, 1, 2])
         self.assertEqual(MODULE.equidistant_sample_indexes(8), [0, 2, 5, 7])
         self.assertEqual(len(MODULE.equidistant_sample_indexes(20)), 5)
+
+
+class RuntimeIsolationTests(unittest.TestCase):
+    def test_date_tools_follow_the_isolated_runtime_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tool_root = Path(directory) / "date-tool"
+            internal = tool_root / "_internal"
+            internal.mkdir(parents=True)
+            (internal / "python.exe").write_bytes(b"test runtime placeholder")
+            (tool_root / "app.py").write_text("", encoding="utf-8")
+
+            with mock.patch.dict("os.environ", {"EASYSOFTWARE_DATE_TOOL_ROOT": str(tool_root)}):
+                ocr = MODULE.DefaultOcrAdapter(ROOT / "scripts")
+                rewriter = MODULE.DefaultDateRewriter(ROOT / "scripts")
+
+            self.assertEqual(ocr.tool_root, tool_root.resolve())
+            self.assertEqual(rewriter.tool_root, tool_root.resolve())
+            self.assertEqual(ocr.backend, "rapidocr_subprocess")
+            self.assertTrue(rewriter.available)
+
+    def test_ocr_batch_performance_metrics_are_opt_in(self):
+        adapter = MODULE.DefaultOcrAdapter(ROOT / "scripts")
+        adapter._batch_images = mock.Mock(return_value=[{"text": "ok"}])
+        with mock.patch.dict("os.environ", {"EASYSOFTWARE_PERF_TRACE": "1"}):
+            rows = adapter.batch([(b"image", ".png")])
+        self.assertEqual(rows, [{"text": "ok"}])
+        self.assertEqual(adapter._performance["batch_calls"], 1)
+        self.assertEqual(adapter._performance["image_count"], 1)
+        self.assertGreaterEqual(adapter._performance["batch_seconds"], 0)
+
+
+class TxtPunctuationRepairTests(unittest.TestCase):
+    def test_default_mode_removes_parenthesized_ordinal_and_counts_it(self):
+        repaired, counts = BATCH_MODULE.repair_main_function_text("（一）设备管理")
+
+        self.assertEqual(repaired, "设备管理")
+        self.assertEqual(counts["ordinal_markers_removed"], 1)
+
+    def test_parenthesized_ordinal_and_other_leading_punctuation_are_cleaned(self):
+        repaired, counts = BATCH_MODULE.repair_main_function_text(
+            "（一）设备管理（支持录入）,,并查询！？",
+            remove_ordinal_markers=False,
+        )
+
+        self.assertEqual(repaired, "一，设备管理，支持录入，并查询！")
+        self.assertTrue(repaired.startswith("一"))
+        self.assertNotRegex(repaired, r"^[，、；。！？!?]")
+        self.assertEqual(counts["leading_punctuation_removed"], 1)
+        self.assertEqual(counts["duplicate_punctuation_removed"], 3)
+        self.assertEqual(counts["parentheses_to_commas"], 4)
+
+    def test_leading_ascii_and_chinese_punctuation_are_counted(self):
+        repaired, counts = BATCH_MODULE.repair_main_function_text(
+            "  ,；功能管理",
+            remove_ordinal_markers=False,
+        )
+
+        self.assertEqual(repaired, "  功能管理")
+        self.assertEqual(counts["leading_punctuation_removed"], 1)
+        self.assertEqual(counts["duplicate_punctuation_removed"], 1)
 
 
 class YearTests(unittest.TestCase):
@@ -124,6 +188,151 @@ class WorkflowTests(unittest.TestCase):
             relevance_classifier=relevance, date_rewriter=date_rewriter,
         )
 
+    @staticmethod
+    def qualification_item(title, status, *, paragraph_id="paragraph:1", text="正文中的业务功能结果"):
+        return {
+            "project_id": f"project:{title}",
+            "title": title,
+            "txt_path": f"{title}.txt",
+            "semantic_input_hash": f"hash:{title}",
+            "paragraphs": [{
+                "paragraph_id": paragraph_id, "text": text,
+                "section_id": "section:front", "style_id": "BodyText",
+                "outline_level": None, "is_toc": False, "in_table": False,
+                "in_textbox": False, "is_title_repeat": False, "structure_uncertain": False,
+            }],
+            "metadata": {"title_source": "txt_filename_stem"},
+            "result": {"status": status, "reason": f"语义结果 {status}"},
+        }
+
+    def test_semantic_input_reuses_txt_title_paragraphs_and_never_calls_legacy_rule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_docx(root / "不同文件名说明.docx", image_count=1)
+            relevance_calls = []
+            qualification = self.qualification_item("TXT 文件名标题", "MATCH", text="TXT 主标题对应的真实业务正文")
+            with (
+                mock.patch.object(MODULE, "assess_body_relevance", side_effect=AssertionError("legacy topic rule called")),
+                mock.patch.object(MODULE, "read_docx_paragraphs", side_effect=AssertionError("body was re-read")),
+            ):
+                report = MODULE.run_manual_content_stage(
+                    root, root / "out", root / "report.json", apply=False,
+                    title_body_inputs_by_relative_path={"不同文件名说明.docx": qualification},
+                    title_body_mode="shadow", skip_mismatch=True,
+                    ocr=lambda *_: {"text": "文字"},
+                    relevance_classifier=lambda text, title, context: relevance_calls.append((title, context)) or {"status": "relevant", "confidence": 0.9},
+                    check_image_vision=False,
+                )
+            project = report["projects"][0]
+            self.assertEqual(project["title"], "TXT 文件名标题")
+            self.assertEqual(project["txt_path"], "TXT 文件名标题.txt")
+            self.assertEqual(project["project_id"], qualification["project_id"])
+            self.assertEqual(project["semantic_status"], "MATCH")
+            self.assertFalse(project["qualification_pending_review"])
+            self.assertEqual(relevance_calls[0][0], "TXT 文件名标题")
+            self.assertEqual(relevance_calls[0][1], "TXT 主标题对应的真实业务正文")
+
+    def test_shadow_mismatch_and_not_evaluated_continue_with_review_despite_skip_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("甲说明.docx", "乙说明.docx"):
+                make_docx(root / name, image_count=1)
+            inputs = {
+                "甲说明.docx": self.qualification_item("甲 TXT 标题", "MISMATCH"),
+                "乙说明.docx": self.qualification_item("乙 TXT 标题", "NOT_EVALUATED"),
+            }
+            ocr_calls = []
+            with mock.patch.object(MODULE, "assess_body_relevance", side_effect=AssertionError("legacy topic rule called")):
+                report = MODULE.run_manual_content_stage(
+                    root, root / "out", root / "report.json", apply=False,
+                    title_body_inputs_by_relative_path=inputs, title_body_mode="shadow",
+                    skip_mismatch=True, not_evaluated_action="hold_changes",
+                    ocr=lambda *_: ocr_calls.append(1) or {"text": "文字"},
+                    relevance_classifier=lambda *_: {"status": "relevant", "confidence": 0.9},
+                    check_image_vision=False,
+                )
+            self.assertEqual(len(ocr_calls), 2)
+            self.assertEqual([item["qualification_action"] for item in report["projects"]], [
+                "CONTINUE_WITH_REVIEW", "CONTINUE_WITH_REVIEW",
+            ])
+            self.assertTrue(all(item["qualification_pending_review"] for item in report["projects"]))
+            self.assertTrue(all(item["status"] == "PREFLIGHT_PASSED_WITH_REVIEW" for item in report["projects"]))
+            self.assertFalse(report["skip_effective"])
+            self.assertEqual(report["skip_requested"], True)
+            self.assertEqual(report["qualification_review_count"], 2)
+
+    def test_enforced_mismatch_skip_and_not_evaluated_hold_skip_all_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "out"
+            names = {"甲": "MISMATCH", "乙": "NOT_EVALUATED", "丙": "MATCH"}
+            originals = {}
+            inputs = {}
+            for name, status in names.items():
+                path = root / f"{name}说明.docx"
+                make_docx(path, ["截至2023年为最新版本"], image_count=2)
+                originals[name] = path.read_bytes()
+                inputs[path.name] = self.qualification_item(f"{name} TXT 标题", status)
+            date_calls = []
+            report = MODULE.run_manual_content_stage(
+                root, output, root / "report.json", apply=True,
+                title_body_inputs_by_relative_path=inputs, title_body_mode="enforced",
+                skip_mismatch=True, not_evaluated_action="hold_changes",
+                check_image_relevance=False, check_image_vision=False,
+                date_rewriter=lambda path, year: date_calls.append(Path(path).name) or {"status": "UNCHANGED", "changed": False},
+            )
+            projects = {Path(item["source"]).stem.removesuffix("说明"): item for item in report["projects"]}
+            self.assertEqual(projects["甲"]["status"], "SKIPPED_TOPIC_MISMATCH")
+            self.assertEqual(projects["甲"]["qualification_action"], "SKIP_MISMATCH")
+            self.assertEqual(projects["乙"]["status"], "HELD_QUALIFICATION_NOT_EVALUATED")
+            self.assertEqual(projects["乙"]["qualification_action"], "HOLD_NOT_EVALUATED")
+            self.assertEqual(report["held_not_evaluated_count"], 1)
+            self.assertEqual(len(date_calls), 1)
+            self.assertTrue(date_calls[0].startswith(".丙说明.date-year-stage-"))
+            self.assertEqual((root / "甲说明.docx").read_bytes(), originals["甲"])
+            self.assertEqual((root / "乙说明.docx").read_bytes(), originals["乙"])
+            self.assertEqual(report["skipped_project_count"], 1)
+            self.assertEqual(report["qualification_review_count"], 1)
+
+    def test_missing_per_project_qualification_is_not_evaluated_and_does_not_fall_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_docx(root / "甲说明.docx", image_count=1)
+            with mock.patch.object(MODULE, "assess_body_relevance", side_effect=AssertionError("legacy topic rule called")), mock.patch.object(
+                MODULE, "_docx_images", side_effect=AssertionError("held project media must stay unloaded"),
+            ):
+                report = MODULE.run_manual_content_stage(
+                    root, root / "out", root / "report.json", apply=False,
+                    title_body_inputs_by_relative_path={}, title_body_mode="enforced",
+                    not_evaluated_action="hold_changes", check_image_relevance=True,
+                )
+            project = report["projects"][0]
+            self.assertEqual(project["semantic_status"], "NOT_EVALUATED")
+            self.assertEqual(project["diagnostic_code"], "TITLE_BODY_RESULT_MISSING")
+            self.assertEqual(project["status"], "HELD_QUALIFICATION_NOT_EVALUATED")
+            self.assertEqual(project["image_count"], 1)
+
+    def test_enforced_can_include_mismatch_and_continue_not_evaluated_with_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = {}
+            for name, status in (("甲", "MISMATCH"), ("乙", "NOT_EVALUATED")):
+                path = root / f"{name}说明.docx"
+                make_docx(path, ["没有可改写年份"])
+                inputs[path.name] = self.qualification_item(f"{name} TXT 标题", status)
+            calls = []
+            report = MODULE.run_manual_content_stage(
+                root, root / "out", root / "report.json", apply=True,
+                title_body_inputs_by_relative_path=inputs, title_body_mode="enforced",
+                skip_mismatch=False, not_evaluated_action="continue_with_review",
+                check_image_relevance=False, check_image_vision=False,
+                date_rewriter=lambda *_: calls.append(1) or {"status": "UNCHANGED", "changed": False},
+            )
+            self.assertEqual(calls, [1, 1])
+            self.assertTrue(all(item["qualification_pending_review"] for item in report["projects"]))
+            self.assertTrue(all(item["qualification_action"] == "CONTINUE_WITH_REVIEW" for item in report["projects"]))
+            self.assertFalse(report["skip_effective"])
+
     def test_unknown_ocr_does_not_block_or_fuse(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -187,6 +396,78 @@ class WorkflowTests(unittest.TestCase):
 
             self.run_stage(root, ocr=ocr, relevance=lambda *_: {"status": "relevant", "confidence": 0.9}, date_rewriter=rewrite)
             self.assertEqual(events[:8], ["ocr"] * 8)
+
+    def test_batch_failure_keeps_original_and_later_document_completes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("甲", "乙"):
+                make_docx(root / f"{name}说明.docx", ["截至2023年为最新版本"], image_count=4)
+            adapter = MODULE.DefaultDateRewriter(ROOT / "scripts")
+            adapter.available = True
+            original_popen = MODULE.subprocess.Popen
+            process_instances = []
+
+            def fake_child(args, **kwargs):
+                child_code = (
+                    "import json,pathlib,sys,time; "
+                    "print(json.dumps({'ready':True,'performance':{'engine_load_seconds':0.12}}),flush=True); "
+                    "request=json.loads(sys.stdin.readline()); "
+                    "path=pathlib.Path(request['path']); "
+                    "path.with_suffix(path.suffix+'.date-year.tmp').write_text('interrupted temp'); "
+                    "time.sleep(30)"
+                )
+                process = original_popen(
+                    [sys.executable, "-c", child_code], stdin=kwargs["stdin"], stdout=kwargs["stdout"],
+                    stderr=kwargs["stderr"], text=kwargs["text"], encoding=kwargs["encoding"],
+                    errors=kwargs["errors"], bufsize=kwargs["bufsize"],
+                )
+                process_instances.append(process)
+                return process
+
+            fallback_results = [
+                {"status": "FAILED", "changed": False, "reason": "模拟单件重试仍失败"},
+                {"status": "CHANGED", "changed": True, "effective_target_year": 2025},
+            ]
+            fallback_calls = []
+
+            def run_fallback(_args, **_kwargs):
+                fallback_calls.append(1)
+                return MODULE.subprocess.CompletedProcess(
+                    [], 0, stdout=json.dumps(fallback_results[len(fallback_calls) - 1]), stderr=""
+                )
+
+            original_first = (root / "甲说明.docx").read_bytes()
+            with (
+                mock.patch.dict("os.environ", {"EASYSOFTWARE_PERF_TRACE": "1"}),
+                mock.patch.object(MODULE, "DATE_REWRITER_TIMEOUT_SECONDS", 0.2),
+                mock.patch.object(MODULE.subprocess, "Popen", side_effect=fake_child),
+                mock.patch.object(MODULE.subprocess, "run", side_effect=run_fallback),
+            ):
+                report = self.run_stage(
+                    root, ocr=lambda *_: {"text": "相关"},
+                    relevance=lambda *_: {"status": "relevant", "confidence": 0.9},
+                    date_rewriter=adapter,
+                )
+
+            self.assertEqual(len(process_instances), 1)
+            self.assertIsNotNone(process_instances[0].poll())
+            self.assertEqual(len(fallback_calls), 2)
+            self.assertEqual(report["projects"][0]["date_rewrite"]["status"], "FAILED")
+            self.assertEqual(report["projects"][1]["date_rewrite"]["status"], "CHANGED")
+            failed_output = Path(report["projects"][0]["output"])
+            successful_output = Path(report["projects"][1]["output"])
+            self.assertEqual(failed_output.read_bytes(), original_first)
+            with zipfile.ZipFile(successful_output) as archive:
+                success_xml = archive.read("word/document.xml").decode("utf-8")
+            self.assertIn("2025", success_xml)
+            self.assertFalse(list((root / "out").rglob("*.date-year-stage-*.docx")))
+            self.assertFalse(list((root / "out").rglob("*.date-year-stage-*.docx.date-year.tmp")))
+            date_perf = report["performance"]["date_rewriter"]
+            self.assertEqual(date_perf["documents_attempted"], 2)
+            self.assertEqual(date_perf["subprocess_calls"], 3)
+            self.assertEqual(date_perf["batch_count"], 1)
+            self.assertEqual(date_perf["engine_load_seconds"], 0.12)
+            self.assertGreaterEqual(date_perf["batch_wall_seconds"], 0)
 
     def test_year_update_is_written_to_output_docx(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -281,9 +562,11 @@ class VisionAdapterTests(unittest.TestCase):
         server = HTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        image = io.BytesIO()
+        Image.new("RGB", (8, 8), "white").save(image, format="PNG")
         try:
             adapter = MODULE.LocalVisionAdapter(base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="proxy", timeout=2)
-            result = adapter(b"\x89PNG\r\n\x1a\n", ".png", "医院人力资源系统", "", "")
+            result = adapter(image.getvalue(), ".png", "医院人力资源系统", "", "")
         finally:
             server.shutdown()
             server.server_close()
@@ -294,7 +577,9 @@ class VisionAdapterTests(unittest.TestCase):
         self.assertEqual(path, "/v1/chat/completions")
         self.assertEqual(auth, "Bearer proxy")
         self.assertEqual(body["model"], "sensenova-6.8-flash-lite")
-        self.assertTrue(body["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
+        image_url = body["messages"][0]["content"][1]["image_url"]["url"]
+        self.assertTrue(image_url.startswith("data:image/jpeg;base64,"))
+        self.assertTrue(base64.b64decode(image_url.partition(",")[2]).startswith(b"\xff\xd8"))
 
     def test_missing_evidence_is_unknown(self):
         with mock.patch.object(MODULE.urllib.request, "urlopen") as post:

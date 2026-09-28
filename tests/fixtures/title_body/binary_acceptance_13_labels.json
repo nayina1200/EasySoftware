@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "fixture_id": "binary-acceptance-13-anonymized",
+  "label_source": "Anonymized binary regression labels; case identifiers contain no source material names.",
+  "labels": {
+    "case-001": "MATCH",
+    "case-002": "MATCH",
+    "case-003": "MISMATCH",
+    "case-004": "MATCH",
+    "case-005": "MATCH",
+    "case-006": "MATCH",
+    "case-007": "MATCH",
+    "case-008": "MATCH",
+    "case-009": "MATCH",
+    "case-010": "MATCH",
+    "case-011": "MISMATCH",
+    "case-012": "MATCH",
+    "case-013": "MATCH"
+  }
+}

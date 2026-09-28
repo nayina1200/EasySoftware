@@ -31,6 +31,7 @@ class UnifiedDocumentEntryTests(unittest.TestCase):
             fake_module = types.SimpleNamespace(run=fake_run)
             arguments = ["unified_workflow.py", str(source), "--work-dir", str(work), flag, *(extra or [])]
             with mock.patch.dict(sys.modules, {"combined_document_workflow": fake_module}), \
+                    mock.patch.object(WORKFLOW, "activate_optimization_isolation", return_value=False), \
                     mock.patch.object(sys, "argv", arguments), contextlib.redirect_stdout(io.StringIO()):
                 exit_code = WORKFLOW.main()
             return exit_code, fake_run

@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import inspect
 import base64
+import io
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import time
 import tempfile
+import threading
 import zipfile
 import urllib.request
+import urllib.error
+from urllib.parse import urlsplit, urlunsplit
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -23,7 +29,9 @@ TARGET_YEAR = 2025
 CONFIDENCE_THRESHOLD = 0.85
 VISION_MODEL = "sensenova-6.8-flash-lite"
 VISION_BASE_URL = "http://127.0.0.1:3458/v1"
+VISION_CONFIG_PATH = Path(__file__).resolve().parent.parent / "vision_config.json"
 VISION_MAX_CALLS_PER_PROJECT = 2
+DATE_REWRITER_TIMEOUT_SECONDS = 900
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 YEAR_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -53,11 +61,11 @@ def equidistant_sample_indexes(total: int, ratio: float = 0.25, minimum: int = 4
     return sorted({round(index * (total - 1) / (count - 1)) for index in range(count)})
 
 
-def classify_year_context(text: str, year: str | None = None) -> dict[str, Any]:
+def classify_year_context(text: str, year: str | None = None, target_year: int = TARGET_YEAR) -> dict[str, Any]:
     """Conservative deterministic baseline for a single year occurrence."""
     value = year or (YEAR_RE.search(text).group(0) if YEAR_RE.search(text) else "")
-    if not value or int(value) >= TARGET_YEAR:
-        return {"decision": "KEEP", "confidence": 1.0, "reason": "目标年份、未来年份或未发现年份"}
+    if not value or int(value) == target_year or int(value) > 2026:
+        return {"decision": "KEEP", "confidence": 1.0, "reason": "目标年份、远期年份或未发现年份"}
     keep_patterns = (
         r"(?:历史|成立于|发布于|颁布于|修订于|自).{0,8}" + re.escape(value),
         re.escape(value) + r".{0,8}(?:年生|年成立|年发布|年颁布|年修订|年度数据|年统计)",
@@ -85,18 +93,22 @@ def replace_update_years(
     for match in YEAR_RE.finditer(text):
         pieces.append(text[cursor:match.start()])
         context = text[max(0, match.start() - 32):min(len(text), match.end() + 32)]
-        if int(match.group(0)) >= target_year:
+        if int(match.group(0)) == target_year or int(match.group(0)) > 2026:
             raw = {"decision": "KEEP", "confidence": 1.0, "reason": "目标年份或未来年份"}
         else:
-            raw = _call_adapter(classifier, context, match.group(0)) if classifier else classify_year_context(context, match.group(0))
+            raw = _call_adapter(classifier, context, match.group(0)) if classifier else classify_year_context(context, match.group(0), target_year)
         decision = _normalise_year_decision(raw)
-        replacement = str(target_year) if decision["decision"] == "UPDATE_TO_2025" else match.group(0)
+        replacement = str(target_year) if decision["decision"] == "UPDATE_TO_TARGET_YEAR" else match.group(0)
         pieces.append(replacement)
+        reported_decision = decision["decision"]
+        if reported_decision == "UPDATE_TO_TARGET_YEAR" and target_year == 2025:
+            reported_decision = "UPDATE_TO_2025"
         decisions.append({
             "source": match.group(0),
             "replacement": replacement,
             "context": context,
             **decision,
+            "decision": reported_decision,
         })
         cursor = match.end()
     pieces.append(text[cursor:])
@@ -109,10 +121,13 @@ def _normalise_year_decision(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {"decision": "REVIEW", "confidence": 0.0, "reason": "分类器返回格式无效"}
     decision = str(value.get("decision", "REVIEW")).upper()
-    if decision not in {"UPDATE_TO_2025", "KEEP", "REVIEW"}:
+    # Accept the prior public classifier label for callers that inject a legacy adapter.
+    if decision == "UPDATE_TO_2025":
+        decision = "UPDATE_TO_TARGET_YEAR"
+    if decision not in {"UPDATE_TO_TARGET_YEAR", "KEEP", "REVIEW"}:
         decision = "REVIEW"
     confidence = float(value.get("confidence", 0.0))
-    if decision == "UPDATE_TO_2025" and confidence < CONFIDENCE_THRESHOLD:
+    if decision == "UPDATE_TO_TARGET_YEAR" and confidence < CONFIDENCE_THRESHOLD:
         decision = "REVIEW"
     return {
         "decision": decision,
@@ -137,7 +152,13 @@ class DefaultOcrAdapter:
         self.backend = "unavailable"
         self.detail = "RapidOCR 和 Windows OCR 均不可用"
         self._rapid = None
-        self.tool_root = script_dir.parent.parent / "图片日期智能处理工具_用户版_20260903"
+        self._performance = {"batch_calls": 0, "image_count": 0, "batch_seconds": 0.0}
+        configured_tool_root = os.getenv("EASYSOFTWARE_DATE_TOOL_ROOT")
+        self.tool_root = (
+            Path(configured_tool_root).expanduser().resolve()
+            if configured_tool_root
+            else script_dir.parent.parent / "图片日期智能处理工具_用户版_20260903"
+        )
         internal = self.tool_root / "_internal"
         self.external_python = internal / "python.exe"
         self.external_bridge = script_dir / "rapid_ocr_bridge.py"
@@ -220,6 +241,17 @@ class DefaultOcrAdapter:
     def batch(self, images: list[tuple[bytes, str]]) -> list[dict[str, Any]]:
         if not images:
             return []
+        perf_trace = os.getenv("EASYSOFTWARE_PERF_TRACE") == "1"
+        started = time.perf_counter() if perf_trace else None
+        try:
+            return self._batch_images(images)
+        finally:
+            if perf_trace:
+                self._performance["batch_calls"] += 1
+                self._performance["image_count"] += len(images)
+                self._performance["batch_seconds"] += time.perf_counter() - started
+
+    def _batch_images(self, images: list[tuple[bytes, str]]) -> list[dict[str, Any]]:
         if self.backend != "rapidocr_subprocess":
             return [self(data, suffix) for data, suffix in images]
         with tempfile.TemporaryDirectory(prefix="easysoftware-ocr-batch-") as directory:
@@ -245,21 +277,96 @@ class DefaultOcrAdapter:
                 return [{"text": "", "confidence": 0.0, "backend": self.backend, "error": str(exc)} for _ in images]
 
 
-class LocalVisionAdapter:
-    """Bounded OpenAI-compatible image reviewer; transport errors remain unknown."""
+def load_vision_config(path: str | Path | None = None) -> dict[str, Any]:
+    """Load the editable OpenAI-compatible vision endpoint configuration."""
+    config_path = Path(path) if path else Path(os.getenv("EASYSOFTWARE_VISION_CONFIG", VISION_CONFIG_PATH))
+    if not config_path.is_file():
+        return {}
+    try:
+        value = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"视觉模型配置读取失败（{config_path}）：{exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"视觉模型配置必须是 JSON 对象：{config_path}")
+    return value
 
-    backend = "local_vision"
 
-    def __init__(self, base_url: str | None = None, api_key: str | None = None, timeout: float = 20.0):
-        self.base_url = (base_url or os.getenv("EASYSOFTWARE_VISION_BASE_URL") or VISION_BASE_URL).rstrip("/")
-        self.api_key = api_key or os.getenv("EASYSOFTWARE_VISION_API_KEY") or "proxy"
-        self.timeout = timeout
+def _safe_endpoint(value: str) -> str:
+    parts = urlsplit(value)
+    host = parts.hostname or ""
+    if parts.port:
+        host += f":{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
+class OpenAICompatibleVisionAdapter:
+    """OpenAI-compatible image reviewer with bounded payloads and API-key rotation."""
+
+    backend = "openai_compatible"
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        timeout: float | None = None,
+        *,
+        model: str | None = None,
+        config: dict[str, Any] | None = None,
+    ):
+        settings = dict(load_vision_config() if config is None else config)
+        self.base_url = str(base_url or os.getenv("EASYSOFTWARE_VISION_BASE_URL") or settings.get("base_url") or VISION_BASE_URL).rstrip("/")
+        self.model = str(model or settings.get("model") or VISION_MODEL)
+        env_key = os.getenv("EASYSOFTWARE_VISION_API_KEY")
+        configured_keys = settings.get("api_keys", settings.get("api_key", []))
+        if isinstance(configured_keys, str):
+            configured_keys = [configured_keys]
+        if not isinstance(configured_keys, list):
+            configured_keys = []
+        key_values = [api_key] if api_key else ([env_key] if env_key else configured_keys)
+        self.api_keys = [str(item).strip() for item in key_values if str(item).strip()]
+        if not self.api_keys:
+            self.api_keys = ["proxy"]
+        self.timeout = float(timeout if timeout is not None else settings.get("timeout_seconds", 30))
+        self.max_image_bytes = max(16 * 1024, int(settings.get("max_image_bytes", 4_000_000)))
+        self.max_image_side = max(64, int(settings.get("max_image_side", 1600)))
+        self.jpeg_quality = max(40, min(95, int(settings.get("jpeg_quality", 85))))
+        self.retry_count = max(0, min(5, int(settings.get("retry_count", 2))))
+        self._next_key = 0
+
+    def _prepare_image(self, image_bytes: bytes) -> tuple[bytes, str]:
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(image_bytes)) as original:
+            image = ImageOps.exif_transpose(original).convert("RGB")
+            image.thumbnail((self.max_image_side, self.max_image_side), Image.Resampling.LANCZOS)
+            quality = self.jpeg_quality
+            while True:
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=quality, optimize=True)
+                prepared = output.getvalue()
+                if len(prepared) <= self.max_image_bytes:
+                    return prepared, "image/jpeg"
+                if quality > 50:
+                    quality -= 10
+                    continue
+                width, height = image.size
+                if max(width, height) <= 512:
+                    raise ValueError(f"图片压缩后仍超过上限 {self.max_image_bytes} 字节")
+                image.thumbnail((max(512, int(width * .75)), max(512, int(height * .75))), Image.Resampling.LANCZOS)
+                quality = min(self.jpeg_quality, 75)
 
     def __call__(self, image_bytes: bytes, suffix: str, title: str, context: str, ocr_text: str) -> dict[str, Any]:
-        suffix = suffix.lower()
-        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(suffix)
-        if not mime:
-            return {"status": "unknown", "confidence": 0.0, "reason": "图片格式不支持视觉接口", "backend": self.backend, "error": f"unsupported image format: {suffix}"}
+        original_size = len(image_bytes)
+        try:
+            image_bytes, mime = self._prepare_image(image_bytes)
+        except Exception as exc:
+            return {"status": "unknown", "confidence": 0.0, "reason": "图片预处理失败", "backend": self.backend, "image_original_bytes": original_size, "image_max_bytes": self.max_image_bytes, "error": str(exc), "error_type": type(exc).__name__}
+        image_metrics = {
+            "image_original_bytes": original_size,
+            "image_sent_bytes": len(image_bytes),
+            "image_max_bytes": self.max_image_bytes,
+            "image_sent_mime": mime,
+        }
         prompt = (
             "核对这张软件说明书截图与项目标题的主题是否一致。只依据图片中可见的界面、文字和图表，"
             "不要把标题或 OCR 文本当作图片证据。仅当图片明确属于另一领域时判 irrelevant；"
@@ -268,23 +375,49 @@ class LocalVisionAdapter:
             f"项目标题：{title[:160]}\n正文开头：{context[:300]}\nOCR 提示：{ocr_text[:300]}"
         )
         payload = {
-            "model": VISION_MODEL,
+            "model": self.model,
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"}},
             ]}],
-            "temperature": 0,
             "max_tokens": 1200,
+            "reasoning_effort": "none",
         }
-        request = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            method="POST",
-        )
+        endpoint = self.base_url if self.base_url.endswith("/chat/completions") else f"{self.base_url}/chat/completions"
+        reported_endpoint = _safe_endpoint(endpoint)
+        errors: list[str] = []
+        attempts = min(len(self.api_keys), self.retry_count + 1)
+        reply: dict[str, Any] | None = None
+        for attempt in range(attempts):
+            key_index = self._next_key % len(self.api_keys)
+            self._next_key += 1
+            request = urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Authorization": f"Bearer {self.api_keys[key_index]}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    reply = json.load(response)
+                break
+            except urllib.error.HTTPError as exc:
+                detail = exc.read(1200).decode("utf-8", errors="replace")
+                for secret in self.api_keys:
+                    detail = detail.replace(secret, "<REDACTED>")
+                errors.append(f"HTTP {exc.code}: {detail or exc.reason}")
+                if attempt + 1 >= attempts or exc.code not in {401, 403, 408, 413, 429, 500, 502, 503, 504}:
+                    return {"status": "unknown", "confidence": 0.0, "reason": "视觉接口 HTTP 请求失败", "backend": self.backend, "model": self.model, "endpoint": reported_endpoint, **image_metrics, "error": errors[-1], "error_type": "HTTPError"}
+            except Exception as exc:
+                detail = str(exc)
+                for secret in self.api_keys:
+                    detail = detail.replace(secret, "<REDACTED>")
+                errors.append(f"{type(exc).__name__}: {detail}")
+                if attempt + 1 >= attempts:
+                    return {"status": "unknown", "confidence": 0.0, "reason": "视觉接口连接或请求失败", "backend": self.backend, "model": self.model, "endpoint": reported_endpoint, **image_metrics, "error": "；".join(errors), "error_type": type(exc).__name__}
+        if reply is None:
+            return {"status": "unknown", "confidence": 0.0, "reason": "视觉接口重试次数耗尽", "backend": self.backend, "model": self.model, "endpoint": reported_endpoint, **image_metrics, "error": "；".join(errors), "error_type": "RetryError"}
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                reply = json.load(response)
             message = reply["choices"][0]["message"]
             content = message.get("content") or ""
             if isinstance(content, list):
@@ -303,9 +436,15 @@ class LocalVisionAdapter:
             if result["status"] == "irrelevant" and len(evidence) < 8:
                 result["status"] = "unknown"
                 result["reason"] = "视觉模型未提供充分的图片证据"
-            return {**result, "backend": self.backend, "model": VISION_MODEL, "usage": reply.get("usage", {})}
+            return {**result, "backend": self.backend, "model": self.model, "endpoint": reported_endpoint, **image_metrics, "usage": reply.get("usage", {})}
         except Exception as exc:
-            return {"status": "unknown", "confidence": 0.0, "reason": "视觉接口未给出可用结论", "backend": self.backend, "error": str(exc), "error_type": type(exc).__name__}
+            detail = str(exc)
+            for secret in self.api_keys:
+                detail = detail.replace(secret, "<REDACTED>")
+            return {"status": "unknown", "confidence": 0.0, "reason": "视觉接口未给出可用结论", "backend": self.backend, "model": self.model, "endpoint": reported_endpoint, **image_metrics, "error": detail, "error_type": type(exc).__name__}
+
+
+LocalVisionAdapter = OpenAICompatibleVisionAdapter
 
 
 class DefaultDateRewriter:
@@ -313,46 +452,296 @@ class DefaultDateRewriter:
 
     def __init__(self, script_dir: Path):
         self.bridge = script_dir / "date_year_rewriter_bridge.py"
-        self.tool_root = script_dir.parent.parent / "图片日期智能处理工具_用户版_20260903"
+        configured_tool_root = os.getenv("EASYSOFTWARE_DATE_TOOL_ROOT")
+        self.tool_root = (
+            Path(configured_tool_root).expanduser().resolve()
+            if configured_tool_root
+            else script_dir.parent.parent / "图片日期智能处理工具_用户版_20260903"
+        )
         self.python = self.tool_root / "_internal" / "python.exe"
         self.available = self.bridge.is_file() and self.python.is_file() and (self.tool_root / "app.py").is_file()
         self.reason = "未找到图片日期工具的运行时或年份重绘桥接脚本"
+        self._performance: dict[str, Any] = {}
 
     def __call__(self, path: Path, target_year: int) -> dict[str, Any]:
+        return self.rewrite_with_metadata(path, target_year)
+
+    def rewrite_with_metadata(self, path: Path, target_year: int) -> dict[str, Any]:
         if not self.available:
-            return {"status": "UNAVAILABLE", "changed": False, "reason": self.reason}
-        completed = subprocess.run(
-            [str(self.python), str(self.bridge), str(self.tool_root), str(path), str(target_year)],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900,
-        )
+            return {"status": "UNAVAILABLE", "changed": False, "reason": self.reason, "effective_target_year": target_year, "trigger_date": None, "rollback_reason": None}
+        perf_trace = os.getenv("EASYSOFTWARE_PERF_TRACE") == "1"
+        started = time.perf_counter() if perf_trace else None
+        self._performance["subprocess_calls"] = self._performance.get("subprocess_calls", 0) + 1
+        call_started = time.perf_counter()
+        try:
+            completed = subprocess.run(
+                [str(self.python), str(self.bridge), str(self.tool_root), str(path), str(target_year)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=DATE_REWRITER_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            self._performance["wall_seconds"] = self._performance.get("wall_seconds", 0.0) + time.perf_counter() - call_started
+            return {"status": "FAILED_TIMEOUT", "changed": False, "reason": "该 DOCX 日期 OCR 超过 900 秒，已终止子进程"}
         lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
         try:
             result = json.loads(lines[-1]) if lines else {}
         except json.JSONDecodeError:
             result = {}
         if completed.returncode != 0 or not isinstance(result, dict):
-            return {
+            failure = {
                 "status": "FAILED", "changed": False,
                 "reason": result.get("error") if isinstance(result, dict) else (completed.stderr.strip() or completed.stdout.strip()),
             }
+            if perf_trace:
+                failure["performance"] = {"subprocess_seconds": round(time.perf_counter() - started, 4)}
+            self._performance["wall_seconds"] = self._performance.get("wall_seconds", 0.0) + time.perf_counter() - call_started
+            return failure
+        if perf_trace:
+            result.setdefault("performance", {})["subprocess_seconds"] = round(time.perf_counter() - started, 4)
+            self._performance["engine_load_seconds"] = self._performance.get("engine_load_seconds", 0.0) + float(
+                result.get("performance", {}).get("engine_load_seconds", 0.0) or 0.0
+            )
+        self._performance["wall_seconds"] = self._performance.get("wall_seconds", 0.0) + time.perf_counter() - call_started
         return result
+
+    def iter_rewrite_many_with_metadata(self, paths: list[Path], target_year: int):
+        """Stream one DOCX at a time through one child with an independent 900s deadline."""
+        if not self.available:
+            for _path in paths:
+                yield {"status": "UNAVAILABLE", "changed": False, "reason": self.reason,
+                       "effective_target_year": target_year, "trigger_date": None, "rollback_reason": None}
+            return
+        perf_trace = os.getenv("EASYSOFTWARE_PERF_TRACE") == "1"
+        launch_started = time.perf_counter()
+        process = None
+        reader_thread = None
+        batch_recorded = False
+        responses: queue.Queue[str | None] = queue.Queue()
+        self._performance["subprocess_calls"] = self._performance.get("subprocess_calls", 0) + 1
+        self._performance["batch_count"] = self._performance.get("batch_count", 0) + 1
+
+        def record_batch_wall():
+            nonlocal batch_recorded
+            if not batch_recorded:
+                elapsed = time.perf_counter() - launch_started
+                self._performance["batch_wall_seconds"] = self._performance.get("batch_wall_seconds", 0.0) + elapsed
+                self._performance["wall_seconds"] = self._performance.get("wall_seconds", 0.0) + elapsed
+                batch_recorded = True
+
+        try:
+            process = subprocess.Popen(
+                [str(self.python), str(self.bridge), "--stream", str(self.tool_root), str(target_year)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+
+            def read_responses():
+                try:
+                    for line in process.stdout:
+                        responses.put(line)
+                finally:
+                    responses.put(None)
+
+            reader_thread = threading.Thread(target=read_responses, daemon=True)
+            reader_thread.start()
+            ready_line = responses.get(timeout=DATE_REWRITER_TIMEOUT_SECONDS)
+            ready = json.loads(ready_line) if ready_line else {}
+            if not isinstance(ready, dict) or not ready.get("ready"):
+                raise RuntimeError(str(ready.get("error", "日期 OCR 批处理子进程启动失败")))
+            if perf_trace:
+                engine_seconds = float(ready.get("performance", {}).get("engine_load_seconds", 0.0) or 0.0)
+                self._performance["engine_load_seconds"] = self._performance.get("engine_load_seconds", 0.0) + engine_seconds
+
+            for index, path in enumerate(paths):
+                try:
+                    process.stdin.write(json.dumps({"op": "rewrite", "path": str(path)}) + "\n")
+                    process.stdin.flush()
+                    process_deadline = time.perf_counter() + DATE_REWRITER_TIMEOUT_SECONDS
+                    response = responses.get(timeout=max(0.01, process_deadline - time.perf_counter()))
+                    if response is None:
+                        raise RuntimeError("日期 OCR 批处理子进程提前退出")
+                    result = json.loads(response)
+                    if not isinstance(result, dict):
+                        raise RuntimeError("日期 OCR 批处理返回无效结果")
+                except queue.Empty:
+                    self._stop_date_process(process)
+                    self._close_date_process_pipes(process, reader_thread)
+                    process = None
+                    record_batch_wall()
+                    retry = self.rewrite_with_metadata(path, target_year)
+                    if str(retry.get("status", "")).upper() not in {
+                        "CHANGED", "UNCHANGED", "CHANGED_WITH_AUTO_SKIPS", "AUTO_SKIPPED_UNCERTAIN_IMAGES",
+                    }:
+                        retry["reason"] = f"批处理单件超时；单件回退失败：{retry.get('reason', retry.get('status'))}"
+                    retry.setdefault("performance", {})["batch_timeout_fallback"] = True
+                    yield retry
+                    for remaining in paths[index + 1:]:
+                        yield self.rewrite_with_metadata(remaining, target_year)
+                    return
+                except Exception as exc:
+                    self._stop_date_process(process)
+                    self._close_date_process_pipes(process, reader_thread)
+                    process = None
+                    record_batch_wall()
+                    retry = self.rewrite_with_metadata(path, target_year)
+                    if str(retry.get("status", "")).upper() not in {
+                        "CHANGED", "UNCHANGED", "CHANGED_WITH_AUTO_SKIPS", "AUTO_SKIPPED_UNCERTAIN_IMAGES",
+                    }:
+                        retry["reason"] = f"批处理单件中断；单件回退失败：{retry.get('reason', retry.get('status'))}"
+                    retry.setdefault("performance", {})["batch_interruption_fallback"] = True
+                    yield retry
+                    for remaining in paths[index + 1:]:
+                        yield self.rewrite_with_metadata(remaining, target_year)
+                    return
+                yield result
+
+            try:
+                process.stdin.write(json.dumps({"op": "close"}) + "\n")
+                process.stdin.flush()
+                process.stdin.close()
+                process.wait(timeout=10)
+                self._close_date_process_pipes(process, reader_thread)
+            except Exception:
+                self._stop_date_process(process)
+                self._close_date_process_pipes(process, reader_thread)
+            process = None
+            record_batch_wall()
+        except Exception:
+            if process is not None:
+                self._stop_date_process(process)
+                self._close_date_process_pipes(process, reader_thread)
+                process = None
+            record_batch_wall()
+            # Startup failure occurs before any request; use the compatible isolated path per DOCX.
+            for path in paths:
+                yield self.rewrite_with_metadata(path, target_year)
+        finally:
+            if process is not None:
+                self._stop_date_process(process)
+                self._close_date_process_pipes(process, reader_thread)
+            record_batch_wall()
+
+    @staticmethod
+    def _stop_date_process(process) -> None:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+    @staticmethod
+    def _close_date_process_pipes(process, reader_thread=None) -> None:
+        if reader_thread is not None:
+            reader_thread.join(timeout=2)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+
+def read_docx_paragraphs(path: str | Path) -> list[tuple[str, str]]:
+    texts: list[tuple[str, str]] = []
+    with zipfile.ZipFile(path) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+        for index, paragraph in enumerate(root.iter(f"{{{WORD_NS}}}p")):
+            value = "".join(node.text or "" for node in paragraph.iter(f"{{{WORD_NS}}}t"))
+            if value.strip():
+                texts.append((f"paragraph:{index + 1}", value))
+    return texts
 
 
 def _docx_parts(path: Path) -> tuple[list[tuple[str, bytes]], list[tuple[str, str]]]:
     images: list[tuple[str, bytes]] = []
-    texts: list[tuple[str, str]] = []
     with zipfile.ZipFile(path) as archive:
         for name in archive.namelist():
-            lowered = name.lower()
-            if lowered.startswith("word/media/") and Path(name).suffix.lower() in IMAGE_SUFFIXES:
+            if name.lower().startswith("word/media/") and Path(name).suffix.lower() in IMAGE_SUFFIXES:
                 images.append((name, archive.read(name)))
-            elif lowered == "word/document.xml":
-                root = etree.fromstring(archive.read(name))
-                for index, paragraph in enumerate(root.iter(f"{{{WORD_NS}}}p")):
-                    value = "".join(node.text or "" for node in paragraph.iter(f"{{{WORD_NS}}}t"))
-                    if value.strip():
-                        texts.append((f"paragraph:{index + 1}", value))
+    texts = read_docx_paragraphs(path)
     return images, texts
+
+
+def _docx_image_names(path: Path) -> list[str]:
+    with zipfile.ZipFile(path) as archive:
+        return [
+            name for name in archive.namelist()
+            if name.lower().startswith("word/media/") and Path(name).suffix.lower() in IMAGE_SUFFIXES
+        ]
+
+
+def _docx_images(path: Path) -> list[tuple[str, bytes]]:
+    with zipfile.ZipFile(path) as archive:
+        return [
+            (name, archive.read(name))
+            for name in archive.namelist()
+            if name.lower().startswith("word/media/") and Path(name).suffix.lower() in IMAGE_SUFFIXES
+        ]
+
+
+def _qualification_paragraphs(value: Any) -> list[tuple[str, str]]:
+    if not isinstance(value, list):
+        return []
+    converted: list[tuple[str, str]] = []
+    for index, item in enumerate(value, 1):
+        if isinstance(item, dict):
+            paragraph_id = str(item.get("paragraph_id", f"paragraph:{index}"))
+            text = str(item.get("text", ""))
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            paragraph_id, text = str(item[0]), str(item[1])
+        else:
+            continue
+        if text.strip():
+            converted.append((paragraph_id, text))
+    return converted
+
+
+def _semantic_status(value: Any) -> str:
+    normalized = str(value or "").strip().casefold()
+    if normalized in {"match", "matched", "符合"}:
+        return "MATCH"
+    if normalized in {"mismatch", "not_match", "不匹配", "错配", "review_topic_mismatch"}:
+        return "MISMATCH"
+    return "NOT_EVALUATED"
+
+
+def _semantic_relevance(source_item: dict[str, Any] | None) -> tuple[dict[str, Any], str, str, str]:
+    if source_item is None:
+        result: dict[str, Any] = {}
+        metadata: dict[str, Any] = {}
+        title = ""
+        diagnostic = "TITLE_BODY_RESULT_MISSING"
+    else:
+        raw_result = source_item.get("result", source_item.get("semantic_result", {}))
+        result = raw_result if isinstance(raw_result, dict) else {}
+        raw_metadata = source_item.get("metadata", {})
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        title = str(source_item.get("title", metadata.get("raw_title", "")) or "").strip()
+        diagnostic = str(
+            result.get("diagnostic_code") or metadata.get("reason")
+            or result.get("reason") or ""
+        )
+        if not result and source_item.get("semantic_status"):
+            result = {"status": source_item.get("semantic_status"), "reason": source_item.get("reason", "")}
+    status = _semantic_status(result.get("status", source_item.get("semantic_status") if source_item else None))
+    reason = str(result.get("reason") or diagnostic or ("标题正文未完成评估" if status == "NOT_EVALUATED" else ""))
+    relevance = {
+        "status": "review_topic_mismatch" if status == "MISMATCH" else ("match" if status == "MATCH" else "not_evaluated"),
+        "similarity_score": None,
+        "reason": reason or ("标题正文未评估" if status == "NOT_EVALUATED" else ""),
+        "semantic_status": status,
+        "evidence": result.get("evidence", []),
+        "diagnostic_code": result.get("diagnostic_code") or metadata.get("diagnostic_code"),
+    }
+    return relevance, status, title, diagnostic
+
+
+def _qualification_action(mode: str, semantic_status: str, skip_requested: bool, not_evaluated_action: str) -> str:
+    if mode == "shadow":
+        return "CONTINUE" if semantic_status == "MATCH" else "CONTINUE_WITH_REVIEW"
+    if semantic_status == "MISMATCH":
+        return "SKIP_MISMATCH" if skip_requested else "CONTINUE_WITH_REVIEW"
+    if semantic_status == "NOT_EVALUATED":
+        return "HOLD_NOT_EVALUATED" if not_evaluated_action == "hold_changes" else "CONTINUE_WITH_REVIEW"
+    return "CONTINUE"
 
 
 def _default_relevance(text: str, title: str, context: str) -> dict[str, Any]:
@@ -380,6 +769,24 @@ def _semantic_score(text: str, reference: str) -> float:
     return len(observed & expected) / math.sqrt(len(observed) * len(expected))
 
 
+def _body_similarity_score(title: str, body: str) -> float:
+    """Return an explainable 0-100 title/body topic overlap score."""
+    lowered_title = title.casefold()
+    lowered_body = body.casefold()
+    title_topics = {
+        topic for topic, terms in BODY_TOPIC_TERMS.items()
+        if any(term.casefold() in lowered_title for term in terms)
+    }
+    counts = {
+        topic: sum(lowered_body.count(term.casefold()) for term in terms)
+        for topic, terms in BODY_TOPIC_TERMS.items()
+    }
+    total = sum(counts.values())
+    if title_topics and total:
+        return round(100 * sum(counts[topic] for topic in title_topics) / total, 1)
+    return round(100 * _semantic_score(title, body), 1)
+
+
 def _batch_relevance(text: str, current: int, references: list[str]) -> dict[str, Any]:
     if not text.strip():
         return {"status": "unknown", "confidence": 0.0, "reason": "OCR 无有效文字"}
@@ -405,8 +812,9 @@ def assess_body_relevance(title: str, paragraphs: list[tuple[str, str]]) -> dict
     body = "\n".join(value for _, value in paragraphs)
     if title:
         body = re.sub(re.escape(title), "", body, flags=re.IGNORECASE)
+    similarity_score = _body_similarity_score(title, body)
     if len(body.strip()) < 80:
-        return {"status": "unknown", "reason": "正文可分析文字不足", "title_terms": {}, "other_topics": {}}
+        return {"status": "unknown", "reason": "正文可分析文字不足", "similarity_score": similarity_score, "title_terms": {}, "other_topics": {}}
     lowered_title = title.casefold()
     lowered_body = body.casefold()
     later_body = "\n".join(value for _, value in paragraphs[10:])
@@ -419,7 +827,7 @@ def assess_body_relevance(title: str, paragraphs: list[tuple[str, str]]) -> dict
         if term.casefold() in lowered_title
     }
     if not title_terms:
-        return {"status": "unknown", "reason": "标题缺少可核对的领域词", "title_terms": {}, "other_topics": {}}
+        return {"status": "unknown", "reason": "标题缺少可核对的领域词", "similarity_score": similarity_score, "title_terms": {}, "other_topics": {}}
     title_topics = {
         topic for topic, terms in BODY_TOPIC_TERMS.items()
         if any(term.casefold() in lowered_title for term in terms)
@@ -446,6 +854,7 @@ def assess_body_relevance(title: str, paragraphs: list[tuple[str, str]]) -> dict
         return {
             "status": "review_topic_mismatch",
             "reason": reason,
+            "similarity_score": similarity_score,
             "title_terms": title_terms,
             "other_topics": other_topics,
         }
@@ -454,10 +863,12 @@ def assess_body_relevance(title: str, paragraphs: list[tuple[str, str]]) -> dict
         return {
             "status": "review_topic_mismatch",
             "reason": "标题专有领域词在正文缺席，正文主要重复通用增删查导操作",
+            "similarity_score": similarity_score,
             "title_terms": title_terms, "other_topics": {"通用操作": generic_operations},
         }
     return {
         "status": "unknown", "reason": "未发现足够强的标题与正文主题冲突证据",
+        "similarity_score": similarity_score,
         "title_terms": title_terms, "other_topics": other_topics,
     }
 
@@ -474,15 +885,6 @@ def _normalise_relevance(value: Any, threshold: float) -> dict[str, Any]:
     if status == "irrelevant" and confidence < threshold:
         status = "unknown"
     return {"status": status, "confidence": confidence, "reason": str(value.get("reason", ""))}
-
-
-def _supported_vision_image(data: bytes, suffix: str) -> bool:
-    suffix = suffix.lower()
-    return (
-        (suffix == ".png" and data.startswith(b"\x89PNG\r\n\x1a\n"))
-        or (suffix in {".jpg", ".jpeg"} and data.startswith(b"\xff\xd8"))
-        or (suffix == ".webp" and data.startswith(b"RIFF") and data[8:12] == b"WEBP")
-    )
 
 
 def _rewrite_document_years(path: Path, classifier: Callable[..., Any] | None, target_year: int) -> list[dict[str, Any]]:
@@ -538,34 +940,179 @@ def run_manual_content_stage(
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
     target_year: int = TARGET_YEAR,
     apply: bool = True,
+    skip_topic_mismatch: bool = True,
+    check_body_relevance: bool = True,
+    title_body_inputs_by_relative_path: dict[str, dict[str, Any]] | None = None,
+    title_body_mode: str = "shadow",
+    skip_mismatch: bool | None = None,
+    not_evaluated_action: str = "hold_changes",
+    unknown_action: str | None = None,
+    check_image_relevance: bool = True,
+    check_image_vision: bool = True,
+    rewrite_body_years: bool = True,
+    rewrite_image_dates: bool = True,
 ) -> dict[str, Any]:
     """Preflight every manual, then copy and mutate only after batch gating completes."""
+    perf_trace = os.getenv("EASYSOFTWARE_PERF_TRACE") == "1"
+    run_started = time.perf_counter() if perf_trace else None
+    preparation_started = time.perf_counter() if perf_trace else None
     source_root = Path(input_root).resolve()
     destination_root = Path(output_root).resolve()
     report_file = Path(report_path).resolve()
     manuals = sorted(source_root.rglob("*说明.docx"), key=lambda path: str(path).casefold())
+    mode = str(title_body_mode or "shadow").strip().casefold()
+    if mode not in {"off", "shadow", "enforced"}:
+        raise ValueError("title_body_mode 必须是 off、shadow 或 enforced")
+    if unknown_action is not None:
+        not_evaluated_action = unknown_action
+    if not_evaluated_action not in {"hold_changes", "continue_with_review"}:
+        raise ValueError("not_evaluated_action 必须是 hold_changes 或 continue_with_review")
+    use_title_body_inputs = title_body_inputs_by_relative_path is not None and mode != "off"
+    report_mode = mode if title_body_inputs_by_relative_path is not None else "legacy"
+    skip_requested = skip_topic_mismatch if skip_mismatch is None else bool(skip_mismatch)
+    skip_effective = (
+        (mode == "enforced" and skip_requested) if use_title_body_inputs
+        else (skip_topic_mismatch if not use_title_body_inputs else False)
+    )
+    qualification_items = {
+        str(key).replace("\\", "/"): item
+        for key, item in (title_body_inputs_by_relative_path or {}).items()
+        if isinstance(item, dict)
+    }
     ocr_adapter = ocr or DefaultOcrAdapter(Path(__file__).resolve().parent)
     relevance = relevance_classifier or _default_relevance
-    vision_adapter = vision_classifier or LocalVisionAdapter()
+    vision_adapter = vision_classifier or OpenAICompatibleVisionAdapter()
     vision_backend = getattr(vision_adapter, "backend", "injected")
     vision_disabled_reason = ""
     date_adapter = date_rewriter or DefaultDateRewriter(Path(__file__).resolve().parent)
+    date_adapter_performance = getattr(date_adapter, "_performance", None)
+    if isinstance(date_adapter_performance, dict):
+        date_adapter_performance.clear()
     projects: list[dict[str, Any]] = []
-    prepared: list[tuple[Path, list[tuple[str, bytes]], list[tuple[str, str]], str, str]] = []
+    prepared: list[dict[str, Any]] = []
     for manual in manuals:
-        images, paragraphs = _docx_parts(manual)
-        title = manual.stem.removesuffix("说明")
+        relative_path = manual.relative_to(source_root).as_posix()
+        title_body_item = qualification_items.get(relative_path) if use_title_body_inputs else None
+        if use_title_body_inputs:
+            body_relevance, semantic_status, title, diagnostic_code = _semantic_relevance(title_body_item)
+            paragraphs = _qualification_paragraphs(title_body_item.get("paragraphs")) if title_body_item else []
+            if title_body_item is None:
+                body_relevance["reason"] = "材料清单中缺少该说明书的资格结果"
+                body_relevance["diagnostic_code"] = "TITLE_BODY_RESULT_MISSING"
+                diagnostic_code = "TITLE_BODY_RESULT_MISSING"
+            if not paragraphs:
+                body_relevance["semantic_status"] = semantic_status = "NOT_EVALUATED"
+                body_relevance["status"] = "not_evaluated"
+                body_relevance["reason"] = body_relevance.get("reason") or "资格结果未携带已抽取的说明书正文"
+                diagnostic_code = diagnostic_code or "TITLE_BODY_PARAGRAPHS_MISSING"
+            action = _qualification_action(mode, semantic_status, skip_requested, not_evaluated_action)
+            if title_body_item and not title:
+                title = ""
+        else:
+            paragraphs = read_docx_paragraphs(manual)
+            title = manual.stem.removesuffix("说明")
+            body_relevance = None
+            semantic_status = ""
+            diagnostic_code = ""
+            action = "LEGACY"
         context = "\n".join(value for _, value in paragraphs[:3])
-        prepared.append((manual, images, paragraphs, title, context))
-    references = [f"{title}\n{context}" for _manual, _images, _paragraphs, title, context in prepared]
+        prepared.append({
+            "manual": manual,
+            "relative_path": relative_path,
+            "title_body_item": title_body_item,
+            "paragraphs": paragraphs,
+            "title": title,
+            "context": context,
+            "body_relevance": body_relevance,
+            "semantic_status": semantic_status,
+            "diagnostic_code": diagnostic_code,
+            "qualification_action": action,
+        })
+    references = [f"{item['title']}\n{item['context']}" for item in prepared]
+    if not use_title_body_inputs:
+        for item in prepared:
+            body_relevance = (
+                assess_body_relevance(item["title"], item["paragraphs"])
+                if check_body_relevance else
+                {"status": "not_requested", "similarity_score": None, "reason": "本次未选择标题与正文主题检测"}
+            )
+            topic_mismatch = body_relevance.get("status") == "review_topic_mismatch"
+            item["body_relevance"] = body_relevance
+            item["semantic_status"] = "MISMATCH" if topic_mismatch else "NOT_EVALUATED"
+            item["qualification_action"] = "SKIP_MISMATCH" if (skip_topic_mismatch and topic_mismatch) else "LEGACY"
 
-    for document_index, (manual, images, paragraphs, title, context) in enumerate(prepared, 1):
+    preparation_seconds = time.perf_counter() - preparation_started if perf_trace else None
+    preflight_started = time.perf_counter() if perf_trace else None
+    for document_index, prepared_item in enumerate(prepared, 1):
+        manual = prepared_item["manual"]
+        relative_path = prepared_item["relative_path"]
+        paragraphs = prepared_item["paragraphs"]
+        title = prepared_item["title"]
+        context = prepared_item["context"]
+        if use_title_body_inputs:
+            body_relevance = prepared_item["body_relevance"]
+            semantic_status = prepared_item["semantic_status"]
+            qualification_action = prepared_item["qualification_action"]
+            topic_mismatch = semantic_status == "MISMATCH"
+            qualification_status = "TOPIC_MISMATCH" if topic_mismatch else ("QUALIFIED" if semantic_status == "MATCH" else "NOT_EVALUATED")
+            pending_review = qualification_action == "CONTINUE_WITH_REVIEW" or semantic_status == "NOT_EVALUATED"
+            changes_held = qualification_action in {"SKIP_MISMATCH", "HOLD_NOT_EVALUATED"}
+        else:
+            body_relevance = prepared_item["body_relevance"]
+            semantic_status = prepared_item["semantic_status"]
+            topic_mismatch = body_relevance.get("status") == "review_topic_mismatch"
+            qualification_status = "TOPIC_MISMATCH" if topic_mismatch else "QUALIFIED"
+            qualification_action = prepared_item["qualification_action"]
+            pending_review = False
+            changes_held = bool(skip_topic_mismatch and topic_mismatch)
+        image_names = _docx_image_names(manual)
+        base_project = {
+            "source": str(manual),
+            "relative_path": relative_path,
+            "title": title,
+            "txt_path": prepared_item["title_body_item"].get("txt_path") if prepared_item["title_body_item"] else None,
+            "project_id": prepared_item["title_body_item"].get("project_id") if prepared_item["title_body_item"] else None,
+            "semantic_input_hash": prepared_item["title_body_item"].get("semantic_input_hash") if prepared_item["title_body_item"] else None,
+            "title_body_result": prepared_item["title_body_item"].get("result") if prepared_item["title_body_item"] else None,
+            "body_relevance": body_relevance,
+            "semantic_status": semantic_status if use_title_body_inputs else None,
+            "diagnostic_code": prepared_item["diagnostic_code"] or None,
+            "qualification_mode": report_mode,
+            "qualification_status": qualification_status,
+            "qualification_action": qualification_action,
+            "qualification_pending_review": pending_review,
+            "changes_held": changes_held,
+            "skip_requested": skip_requested,
+            "skip_effective": qualification_action == "SKIP_MISMATCH" if use_title_body_inputs else (skip_topic_mismatch and topic_mismatch),
+            "image_count": len(image_names),
+        }
+        if changes_held:
+            hold_status = "SKIPPED_TOPIC_MISMATCH" if qualification_action == "SKIP_MISMATCH" else "HELD_QUALIFICATION_NOT_EVALUATED"
+            projects.append({
+                **base_project,
+                "sample_indexes": [],
+                "samples": [],
+                "irrelevant_count": 0,
+                "decisive_count": 0,
+                "visual_backend": vision_backend,
+                "visual_call_count": 0,
+                "visual_decision_count": 0,
+                "visual_failure_count": 0,
+                "visual_total_tokens": 0,
+                "visual_candidate_count": 0,
+                "visual_selected_indexes": [],
+                "blocked": False,
+                "status": hold_status,
+            })
+            _progress(progress, "跳过标题正文资格未通过项目", document_index, manual.name)
+            continue
+        images = _docx_images(manual) if (check_image_relevance or check_image_vision) else []
         samples = []
         visual_calls = 0
         visual_decisions = 0
         visual_failures = 0
         visual_tokens = 0
-        sample_indexes = equidistant_sample_indexes(len(images))
+        sample_indexes = equidistant_sample_indexes(len(images)) if (check_image_relevance or check_image_vision) else []
         sample_inputs = [(images[index][1], Path(images[index][0]).suffix) for index in sample_indexes]
         if hasattr(ocr_adapter, "batch"):
             raw_results = ocr_adapter.batch(sample_inputs)
@@ -594,7 +1141,7 @@ def run_manual_content_stage(
                 **judgement,
                 "visual_review": {"status": "not_requested", "backend": vision_backend},
             })
-        visual_candidates = [position for position, sample in enumerate(samples) if sample["status"] in {"unknown", "irrelevant"}]
+        visual_candidates = [position for position, sample in enumerate(samples) if sample["status"] in {"unknown", "irrelevant"}] if check_image_vision else []
         vision_limit = max(0, min(int(vision_max_calls_per_project), len(visual_candidates)))
         selected_positions = [
             visual_candidates[index] for index in equidistant_sample_indexes(len(visual_candidates), ratio=0, minimum=vision_limit)
@@ -605,7 +1152,7 @@ def run_manual_content_stage(
             suffix = Path(image_name).suffix
             if vision_disabled_reason:
                 visual_review = {"status": "unknown", "backend": vision_backend, "error": vision_disabled_reason, "reason": "本批视觉接口此前失败，跳过后续调用"}
-            elif _supported_vision_image(image_bytes, suffix):
+            elif suffix.lower() in IMAGE_SUFFIXES:
                 visual_calls += 1
                 raw_visual = _call_adapter(vision_adapter, image_bytes, suffix, title, context, sample["ocr_text"])
                 visual_review = raw_visual if isinstance(raw_visual, dict) else {"status": "unknown", "error": "视觉分类器返回格式无效"}
@@ -624,12 +1171,13 @@ def run_manual_content_stage(
             sample["visual_review"] = visual_review
         irrelevant = sum(item["status"] == "irrelevant" for item in samples)
         decisive = sum(item["status"] in {"relevant", "irrelevant"} for item in samples)
-        blocked = bool(decisive and irrelevant / decisive > 0.5)
+        blocked = bool(check_image_relevance and decisive and irrelevant / decisive > 0.5)
+        if use_title_body_inputs and prepared_item["qualification_action"] == "CONTINUE_WITH_REVIEW":
+            status = "BLOCKED_IRRELEVANT_WITH_REVIEW" if blocked else "PREFLIGHT_PASSED_WITH_REVIEW"
+        else:
+            status = "BLOCKED_IRRELEVANT" if blocked else "PREFLIGHT_PASSED"
         projects.append({
-            "source": str(manual),
-            "relative_path": str(manual.relative_to(source_root)),
-            "body_relevance": assess_body_relevance(title, paragraphs),
-            "image_count": len(images),
+            **base_project,
             "sample_indexes": [item["index"] for item in samples],
             "samples": samples,
             "irrelevant_count": irrelevant,
@@ -642,39 +1190,163 @@ def run_manual_content_stage(
             "visual_candidate_count": len(visual_candidates),
             "visual_selected_indexes": [samples[position]["index"] for position in selected_positions],
             "blocked": blocked,
-            "status": "BLOCKED_IRRELEVANT" if blocked else "PREFLIGHT_PASSED",
+            "status": status,
         })
+        del images
         _progress(progress, "说明相关性预检", document_index, manual.name)
 
-    blocked_count = sum(project["blocked"] for project in projects)
-    batch_fused = bool(projects and blocked_count / len(projects) > 0.2)
+    eligible_for_image_gate = [
+        project for project in projects
+        if not project.get("changes_held")
+    ]
+    blocked_count = sum(project["blocked"] for project in eligible_for_image_gate)
+    batch_fused = bool(eligible_for_image_gate and blocked_count / len(eligible_for_image_gate) > 0.2)
+    preflight_seconds = time.perf_counter() - preflight_started if perf_trace else None
 
     # The first filesystem mutation intentionally happens only after every document is preflighted.
+    mutation_started = time.perf_counter() if perf_trace else None
+    date_documents_attempted = 0
+    batch_stage_by_source: dict[str, Path] = {}
+    batch_iterator = None
     if apply:
-        for document_index, project in enumerate(projects, 1):
-            source = Path(project["source"])
-            destination = destination_root / project["relative_path"]
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if source != destination:
-                shutil.copy2(source, destination)
-            project["output"] = str(destination)
-            project["year_changes"] = _rewrite_document_years(destination, year_classifier, target_year)
-            if batch_fused:
-                project["date_rewrite"] = {"status": "SKIPPED_BATCH_FUSE", "changed": False}
-                project["status"] = "BATCH_FUSED"
-            elif project["blocked"]:
-                project["date_rewrite"] = {"status": "SKIPPED_PROJECT_BLOCKED", "changed": False}
-            else:
-                result = _call_adapter(date_adapter, destination, target_year)
-                if not isinstance(result, dict):
-                    result = {"status": "FAILED_INVALID_RESULT", "changed": False, "reason": "date_rewriter 必须返回字典"}
-                result.setdefault("status", "CHANGED" if result.get("changed") else "UNCHANGED")
-                result.setdefault("changed", False)
-                project["date_rewrite"] = result
-                if result["status"] == "UNAVAILABLE":
-                    project["status"] = "DATE_REWRITER_UNAVAILABLE"
-            _progress(progress, "说明内容处理", document_index, source.name)
+        try:
+            batch_iterator_factory = getattr(date_adapter, "iter_rewrite_many_with_metadata", None)
+            if callable(batch_iterator_factory) and rewrite_image_dates and not batch_fused:
+                batch_projects = [
+                    project for project in projects
+                    if not project.get("changes_held") and not project["blocked"]
+                ]
+                batch_stages = []
+                for project in batch_projects:
+                    source = Path(project["source"])
+                    destination = destination_root / project["relative_path"]
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if source != destination:
+                        shutil.copy2(source, destination)
+                    project["output"] = str(destination)
+                    stage_fd, stage_name = tempfile.mkstemp(
+                        prefix=f".{destination.stem}.date-year-stage-", suffix=".docx", dir=destination.parent
+                    )
+                    os.close(stage_fd)
+                    stage_path = Path(stage_name)
+                    batch_stage_by_source[str(source)] = stage_path
+                    shutil.copy2(destination, stage_path)
+                    batch_stages.append(stage_path)
+                if batch_stages:
+                    batch_iterator = iter(batch_iterator_factory(batch_stages, target_year))
 
+            for document_index, project in enumerate(projects, 1):
+                source = Path(project["source"])
+                destination = destination_root / project["relative_path"]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if project.get("changes_held"):
+                    project["output"] = str(destination)
+                    hold_status = "SKIPPED_TOPIC_MISMATCH" if project.get("qualification_action") == "SKIP_MISMATCH" else "HELD_QUALIFICATION_NOT_EVALUATED"
+                    project["status"] = hold_status
+                    project["date_rewrite"] = {"status": hold_status, "changed": False}
+                    project["year_changes"] = []
+                    project["year_update_skipped_reason"] = project.get("body_relevance", {}).get("reason") or "项目资格状态要求暂停修改"
+                    _progress(progress, "跳过标题正文资格未通过项目", document_index, source.name)
+                    continue
+                if source != destination and project.get("output") != str(destination):
+                    shutil.copy2(source, destination)
+                project["output"] = str(destination)
+                year_update_skipped_reason = None
+                if batch_fused and rewrite_image_dates:
+                    project["date_rewrite"] = {"status": "SKIPPED_BATCH_FUSE", "changed": False}
+                    project["status"] = "BATCH_FUSED"
+                    year_update_skipped_reason = "批次图像日期阶段被熔断，无法确定与截图一致的目标年份"
+                elif project["blocked"] and rewrite_image_dates:
+                    project["date_rewrite"] = {"status": "SKIPPED_PROJECT_BLOCKED", "changed": False}
+                    year_update_skipped_reason = "项目因截图相关性门控而跳过日期处理，无法确定与截图一致的目标年份"
+                elif not rewrite_image_dates:
+                    project["date_rewrite"] = {"status": "SKIPPED_NOT_SELECTED", "changed": False}
+                else:
+                    metadata_rewriter = getattr(date_adapter, "rewrite_with_metadata", None)
+                    stage_path = batch_stage_by_source.get(str(source))
+                    if stage_path is None:
+                        stage_fd, stage_name = tempfile.mkstemp(
+                            prefix=f".{destination.stem}.date-year-stage-", suffix=".docx", dir=destination.parent
+                        )
+                        os.close(stage_fd)
+                        stage_path = Path(stage_name)
+                        batch_stage_by_source[str(source)] = stage_path
+                        shutil.copy2(destination, stage_path)
+                    date_documents_attempted += 1
+                    try:
+                        if batch_iterator is not None and str(source) in batch_stage_by_source:
+                            result = next(batch_iterator)
+                        else:
+                            result = metadata_rewriter(stage_path, target_year) if callable(metadata_rewriter) else _call_adapter(date_adapter, stage_path, target_year)
+                    except StopIteration:
+                        result = {"status": "FAILED_BATCH_INTERRUPTED", "changed": False,
+                                  "reason": "批处理未返回该 DOCX 的结果"}
+                    except Exception as exc:
+                        result = {"status": "FAILED", "changed": False, "reason": str(exc)}
+                    if not isinstance(result, dict) or not result:
+                        result = {"status": "FAILED_INVALID_RESULT", "changed": False, "reason": "date_rewriter 未返回有效结果字典"}
+                    result.setdefault("status", "CHANGED" if result.get("changed") else "UNCHANGED")
+                    result.setdefault("changed", False)
+                    successful_date_statuses = {
+                        "CHANGED", "UNCHANGED", "CHANGED_WITH_AUTO_SKIPS", "AUTO_SKIPPED_UNCERTAIN_IMAGES",
+                    }
+                    date_status = str(result["status"]).upper()
+                    if date_status in successful_date_statuses:
+                        stage_path.with_suffix(stage_path.suffix + ".date-year.tmp").unlink(missing_ok=True)
+                        os.replace(stage_path, destination)
+                        batch_stage_by_source.pop(str(source), None)
+                    else:
+                        stage_path.unlink(missing_ok=True)
+                        stage_path.with_suffix(stage_path.suffix + ".date-year.tmp").unlink(missing_ok=True)
+                        batch_stage_by_source.pop(str(source), None)
+                    project["date_rewrite"] = result
+                    project["effective_target_year"] = int(result.get("effective_target_year", target_year))
+                    project["trigger_date"] = result.get("trigger_date")
+                    project["rollback_reason"] = result.get("rollback_reason")
+                    if date_status == "UNAVAILABLE":
+                        project["status"] = "DATE_REWRITER_UNAVAILABLE"
+                    if date_status not in successful_date_statuses:
+                        detail = result.get("reason") or result.get("error") or date_status
+                        year_update_skipped_reason = f"截图日期处理未成功（{detail}），跳过正文年份改写以避免与截图不一致"
+                effective_target_year = int(project.get("effective_target_year", target_year))
+                project.setdefault("effective_target_year", effective_target_year)
+                project.setdefault("trigger_date", None)
+                project.setdefault("rollback_reason", None)
+                if year_update_skipped_reason:
+                    project["year_changes"] = []
+                    project["year_update_skipped_reason"] = year_update_skipped_reason
+                elif rewrite_body_years:
+                    body_target_year = target_year if not rewrite_image_dates else effective_target_year
+                    project["year_changes"] = _rewrite_document_years(destination, year_classifier, body_target_year)
+                else:
+                    project["year_changes"] = []
+                _progress(progress, "说明内容处理", document_index, source.name)
+
+        finally:
+            if batch_iterator is not None and hasattr(batch_iterator, "close"):
+                batch_iterator.close()
+            for remaining_stage in batch_stage_by_source.values():
+                remaining_stage.unlink(missing_ok=True)
+                remaining_stage.with_suffix(remaining_stage.suffix + ".date-year.tmp").unlink(missing_ok=True)
+            batch_stage_by_source.clear()
+
+    for project in projects:
+        project.setdefault("effective_target_year", target_year)
+        project.setdefault("trigger_date", None)
+        project.setdefault("rollback_reason", None)
+        if not apply and rewrite_image_dates:
+            project.setdefault("date_rewrite", {
+                "status": "PREVIEW_NOT_SCANNED",
+                "changed": False,
+                "reason": "预览模式不扫描全部截图日期；有效年份与触发日期需在实际应用时确定",
+            })
+            project.setdefault("year_changes", [])
+            project.setdefault("year_update_skipped_reason", "预览模式未扫描截图日期，无法确定与截图一致的正文目标年份")
+
+    mutation_seconds = time.perf_counter() - mutation_started if perf_trace else None
+
+    disqualified = [project for project in projects if project["qualification_status"] == "TOPIC_MISMATCH"]
+    qualification_reviews = [project for project in projects if project.get("qualification_pending_review")]
     report = {
         "schema_version": 1,
         "stage": "manual_content",
@@ -688,8 +1360,53 @@ def run_manual_content_stage(
         "blocked_project_count": blocked_count,
         "batch_fused": batch_fused,
         "visual_backend": vision_backend,
+        "visual_endpoint": _safe_endpoint(getattr(vision_adapter, "base_url", "")) if getattr(vision_adapter, "base_url", None) else None,
+        "visual_model": getattr(vision_adapter, "model", None),
+        "visual_max_image_bytes": getattr(vision_adapter, "max_image_bytes", None),
+        "visual_max_image_side": getattr(vision_adapter, "max_image_side", None),
+        "visual_api_key_count": len(getattr(vision_adapter, "api_keys", [])),
+        "visual_retry_count": getattr(vision_adapter, "retry_count", None),
+        "skip_topic_mismatch": skip_effective if use_title_body_inputs else skip_topic_mismatch,
+        "skip_requested": skip_requested,
+        "skip_effective": skip_effective,
+        "title_body_mode": report_mode,
+        "not_evaluated_action": not_evaluated_action,
+        "options": {
+            "check_body_relevance": check_body_relevance,
+            "title_body_mode": report_mode,
+            "check_image_relevance": check_image_relevance,
+            "check_image_vision": check_image_vision,
+            "rewrite_body_years": rewrite_body_years,
+            "rewrite_image_dates": rewrite_image_dates,
+        },
+        "disqualified_project_count": len(disqualified),
+        "skipped_project_count": sum(project.get("qualification_action") == "SKIP_MISMATCH" for project in projects),
+        "held_not_evaluated_count": sum(project.get("qualification_action") == "HOLD_NOT_EVALUATED" for project in projects),
+        "qualification_review_count": len(qualification_reviews),
+        "disqualified_projects": [
+            {
+                "name": project.get("title") or Path(project["relative_path"]).stem.removesuffix("说明"),
+                "relative_path": project["relative_path"],
+                "semantic_status": project.get("semantic_status"),
+                "similarity_score": project["body_relevance"].get("similarity_score"),
+                "evidence": project["body_relevance"].get("evidence", []),
+                "action": project.get("qualification_action"),
+                "reason": project["body_relevance"].get("reason", ""),
+            }
+            for project in disqualified
+        ],
+        "qualification_review_projects": [
+            {
+                "name": project.get("title") or Path(project["relative_path"]).stem.removesuffix("说明"),
+                "relative_path": project["relative_path"],
+                "semantic_status": project.get("semantic_status"),
+                "action": project.get("qualification_action"),
+                "diagnostic_code": project.get("diagnostic_code"),
+                "reason": project["body_relevance"].get("reason", ""),
+            }
+            for project in qualification_reviews
+        ],
         "visual_max_calls_per_project": vision_max_calls_per_project,
-        "visual_model": VISION_MODEL if isinstance(vision_adapter, LocalVisionAdapter) else None,
         "visual_call_count": sum(project["visual_call_count"] for project in projects),
         "visual_decision_count": sum(project["visual_decision_count"] for project in projects),
         "visual_failure_count": sum(project["visual_failure_count"] for project in projects),
@@ -698,6 +1415,22 @@ def run_manual_content_stage(
         "visual_error": vision_disabled_reason or None,
         "projects": projects,
     }
+    if perf_trace:
+        report["performance"] = {
+            "preparation_seconds": round(preparation_seconds, 4),
+            "preflight_seconds": round(preflight_seconds, 4),
+            "mutation_seconds": round(mutation_seconds, 4),
+            "date_rewriter": {
+                "documents_attempted": date_documents_attempted,
+                "subprocess_calls": date_adapter_performance.get("subprocess_calls") if isinstance(date_adapter_performance, dict) else None,
+                "batch_count": date_adapter_performance.get("batch_count", 0) if isinstance(date_adapter_performance, dict) else 0,
+                "wall_seconds": round(float(date_adapter_performance.get("wall_seconds", 0.0)), 4) if isinstance(date_adapter_performance, dict) else None,
+                "batch_wall_seconds": round(float(date_adapter_performance.get("batch_wall_seconds", 0.0)), 4) if isinstance(date_adapter_performance, dict) else None,
+                "engine_load_seconds": round(float(date_adapter_performance.get("engine_load_seconds", 0.0)), 4) if isinstance(date_adapter_performance, dict) else None,
+            },
+            "ocr_adapter": dict(getattr(ocr_adapter, "_performance", {})),
+            "total_seconds": round(time.perf_counter() - run_started, 4),
+        }
     report_file.parent.mkdir(parents=True, exist_ok=True)
     temporary_report = report_file.with_suffix(report_file.suffix + ".tmp")
     temporary_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -707,9 +1440,11 @@ def run_manual_content_stage(
 
 __all__ = [
     "LocalVisionAdapter",
+    "OpenAICompatibleVisionAdapter",
     "assess_body_relevance",
     "classify_year_context",
     "equidistant_sample_indexes",
+    "read_docx_paragraphs",
     "replace_update_years",
     "run_manual_content_stage",
 ]

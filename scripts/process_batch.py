@@ -16,8 +16,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
@@ -32,6 +34,9 @@ Image.MAX_IMAGE_PIXELS = None
 from pypdf import PdfReader
 
 import archive_types
+import cover_rules
+import page_label_audit
+from validation_isolation import activate_optimization_isolation, require_validation_path
 
 
 VERSION = "3.4.26"
@@ -49,13 +54,7 @@ REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 NS = {"w": W, "a": A, "r": R, "v": V, "rel": REL, "mc": MC}
 
-MANUAL_LABELS = (
-    "使用说明书", "使用手册", "用户手册", "用户使用手册",
-    "用户操作手册", "用户操作说明", "操作说明书", "操作手册",
-    "软件设计说明书", "软件设计说明",
-)
-LABEL_RE = re.compile(r"^[【\[]?(?:" + "|".join(map(re.escape, MANUAL_LABELS)) + r")[】\]]?$")
-LEGACY_LABEL_RE = re.compile(r"^[【\[]?(?:" + "|".join(map(re.escape, MANUAL_LABELS + ("说明书",))) + r")[】\]]?$")
+MANUAL_LABELS = tuple(cover_rules.load_rules()["full_labels"])
 SIMSUN_NAMES = {"宋体", "SimSun", "NSimSun", "宋体-简"}
 ARCHIVE_SUFFIXES = archive_types.ARCHIVE_SUFFIXES
 RELEVANT_SUFFIXES = {".txt", ".pdf", ".docx"}
@@ -110,36 +109,16 @@ def compact_text(value: str | None) -> str:
 
 
 def is_manual_label_candidate(value: str | None) -> bool:
-    """Recognize cover labels beyond the fixed legacy vocabulary."""
-    normalized = compact_text(value)
-    normalized = re.sub(r"^[0-9一二三四五六七八九十]+[、.)）]", "", normalized)
-    normalized = re.sub(r"[《》「」『』【】\[\]（）()\"“”]", "", normalized)
-    if LEGACY_LABEL_RE.fullmatch(normalized):
-        return True
-    signals = {term for term in ("书", "说明", "软件", "设计", "使用") if term in normalized}
-    return len(signals) >= 2 and bool(signals & {"书", "说明", "使用"})
-
-
-COVER_VERSION_SUFFIX_RE = re.compile(r"(?i)(?:\s*(?:V|版本)\s*\d+(?:\.\d+)*|\s*\d+\.\d+(?:\.\d+)*)\s*$")
+    """Recognize only labels accepted by the shared, versioned cover rules."""
+    return cover_rules.is_manual_label(value)
 
 
 def strip_cover_version(value: str) -> str:
-    return COVER_VERSION_SUFFIX_RE.sub("", value)
+    return cover_rules.strip_cover_version(value)
 
 
 def is_cover_title(value: str | None, title: str | None) -> bool:
-    normalized = compact_text(value)
-    normalized = re.sub(
-        r"^(?:\d+[、.．)）]|[（(](?:\d+|[一二三四五六七八九十]+)[）)]|"
-        r"第[一二三四五六七八九十]+[章节部分、，.]?|[一二三四五六七八九十]+[、.．)）])",
-        "",
-        normalized,
-    )
-    # A supplied cover often puts the version on the title line (“软件名 V1.0”).
-    # The cover itself must carry only the pure software name; the version lives
-    # in the running header. Strip a trailing version marker before matching so
-    # such a cover is detected and then repaired to the pure name.
-    return strip_cover_version(normalized) == compact_text(title)
+    return cover_rules.is_cover_title(value, title)
 
 
 def is_image_caption(text: str, props: dict | None = None) -> bool:
@@ -668,19 +647,26 @@ def inspect_txt(path: Path, title: str) -> dict:
     }
 
 
-def repair_main_function_text(value: str) -> tuple[str, dict[str, int]]:
+def repair_main_function_text(value: str, *, remove_ordinal_markers: bool = True) -> tuple[str, dict[str, int]]:
     """Apply the requested conservative punctuation cleanup to a TXT value."""
-    counts = {"parentheses_to_commas": 0, "quotes_removed": 0, "duplicate_punctuation_removed": 0, "ordinal_markers_removed": 0}
+    counts = {
+        "parentheses_to_commas": 0,
+        "quotes_removed": 0,
+        "duplicate_punctuation_removed": 0,
+        "leading_punctuation_removed": 0,
+        "ordinal_markers_removed": 0,
+    }
 
-    def remove_ordinal(match: re.Match[str]) -> str:
-        counts["ordinal_markers_removed"] += 1
-        return ""
+    if remove_ordinal_markers:
+        def remove_ordinal(match: re.Match[str]) -> str:
+            counts["ordinal_markers_removed"] += 1
+            return ""
 
-    while True:
-        updated = ORDINAL_MARKER_RE.sub(remove_ordinal, value)
-        if updated == value:
-            break
-        value = updated
+        while True:
+            updated = ORDINAL_MARKER_RE.sub(remove_ordinal, value)
+            if updated == value:
+                break
+            value = updated
 
     def replace_parenthesis(match: re.Match[str]) -> str:
         counts["parentheses_to_commas"] += 1
@@ -700,6 +686,19 @@ def repair_main_function_text(value: str) -> tuple[str, dict[str, int]]:
         return match.group("first")
 
     value = REPEATED_PUNCTUATION_RE.sub(collapse_punctuation, value)
+
+    def remove_leading_punctuation(match: re.Match[str]) -> str:
+        punctuation = match.group("punctuation")
+        counts["leading_punctuation_removed"] += len(
+            re.findall(r"[。，“、；：！？,;:!?]", punctuation)
+        )
+        return match.group("whitespace")
+
+    value = re.sub(
+        r"^(?P<whitespace>\s*)(?P<punctuation>(?:[。，“、；：！？,;:!?]\s*)+)",
+        remove_leading_punctuation,
+        value,
+    )
     return value, {key: count for key, count in counts.items() if count}
 
 
@@ -1173,7 +1172,7 @@ def inspect_docx(path: Path, title: str, check_login: bool) -> dict:
                     "label_paragraph": paragraph_rows[j]["index"],
                     "label": candidate_text,
                     "title_text": row["text"],
-                    "accepted_label": LABEL_RE.fullmatch(candidate_text) is not None,
+                    "accepted_label": is_manual_label_candidate(candidate_text),
                     "title_props": row["props"],
                     "label_props": paragraph_rows[j]["props"],
                 })
@@ -1314,7 +1313,7 @@ def inspect_docx(path: Path, title: str, check_login: bool) -> dict:
         "cover_found": cover is not None,
         "cover_label": cover["label"] if cover else None,
         "cover_title_text": cover["title_text"] if cover else None,
-        "cover_title_has_version": bool(cover and COVER_VERSION_SUFFIX_RE.search(cover["title_text"])),
+        "cover_title_has_version": bool(cover and cover_rules.has_cover_version(cover["title_text"])),
         "cover_style_explicit_ok": style_ok,
         "cover_layout_explicit_ok": layout_ok,
         **header_audit,
@@ -1465,7 +1464,131 @@ def inspect_login_screens_in_order(source: zipfile.ZipFile, images: list[dict]) 
     return {"status": "missing" if not matches else "single", "matches": matches}
 
 
-def inspect_pdf(path: Path, title: str, code: bool = False) -> dict:
+def _pdftoppm_executable() -> str | None:
+    found = shutil.which("pdftoppm")
+    if found:
+        return found
+    known = Path(r"C:\Users\ban\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\poppler\Library\bin\pdftoppm.exe")
+    return str(known) if known.is_file() else None
+
+
+def _render_pdf_page(path: Path, page_number: int, assets_dir: Path) -> dict:
+    executable = _pdftoppm_executable()
+    if not executable:
+        return {"status": "unavailable", "error": "找不到 pdftoppm，无法渲染疑似空白页"}
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    target_stem = assets_dir / f"page_{page_number:03d}"
+    command = [
+        executable, "-f", str(page_number), "-l", str(page_number), "-r", "100",
+        "-png", "-singlefile", str(path), str(target_stem),
+    ]
+    try:
+        completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20, check=False)
+        image_path = target_stem.with_suffix(".png")
+        if completed.returncode != 0 or not image_path.is_file():
+            message = completed.stdout.decode("utf-8", errors="replace")[-500:]
+            return {"status": "failed", "error": message or f"pdftoppm 退出码 {completed.returncode}"}
+        with Image.open(image_path) as image:
+            grayscale = image.convert("L")
+            pixels = grayscale.getdata()
+            foreground = sum(value < 235 for value in pixels)
+            ratio = foreground / max(1, grayscale.width * grayscale.height)
+        return {
+            "status": "rendered", "image": str(image_path),
+            "foreground_ratio": round(ratio, 6), "visually_blank": ratio <= 0.005,
+        }
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"status": "failed", "error": str(exc)}
+
+
+def _pdf_page_object_counts(page) -> tuple[int, int, int]:
+    images = forms = 0
+    resources = page.get("/Resources")
+    if resources:
+        try:
+            xobjects = resources.get_object().get("/XObject", {})
+            for reference in xobjects.values():
+                obj = reference.get_object()
+                subtype = str(obj.get("/Subtype", ""))
+                if subtype == "/Image":
+                    images += 1
+                elif subtype == "/Form":
+                    forms += 1
+        except Exception:
+            pass
+    annotations = 0
+    try:
+        annotations = len(page.get("/Annots", []))
+    except Exception:
+        pass
+    return images, forms, annotations
+
+
+def _pdf_page_body_text(text: str, title: str, page_number: int) -> str:
+    title_compact = compact_text(title)
+    raw_lines = [clean_text(line) for line in text.splitlines()]
+    chinese_pages = {"一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十", "二十一", "二十二", "二十三", "二十四", "二十五", "二十六", "二十七", "二十八", "二十九", "三十"}
+    skip_page_number_line = set()
+    for index, line in enumerate(raw_lines):
+        compact_line = compact_text(line)
+        if compact_line == "第" and index + 1 < len(raw_lines):
+            following = compact_text(raw_lines[index + 1])
+            if following in {f"{value}页" for value in chinese_pages} or re.fullmatch(r"\d+页", following):
+                skip_page_number_line.update({index, index + 1})
+        if compact_line in {f"{value}页" for value in chinese_pages}:
+            skip_page_number_line.add(index)
+    kept = []
+    for index, line in enumerate(raw_lines):
+        if index in skip_page_number_line:
+            continue
+        if not line:
+            continue
+        normalized = compact_text(line)
+        if re.fullmatch(rf"(?:第\s*)?{page_number}\s*(?:页)?", line):
+            continue
+        if re.fullmatch(rf"(?:{page_number}|第{page_number}页)", normalized):
+            continue
+        if normalized in {f"第{chinese}" for chinese in chinese_pages} or normalized in {f"{chinese}页" for chinese in chinese_pages}:
+            continue
+        if title_compact and title_compact in normalized and re.search(r"(?i)(?:V\s*\d+(?:\.\d+)*|版本\s*\d+(?:\.\d+)*)", line):
+            continue
+        if re.fullmatch(r"(?i)(?:V\s*\d+(?:\.\d+)*|版本\s*\d+(?:\.\d+)*)", line):
+            continue
+        if re.fullmatch(rf"(?i)V\s*\d+(?:\.\d+)*\s*{page_number}", line):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+WORD_BOOKMARK_ERROR_PATTERNS = (
+    ("未定义书签", re.compile(r"错误[\s\W_]*未定义[\s\W_]*书签", re.IGNORECASE)),
+    ("Bookmark not defined", re.compile(r"error[\s\W_]*bookmark[\s\W_]*not[\s\W_]*defined", re.IGNORECASE)),
+)
+
+
+def _find_word_bookmark_errors(text: str, page_number: int) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for error_type, pattern in WORD_BOOKMARK_ERROR_PATTERNS:
+        for match in pattern.finditer(text or ""):
+            start = max(0, match.start() - 45)
+            end = min(len(text), match.end() + 45)
+            snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+            findings.append({
+                "page": page_number,
+                "type": error_type,
+                "snippet": snippet,
+            })
+    return findings
+
+
+def inspect_pdf(
+    path: Path,
+    title: str,
+    code: bool = False,
+    *,
+    assets_dir: Path | None = None,
+    expected_label: str | None = None,
+) -> dict:
     reader = PdfReader(str(path))
     pages = len(reader.pages)
     first_text = reader.pages[0].extract_text() or "" if pages else ""
@@ -1483,6 +1606,55 @@ def inspect_pdf(path: Path, title: str, code: bool = False) -> dict:
             or re.search(rf"V\s*1\.0\s+{re.escape(expected)}\s*$", line, re.I)
             for line in lines
         )
+    all_pages = []
+    suspicious_pages = []
+    bookmark_errors = []
+    confirmed_blank_pages = []
+    unresolved_blank_pages = []
+    render_root = assets_dir or (Path(tempfile.gettempdir()) / "easysoftware_pdf_page_audit")
+    for number, page in enumerate(reader.pages, 1):
+        page_text = page.extract_text() or ""
+        body_text = _pdf_page_body_text(page_text, title, number)
+        page_bookmark_errors = _find_word_bookmark_errors(page_text, number)
+        bookmark_errors.extend(page_bookmark_errors)
+        image_count, form_count, annotation_count = _pdf_page_object_counts(page)
+        record = {
+            "page": number,
+            "bookmark_errors": page_bookmark_errors,
+            "text_chars_after_header_footer_filter": len(body_text.strip()),
+            "has_body_text": bool(body_text.strip()),
+            "image_objects": image_count,
+            "form_xobjects": form_count,
+            "annotations": annotation_count,
+            "blank_candidate": False,
+        }
+        # Text-free pages with no image or annotation objects may still contain
+        # vector drawings. Render only these candidates before calling them blank.
+        if not body_text.strip() and image_count == 0 and annotation_count == 0:
+            record["blank_candidate"] = True
+            rendered = _render_pdf_page(path, number, render_root)
+            record["render"] = rendered
+            if rendered.get("status") == "rendered":
+                record["confirmed_blank"] = bool(rendered.get("visually_blank"))
+                if record["confirmed_blank"]:
+                    confirmed_blank_pages.append(number)
+                elif form_count == 0:
+                    unresolved_blank_pages.append(number)
+            else:
+                record["confirmed_blank"] = False
+                unresolved_blank_pages.append(number)
+            suspicious_pages.append(record)
+        else:
+            record["confirmed_blank"] = False
+        all_pages.append(record)
+    compact_first_text = compact_text(first_text)
+    first_manual_label = any(cover_rules.is_manual_label(line) for line in first_lines) or any(
+        cover_rules.normalize_cover_text(label) in compact_first_text for label in MANUAL_LABELS
+    )
+    first_label_matches_expected = (
+        expected_label is None
+        or cover_rules.normalize_cover_text(expected_label) in compact_first_text
+    )
     result = {
         "pages": pages,
         "first_text": first_text,
@@ -1494,6 +1666,13 @@ def inspect_pdf(path: Path, title: str, code: bool = False) -> dict:
         "first_has_page_number": has_page_number(first_lines, 1),
         "last_has_page_number": has_page_number(last_lines, pages),
         "title_on_one_extracted_line": any(compact_text(title) in compact_text(line) for line in first_lines),
+        "first_has_manual_label": first_manual_label,
+        "first_label_matches_expected": first_label_matches_expected,
+        "bookmark_errors": bookmark_errors,
+        "all_pages": all_pages,
+        "blank_page_candidates": suspicious_pages,
+        "confirmed_blank_pages": confirmed_blank_pages,
+        "unresolved_blank_pages": unresolved_blank_pages,
     }
     if code:
         combined = first_text + "\n" + last_text
@@ -2739,9 +2918,185 @@ def restore_word_pair(docx: Path, pdf: Path, backup_dir: Path, had_pdf: bool) ->
         shutil.copy2(backup_pdf, pdf)
     elif not had_pdf and pdf.exists():
         pdf.unlink()
-    lock = docx.with_name("~$" + docx.name[2:])
+    lock = docx.with_name("~$" + docx.name)
     if lock.exists():
         lock.unlink()
+
+
+COVER_TRANSACTION_FILENAME = ".easysoftware_cover_transaction.json"
+COVER_BACKUP_DIRECTORY = ".easysoftware_cover_backups"
+
+
+def _sha256_path(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _transaction_paths(root: Path, entry: dict[str, Any]) -> tuple[Path, Path, Path]:
+    from validation_isolation import require_validation_path
+
+    root = root.resolve()
+    folder_candidate = root / str(entry.get("folder", ""))
+    docx_candidate = folder_candidate / str(entry.get("docx", ""))
+    pdf_candidate = folder_candidate / str(entry.get("pdf", ""))
+    backup_candidate = Path(str(entry.get("backup_dir", "")))
+    require_validation_path(docx_candidate, kind="material", same_run_as=root)
+    require_validation_path(pdf_candidate, kind="material", same_run_as=root)
+    require_validation_path(backup_candidate, kind="material", same_run_as=root)
+    folder = folder_candidate.resolve()
+    docx = docx_candidate.resolve()
+    pdf = pdf_candidate.resolve()
+    backup_dir = backup_candidate.resolve()
+    backup_root = (root / COVER_BACKUP_DIRECTORY).resolve()
+    if not folder.is_relative_to(root) or not docx.is_relative_to(root) or not pdf.is_relative_to(root):
+        raise RuntimeError("封面事务记录包含输出目录之外的文档路径")
+    if not backup_dir.is_relative_to(backup_root):
+        raise RuntimeError("封面事务记录包含快照目录之外的备份路径")
+    return docx, pdf, backup_dir
+
+
+def recover_cover_transaction(journal_path: Path) -> dict[str, Any]:
+    """Recover a pending DOCX/PDF transaction after an interrupted process."""
+    from validation_isolation import require_validation_path
+
+    require_validation_path(journal_path, kind="material")
+    journal_path = journal_path.resolve()
+    root = journal_path.parent
+    transaction = load_json(journal_path, None)
+    if not isinstance(transaction, dict) or not isinstance(transaction.get("documents"), list):
+        raise RuntimeError(f"封面事务日志损坏，保留原文件供检查：{journal_path}")
+    actions = []
+    for entry in transaction["documents"]:
+        docx, pdf, backup_dir = _transaction_paths(root, entry)
+        state = str(entry.get("state", "PENDING"))
+        expected = entry.get("committed_hashes") if state == "COMMITTED" else entry.get("original_hashes", {})
+        current_matches = (
+            _sha256_path(docx) == expected.get("docx")
+            and _sha256_path(pdf) == expected.get("pdf")
+        )
+        if state == "COMMITTED" and current_matches:
+            action = "保留已验收提交"
+        elif state == "RESTORED" and current_matches:
+            action = "确认原文件已恢复"
+        else:
+            had_pdf = bool(entry.get("had_pdf"))
+            if not (backup_dir / docx.name).is_file():
+                raise RuntimeError(f"封面事务缺少 DOCX 快照，保留日志供检查：{journal_path}")
+            restore_word_pair(docx, pdf, backup_dir, had_pdf)
+            action = "恢复修复前 DOCX/PDF 快照"
+        entry["state"] = "COMMITTED" if state == "COMMITTED" and action == "保留已验收提交" else "RESTORED"
+        actions.append({"name": entry.get("name", ""), "folder": entry.get("folder", ""), "action": action})
+        # Persist progress after each pair so another interruption can resume
+        # recovery without leaving a mixed DOCX/PDF version.
+        atomic_json(journal_path, transaction)
+    backup_root = (root / COVER_BACKUP_DIRECTORY).resolve()
+    if backup_root.is_dir():
+        shutil.rmtree(backup_root)
+    journal_path.unlink(missing_ok=True)
+    return {"transaction_id": transaction.get("transaction_id", ""), "root": str(root), "actions": actions}
+
+
+def recover_pending_cover_transactions(
+    source_root: Path,
+    *,
+    output_prefix: str | None = None,
+) -> list[dict[str, Any]]:
+    """Recover this source root and its matching processed-output siblings."""
+    from validation_isolation import require_validation_path
+
+    source_root = require_validation_path(source_root, kind="material")
+    roots = []
+    if (source_root / COVER_TRANSACTION_FILENAME).is_file():
+        roots.append(source_root)
+    if output_prefix and source_root.parent.is_dir():
+        for path in source_root.parent.iterdir():
+            if not path.is_dir() or not path.name.startswith(output_prefix):
+                continue
+            require_validation_path(path, kind="material", same_run_as=source_root)
+            if (path / COVER_TRANSACTION_FILENAME).is_file():
+                roots.append(path)
+    recovered = []
+    for root in roots:
+        recovered.append(recover_cover_transaction(root / COVER_TRANSACTION_FILENAME))
+    return recovered
+
+
+def _mark_cover_transaction_item(
+    journal_path: Path,
+    key: tuple[str, str],
+    state: str,
+    docx: Path,
+    pdf: Path,
+) -> None:
+    transaction = load_json(journal_path, None)
+    if not isinstance(transaction, dict):
+        raise RuntimeError(f"封面事务日志丢失：{journal_path}")
+    for entry in transaction.get("documents", []):
+        if (str(entry.get("name", "")), str(entry.get("folder", ""))) == key:
+            entry["state"] = state
+            if state == "COMMITTED":
+                entry["committed_hashes"] = {"docx": _sha256_path(docx), "pdf": _sha256_path(pdf)}
+            atomic_json(journal_path, transaction)
+            return
+    raise RuntimeError(f"封面事务日志找不到项目：{key[0]} / {key[1]}")
+
+
+def _close_cover_transaction(journal_path: Path, report_path: Path, report: dict[str, Any]) -> None:
+    atomic_json(report_path, report)
+    if not journal_path.is_file():
+        return
+    transaction = load_json(journal_path, {})
+    states = {str(entry.get("state", "PENDING")) for entry in transaction.get("documents", [])}
+    if states.issubset({"COMMITTED", "RESTORED"}):
+        backup_root = journal_path.parent / COVER_BACKUP_DIRECTORY
+        if backup_root.is_dir():
+            shutil.rmtree(backup_root)
+        journal_path.unlink(missing_ok=True)
+
+
+def _project_file_manifest(folder: Path) -> list[dict[str, Any]]:
+    rows = []
+    for path in sorted((item for item in folder.rglob("*") if item.is_file()), key=lambda item: str(item).casefold()):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        rows.append({
+            "path": str(path.relative_to(folder)),
+            "size": path.stat().st_size,
+            "sha256": digest.hexdigest(),
+        })
+    return rows
+
+
+def _cover_pdf_findings(pdf_audit: dict[str, Any], word_pages: int, expected_label: str) -> list[str]:
+    findings = []
+    if not pdf_audit.get("first_has_title"):
+        findings.append("最终 PDF 第 1 页未识别到完整软件名称")
+    if not pdf_audit.get("first_has_manual_label"):
+        findings.append("最终 PDF 第 1 页未识别到有效说明书标签")
+    if expected_label and not pdf_audit.get("first_label_matches_expected"):
+        findings.append("最终 PDF 封面标签与 Word 验收标签不一致")
+    if pdf_audit.get("confirmed_blank_pages"):
+        numbers = "、".join(str(page) for page in pdf_audit["confirmed_blank_pages"])
+        findings.append(f"最终 PDF 发现纯空白页：第 {numbers} 页")
+    if pdf_audit.get("unresolved_blank_pages"):
+        numbers = "、".join(str(page) for page in pdf_audit["unresolved_blank_pages"])
+        findings.append(f"最终 PDF 疑似空白页未能完成渲染复核：第 {numbers} 页")
+    if pdf_audit.get("bookmark_errors"):
+        errors = "；".join(
+            f"第 {int(item.get('page', 0))} 页（{item.get('type', '书签错误')}）：{item.get('snippet', '')}"
+            for item in pdf_audit["bookmark_errors"]
+        )
+        findings.append("最终 PDF 全书发现 Word 书签引用错误文本：" + errors)
+    if word_pages > 0 and int(pdf_audit.get("pages", 0)) != word_pages:
+        findings.append(f"Word 与最终 PDF 页数不一致：{word_pages} / {pdf_audit.get('pages', 0)}")
+    return findings
 
 
 def invoke_word_pipeline(
@@ -2752,6 +3107,7 @@ def invoke_word_pipeline(
     timeout_seconds: int = 300,
     progress: ProgressReporter | None = None,
     module: str = "",
+    _allow_targeted_retry: bool = True,
 ) -> dict:
     plan = load_json(plan_path, {})
     packages = [row for row in plan.get("packages", []) if row.get("actions")]
@@ -2759,6 +3115,12 @@ def invoke_word_pipeline(
         report = {"version": VERSION, "packages": [], "message": "没有需要Word修复的文档"}
         atomic_json(report_path, report)
         return report
+
+    # Recover a previous external run that was terminated while Word was
+    # writing. The internal targeted retry deliberately shares the original
+    # pending journal until the outer transaction reaches final QA.
+    if _allow_targeted_retry:
+        recover_pending_cover_transactions(modified)
 
     # A single broken code document can make Word hang during PDF export.
     # Isolate code documents so one timeout never blocks the remaining batch.
@@ -2788,10 +3150,62 @@ def invoke_word_pipeline(
     timeout = max(timeout_seconds, timeout_seconds * len(packages))
     pid_path = report_path.with_suffix(".word.pid")
     backups: list[tuple[dict, Path, Path, Path, bool]] = []
+    transactional = any(
+        set(row.get("actions", [])) & {
+            "ENSURE_COVER_FIRST_PAGE", "AUDIT_ALL_PAGES", "AUDIT_PAGE_LABELS", "ADD_COVER",
+            "REPAIR_TRUNCATED_PAGE_LABELS",
+        }
+        for row in packages
+    )
+    manifests: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    transaction_id = uuid.uuid4().hex
+    transaction_path = (
+        modified / COVER_TRANSACTION_FILENAME
+        if transactional and _allow_targeted_retry else None
+    )
+    transaction_entries = []
     for index, row in enumerate(packages, 1):
-        backup_dir = report_path.parent / "timeout_backups" / f"{index:03d}_{safe_name(str(row.get('name', 'unnamed')))}"
+        # Keep the initial run's rollback snapshot separate from a targeted
+        # retry. Both invocations share the same report directory; reusing a
+        # package-only folder would overwrite the original with retry input.
+        if transaction_path is not None:
+            backup_dir = (
+                modified / COVER_BACKUP_DIRECTORY / transaction_id
+                / safe_name(report_path.stem)
+                / f"{index:03d}_{safe_name(str(row.get('name', 'unnamed')))}"
+            )
+        else:
+            backup_dir = (
+                report_path.parent / "timeout_backups" / safe_name(report_path.stem)
+                / f"{index:03d}_{safe_name(str(row.get('name', 'unnamed')))}"
+            )
         docx, pdf, had_pdf = backup_word_pair(modified, row, backup_dir)
         backups.append((row, docx, pdf, backup_dir, had_pdf))
+        if transaction_path is not None:
+            transaction_entries.append({
+                "name": str(row.get("name", "")),
+                "folder": str(row.get("folder", "")),
+                "docx": str(row.get("docx", "")),
+                "pdf": pdf.relative_to(modified / str(row.get("folder", ""))).as_posix(),
+                "backup_dir": str(backup_dir),
+                "had_pdf": had_pdf,
+                "original_hashes": {
+                    "docx": _sha256_path(backup_dir / docx.name),
+                    "pdf": _sha256_path(backup_dir / pdf.name) if had_pdf else None,
+                },
+                "state": "PENDING",
+            })
+            project_dir = (modified / str(row.get("folder", ""))).resolve()
+            if project_dir.is_relative_to(modified.resolve()) and project_dir.is_dir():
+                manifests[(str(row.get("name", "")), str(row.get("folder", "")))] = _project_file_manifest(project_dir)
+    if transaction_path is not None:
+        atomic_json(transaction_path, {
+            "schema_version": 1,
+            "transaction_id": transaction_id,
+            "created_at": now_iso(),
+            "state": "PENDING",
+            "documents": transaction_entries,
+        })
     command = [
         shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path),
         "-BaseDir", str(modified), "-PlanPath", str(plan_path), "-ReportPath", str(report_path),
@@ -2830,16 +3244,232 @@ def invoke_word_pipeline(
             report = {"version": VERSION, "created_at": now_iso(), "base": str(modified), "packages": [
                 {"name": row.get("name", ""), "folder": row.get("folder", ""), "status": "PRESERVED_FOR_REVIEW", "changed": True,
                  "actions_requested": row.get("actions", []), "actions_applied": [],
-                 "failures": [f"Word批处理超时（>{timeout}秒），已保留当前修复结果供审核"], "word_pages": 0, "seconds": timeout}
+                 "failures": [f"Word批处理超时（>{timeout}秒）"], "word_pages": 0, "seconds": timeout}
                 for row, *_ in backups
             ], "raw_output": decode_process_output(exc.stdout)[-3000:]}
-            atomic_json(report_path, report)
+            if transactional:
+                for package_result, (row, docx, pdf, backup_dir, had_pdf) in zip(report["packages"], backups):
+                    restore_word_pair(docx, pdf, backup_dir, had_pdf)
+                    package_result.update({
+                        "status": "ROLLED_BACK", "snapshot_restored": True,
+                        "snapshot_manifest": manifests.get((str(row.get("name", "")), str(row.get("folder", ""))), []),
+                    })
+                    package_result["failures"].append("已按项目文件快照恢复 DOCX/PDF，批次继续")
+                    if transaction_path is not None:
+                        _mark_cover_transaction_item(
+                            transaction_path,
+                            (str(row.get("name", "")), str(row.get("folder", ""))),
+                            "RESTORED", docx, pdf,
+                        )
+            if transaction_path is not None:
+                _close_cover_transaction(transaction_path, report_path, report)
+            else:
+                atomic_json(report_path, report)
             return report
     close_owned_word(pid_path)
     report = load_json(report_path, None)
     if report and report.get("packages"):
         report["raw_output"] = (completed.stdout or "")[-3000:]
-        atomic_json(report_path, report)
+        result_by_key = {
+            (str(item.get("name", "")), str(item.get("folder", ""))): item
+            for item in report.get("packages", [])
+        }
+        retry_pages_by_key: dict[tuple[str, str], list[int]] = {}
+        for row in packages:
+            key = (str(row.get("name", "")), str(row.get("folder", "")))
+            result_row = result_by_key.get(key)
+            if not result_row:
+                continue
+            result_row.setdefault("name_source", row.get("name_source", ""))
+            result_row.setdefault("docx_title", row.get("docx_title", ""))
+            result_row.setdefault("name_conflicts", row.get("name_conflicts", []))
+            if transactional:
+                result_row["snapshot_manifest"] = manifests.get(key, [])
+                result_row["snapshot_status"] = "PENDING_FINAL_QA"
+            actions = set(row.get("actions", []))
+            audit_all_pages = bool(actions & {"AUDIT_ALL_PAGES", "AUDIT_PDF_ALL_PAGES"})
+            audit_page_labels = bool(actions & {"AUDIT_ALL_PAGES", "AUDIT_PAGE_LABELS", "AUDIT_PDF_ALL_PAGES"})
+            if not audit_all_pages and not audit_page_labels:
+                continue
+            folder = modified / str(row.get("folder", ""))
+            pdf_path = folder / str(row.get("pdf", "")) if row.get("pdf") else (folder / str(row.get("docx", ""))).with_suffix(".pdf")
+            if not pdf_path.is_file():
+                pdf_audit = {"pages": 0, "error": f"導出後 PDF 不存在：{pdf_path}", "confirmed_blank_pages": [], "unresolved_blank_pages": []}
+                findings = [pdf_audit["error"]]
+            else:
+                assets_dir = report_path.parent / "combined_document_result_assets" / "pdf_pages" / safe_name(str(row.get("name", "package")))
+                try:
+                    if audit_all_pages:
+                        pdf_audit = inspect_pdf(
+                            pdf_path, str(row.get("name", "")), assets_dir=assets_dir,
+                            expected_label=str(result_row.get("cover_label", "")),
+                        )
+                        findings = _cover_pdf_findings(
+                            pdf_audit, int(result_row.get("word_pages", 0)), str(result_row.get("cover_label", "")),
+                        )
+                    else:
+                        pdf_audit = {"pages": 0, "confirmed_blank_pages": [], "unresolved_blank_pages": []}
+                        findings = []
+                    if audit_page_labels:
+                        docx_path = folder / str(row.get("docx", ""))
+                        # 页码完整性审计暂时只记录结果，不参与失败判定、自动修复或成对回滚。
+                        try:
+                            label_audit = page_label_audit.audit_docx_pdf_page_labels(docx_path, pdf_path)
+                            if not isinstance(label_audit, dict):
+                                label_audit = {
+                                    "status": "error",
+                                    "issues": ["页码完整性审计未返回有效结果"],
+                                }
+                        except Exception as exc:
+                            label_audit = {
+                                "status": "error",
+                                "issues": [f"页码完整性审计执行失败：{exc}"],
+                            }
+                        label_audit["enforcement"] = "informational_only"
+                        pdf_audit["page_label_audit"] = label_audit
+                        page_count = label_audit.get("page_count")
+                        if (
+                            not pdf_audit.get("pages")
+                            and isinstance(page_count, int)
+                            and not isinstance(page_count, bool)
+                        ):
+                            pdf_audit["pages"] = page_count
+                except Exception as exc:
+                    pdf_audit = {"pages": 0, "error": str(exc), "confirmed_blank_pages": [], "unresolved_blank_pages": []}
+                    findings = [f"最终 PDF 全书验收失败：{exc}"]
+            result_row["pdf_audit"] = pdf_audit
+            result_row["pdf_page_count"] = int(pdf_audit.get("pages", 0))
+            result_row["confirmed_blank_pages"] = list(pdf_audit.get("confirmed_blank_pages", []))
+            result_row["unresolved_blank_pages"] = list(pdf_audit.get("unresolved_blank_pages", []))
+            word_page_rows = {int(item.get("page", 0)): item for item in result_row.get("page_audit", [])}
+            for candidate in pdf_audit.get("blank_page_candidates", []):
+                page_number = int(candidate.get("page", 0))
+                mapped_page = word_page_rows.get(page_number, {})
+                following_page = word_page_rows.get(page_number + 1, {})
+                next_section_starts = set(following_page.get("section_starts", []))
+                causes = []
+                if not mapped_page:
+                    causes.append("最终 PDF 页码未对应到 Word 当前分页映射")
+                elif not mapped_page.get("has_body_content"):
+                    causes.append("当前 Word 页无正文文字、表格或图形对象")
+                    if "odd_page" in next_section_starts:
+                        causes.append("下一页奇数页分节可能生成此空白页")
+                    elif "even_page" in next_section_starts:
+                        causes.append("下一页偶数页分节可能生成此空白页")
+                    elif int(mapped_page.get("page_breaks", 0)) > 0:
+                        causes.append("Word 页面映射含显式分页符")
+                    elif int(mapped_page.get("page_break_before", 0)) > 0:
+                        causes.append("Word 段落设置了段前分页")
+                    elif not any("分节" in str(change.get("cause", "")) for change in result_row.get("blank_page_repairs", [])):
+                        causes.append("当前页未定位到明确分页成因")
+                else:
+                    causes.append("Word 当前页有正文或对象，PDF 与 Word 页面映射不一致；只允许重新导出，不按旧 PDF 页码删除")
+                candidate["word_page_mapping"] = mapped_page
+                candidate["suspected_causes"] = causes
+            result_row["blank_page_diagnostics"] = pdf_audit.get("blank_page_candidates", [])
+            retry_pages = []
+            if result_row.get("status") == "OK" and pdf_audit.get("confirmed_blank_pages"):
+                for page_number in pdf_audit["confirmed_blank_pages"]:
+                    current_page = word_page_rows.get(int(page_number), {})
+                    if not current_page or not current_page.get("has_body_content"):
+                        retry_pages.append(int(page_number))
+                    else:
+                        # The PDF page is empty but the current Word map has
+                        # content there. Re-export once; never delete by the
+                        # stale PDF page number.
+                        retry_pages.append(int(page_number))
+                retry_pages_by_key[key] = retry_pages
+            if findings:
+                prior = list(result_row.get("failures", []))
+                for finding in findings:
+                    if finding not in prior:
+                        prior.append(finding)
+                result_row["failures"] = prior
+                result_row["status"] = "QA_FAILED"
+                result_row.setdefault("attempts", []).append({
+                    "attempt": 1, "phase": "最终 PDF 全书验收", "status": "FAILED", "failures": findings,
+                    "pdf_page_count": int(pdf_audit.get("pages", 0)),
+                    "confirmed_blank_pages": list(pdf_audit.get("confirmed_blank_pages", [])),
+                })
+            else:
+                result_row.setdefault("attempts", []).append({
+                    "attempt": 1, "phase": "最终 PDF 全书验收", "status": "PASSED", "failures": [],
+                    "pdf_page_count": int(pdf_audit.get("pages", 0)),
+                })
+
+        if _allow_targeted_retry and retry_pages_by_key:
+            retry_packages = []
+            for row in packages:
+                key = (str(row.get("name", "")), str(row.get("folder", "")))
+                if key not in retry_pages_by_key:
+                    continue
+                retry_row = dict(row)
+                retry_actions = list(row.get("actions", []))
+                retry_row["retry_blank_pages"] = retry_pages_by_key[key]
+                retry_actions.append("REPAIR_BLANK_PAGES")
+                retry_actions.append("EXPORT_PDF")
+                retry_row["actions"] = list(dict.fromkeys(retry_actions))
+                retry_packages.append(retry_row)
+            retry_plan_path = report_path.with_name(report_path.stem + "_retry_plan.json")
+            retry_report_path = report_path.with_name(report_path.stem + "_retry_result.json")
+            atomic_json(retry_plan_path, {**plan, "packages": retry_packages})
+            retry_report = invoke_word_pipeline(
+                modified, retry_plan_path, retry_report_path, script_path,
+                timeout_seconds=timeout_seconds, progress=progress, module=module,
+                _allow_targeted_retry=False,
+            )
+            retry_rows = {
+                (str(item.get("name", "")), str(item.get("folder", ""))): item
+                for item in retry_report.get("packages", [])
+            }
+            for key, retried in retry_rows.items():
+                original_row = result_by_key.get(key)
+                if not original_row:
+                    continue
+                first_attempts = list(original_row.get("attempts", []))
+                second_findings = list(retried.get("failures", []))
+                retried["attempts"] = first_attempts + [{
+                    "attempt": 2,
+                    "phase": "根据当前 Word 分页映射定向修复并重新导出 PDF",
+                    "status": "PASSED" if retried.get("status") == "OK" else "FAILED",
+                    "target_pages": retry_pages_by_key.get(key, []),
+                    "failures": second_findings,
+                    "pdf_page_count": int(retried.get("pdf_page_count", 0)),
+                }]
+                retried["retry_performed"] = True
+                report["packages"] = [
+                    retried if (str(item.get("name", "")), str(item.get("folder", ""))) == key else item
+                    for item in report.get("packages", [])
+                ]
+                result_by_key[key] = retried
+
+        if transactional:
+            for row, docx, pdf, backup_dir, had_pdf in backups:
+                key = (str(row.get("name", "")), str(row.get("folder", "")))
+                result_row = result_by_key.get(key)
+                if result_row and result_row.get("status") != "OK":
+                    restore_word_pair(docx, pdf, backup_dir, had_pdf)
+                    result_row["status"] = "ROLLED_BACK"
+                    result_row["snapshot_restored"] = True
+                    result_row["snapshot_status"] = "RESTORED_AFTER_QA_FAILURE"
+                    rollback_note = "项目验收未通过，已按修复前 DOCX/PDF 快照恢复"
+                    failures = result_row.setdefault("failures", [])
+                    if rollback_note not in failures:
+                        failures.append(rollback_note)
+                    transaction_state = "RESTORED"
+                elif result_row:
+                    result_row["snapshot_restored"] = False
+                    result_row["snapshot_status"] = "COMMITTED_AFTER_QA"
+                    transaction_state = "COMMITTED"
+                else:
+                    restore_word_pair(docx, pdf, backup_dir, had_pdf)
+                    transaction_state = "RESTORED"
+                if transaction_path is not None:
+                    _mark_cover_transaction_item(transaction_path, key, transaction_state, docx, pdf)
+        if transaction_path is not None:
+            _close_cover_transaction(transaction_path, report_path, report)
+        else:
+            atomic_json(report_path, report)
         return report
     report = {"version": VERSION, "created_at": now_iso(), "base": str(modified), "packages": [
         {"name": row.get("name", ""), "folder": row.get("folder", ""), "status": "PRESERVED_FOR_REVIEW", "changed": True,
@@ -2847,7 +3477,24 @@ def invoke_word_pipeline(
          "failures": ["Word批处理未生成有效报告，已保留当前修复结果：" + (completed.stdout or "")[-500:]], "word_pages": 0, "seconds": 0}
         for row, *_ in backups
     ], "raw_output": (completed.stdout or "")[-3000:]}
-    atomic_json(report_path, report)
+    if transactional:
+        for result_row, (row, docx, pdf, backup_dir, had_pdf) in zip(report["packages"], backups):
+            restore_word_pair(docx, pdf, backup_dir, had_pdf)
+            result_row.update({
+                "status": "ROLLED_BACK", "snapshot_restored": True,
+                "snapshot_manifest": manifests.get((str(row.get("name", "")), str(row.get("folder", ""))), []),
+            })
+            result_row["failures"].append("已按项目文件快照恢复 DOCX/PDF")
+            if transaction_path is not None:
+                _mark_cover_transaction_item(
+                    transaction_path,
+                    (str(row.get("name", "")), str(row.get("folder", ""))),
+                    "RESTORED", docx, pdf,
+                )
+    if transaction_path is not None:
+        _close_cover_transaction(transaction_path, report_path, report)
+    else:
+        atomic_json(report_path, report)
     return report
 
 
@@ -3199,10 +3846,16 @@ def main() -> int:
     parser.add_argument("--manual-only", action="store_true", help="仅处理并验证说明书，跳过代码材料")
     args = parser.parse_args()
 
-    batch_root = args.batch_root.resolve()
+    activate_optimization_isolation()
+    batch_root = require_validation_path(args.batch_root, kind="material")
     extracted = (args.extracted or batch_root / "解压版").resolve()
     modified = (args.modified or batch_root / "修改版").resolve()
     work = (args.work_dir or default_work_dir(batch_root)).resolve()
+    require_validation_path(extracted, kind="material", same_run_as=batch_root)
+    require_validation_path(modified, kind="material", same_run_as=batch_root)
+    require_validation_path(work, kind="workspace")
+    for archive_path in args.input_archive:
+        require_validation_path(archive_path, kind="material", same_run_as=batch_root)
     work.mkdir(parents=True, exist_ok=True)
     hashes = HashCache(work / "hash_cache.json")
     timing = {}

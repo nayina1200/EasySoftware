@@ -1,0 +1,39 @@
+{
+  "enabled": true,
+  "mode": "shadow",
+  "enforce": false,
+  "not_evaluated_action": "hold_changes",
+  "skip_mismatch_requested": false,
+  "provider": "typesafe_jev",
+  "prompt_version": "title-body-jev-domain-fit-score-v3",
+  "policy_version": "title-body-jev-threshold-policy-v1",
+  "score_threshold": 70,
+  "threshold_calibrated": false,
+  "coverage_policy": {
+    "full_body_required": true,
+    "calibrated": false
+  },
+  "typesafe_jev": {
+    "model_id": "jev-1.13.0",
+    "request_timeout_seconds": 20,
+    "max_retries": 2,
+    "max_retry_after_seconds": 5,
+    "max_request_characters": 28000
+  },
+  "runtime": {
+    "expected_server_version": "9442",
+    "model_id": "QwenPaw-Flash-2B-Q4_K_M",
+    "model_filename": "QwenPaw-Flash-2B-Q4_K_M.gguf",
+    "context_size": 4096,
+    "output_reserve_tokens": 512,
+    "safety_margin_tokens": 128,
+    "request_timeout_seconds": 20,
+    "task_deadline_seconds": 45,
+    "startup_timeout_seconds": 120,
+    "startup_lock_timeout_seconds": 10,
+    "n_gpu_layers": 99
+  },
+  "reranker": {
+    "enabled": false
+  }
+}

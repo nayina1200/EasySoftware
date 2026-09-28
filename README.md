@@ -87,7 +87,16 @@ python scripts\unified_workflow.py "C:\材料\批次.rar" --apply-comment-cleanu
 
 第一次运行成功后返回 `NEEDS_IMAGE_REVIEW`；填写图片未通过项目序号后返回 `NEEDS_UNIFIED_REVIEW`。两次审核页都带有可继续执行的 `next` 命令。只有最终打包成功返回退出码 0；审核等待或错误状态返回退出码 2，调用方应以 JSON 的 `status` 字段判断。
 
+## 标题正文匹配
+
+- Jev 根据 TXT 文件名标题和严格配对 DOCX 的完整可见正文评分，最终内容判定为 `MATCH` 或 `MISMATCH`。输入或服务异常记为运行状态 `NOT_EVALUATED`，不会伪装成内容类别。
+- 默认 `mode=shadow`、`enforce=false`、评分线为 70。评分线尚未用独立留出集校准；需要显式配置后才会跳过 MISMATCH 材料。
+- 正式执行首轮资格检查后，会输出 MISMATCH 材料名称并尝试复制“其余材料正在处理，以下材料不匹配：”摘要到 Windows 剪贴板；预览不修改剪贴板。
+- TypeSafe key 从 `TYPESAFE_API_KEY` 环境变量读取。不要把密钥写入 JSON 或提交到仓库；本地设置见 `scripts/title_body_config.example.json`。
+
 ## 自检与测试
+
+页码审计测试用 ReportLab 生成合成 PDF。它只用于测试，不是应用运行依赖；先执行 `python -m pip install -r tests/requirements.txt`。
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\启动EasySoftware.ps1 -SelfTest

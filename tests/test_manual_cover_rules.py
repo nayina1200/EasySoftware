@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import base64
+import json
 import subprocess
 import sys
 import tempfile
@@ -11,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from lxml import etree
+from pypdf import PdfWriter
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +43,45 @@ def make_docx(path: Path, lines: list[str]) -> None:
         archive.writestr("word/document.xml", etree.tostring(document, xml_declaration=True, encoding="UTF-8"))
 
 
+def make_textframe_page_docx(path: Path, right_aligned: bool) -> None:
+    document = etree.Element(f"{{{MODULE.W}}}document", nsmap={"w": MODULE.W, "r": MODULE.R})
+    body = etree.SubElement(document, f"{{{MODULE.W}}}body")
+    section = etree.SubElement(body, f"{{{MODULE.W}}}sectPr")
+    header_ref = etree.SubElement(section, f"{{{MODULE.W}}}headerReference")
+    header_ref.set(f"{{{MODULE.W}}}type", "default")
+    header_ref.set(f"{{{MODULE.R}}}id", "rId1")
+
+    header = etree.Element(f"{{{MODULE.W}}}hdr", nsmap={"w": MODULE.W})
+    textbox_content = etree.SubElement(header, f"{{{MODULE.W}}}txbxContent")
+    paragraph = etree.SubElement(textbox_content, f"{{{MODULE.W}}}p")
+    if right_aligned:
+        properties = etree.SubElement(paragraph, f"{{{MODULE.W}}}pPr")
+        alignment = etree.SubElement(properties, f"{{{MODULE.W}}}jc")
+        alignment.set(f"{{{MODULE.W}}}val", "right")
+    run = etree.SubElement(paragraph, f"{{{MODULE.W}}}r")
+    instruction = etree.SubElement(run, f"{{{MODULE.W}}}instrText")
+    instruction.text = " PAGE "
+
+    relationships = etree.Element(
+        "{http://schemas.openxmlformats.org/package/2006/relationships}Relationships",
+        nsmap={None: "http://schemas.openxmlformats.org/package/2006/relationships"},
+    )
+    relationship = etree.SubElement(
+        relationships, "{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"
+    )
+    relationship.set("Id", "rId1")
+    relationship.set("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header")
+    relationship.set("Target", "header1.xml")
+
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("word/document.xml", etree.tostring(document, xml_declaration=True, encoding="UTF-8"))
+        archive.writestr("word/header1.xml", etree.tostring(header, xml_declaration=True, encoding="UTF-8"))
+        archive.writestr(
+            "word/_rels/document.xml.rels",
+            etree.tostring(relationships, xml_declaration=True, encoding="UTF-8"),
+        )
+
+
 class ManualCoverAuditTests(unittest.TestCase):
     def inspect(self, lines: list[str], title: str = "示例软件") -> dict:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -52,6 +94,23 @@ class ManualCoverAuditTests(unittest.TestCase):
 
         self.assertTrue(audit["cover_found"])
         self.assertEqual(audit["cover_label"], "使用说明书")
+
+    def test_active_textframe_page_alignment_is_not_an_acceptance_requirement(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            misaligned = root / "misaligned.docx"
+            aligned = root / "aligned.docx"
+            make_textframe_page_docx(misaligned, right_aligned=False)
+            make_textframe_page_docx(aligned, right_aligned=True)
+
+            misaligned_audit = MODULE.inspect_docx_header_only(misaligned, "示例软件")
+            aligned_audit = MODULE.inspect_docx_header_only(aligned, "示例软件")
+
+        self.assertEqual(misaligned_audit["header_page_field_counts"], [1])
+        self.assertNotIn("textframe_page_paragraphs_right_aligned", misaligned_audit)
+        self.assertNotIn("textframe_page_paragraph_count", misaligned_audit)
+        self.assertNotIn("textframe_page_paragraphs_right_aligned", aligned_audit)
+        self.assertNotIn("textframe_page_paragraph_count", aligned_audit)
 
     def test_cover_scan_stops_at_first_visible_non_label(self):
         audit = self.inspect(["示例软件", "第一章 功能介绍", "使用说明书"])
@@ -66,6 +125,58 @@ class ManualCoverAuditTests(unittest.TestCase):
         self.assertFalse(MODULE.is_manual_label_candidate("用户操作"))
         self.assertFalse(audit["cover_found"])
         self.assertIn("用户操作", audit["body_text"])
+
+    def test_pdf_audit_scans_every_page_and_renders_header_only_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "manual.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=612, height=792)
+            writer.add_blank_page(width=612, height=792)
+            with path.open("wb") as stream:
+                writer.write(stream)
+            with mock.patch.object(MODULE, "_render_pdf_page", return_value={
+                "status": "rendered", "foreground_ratio": 0.002, "visually_blank": True,
+                "image": str(root / "page.png"),
+            }) as render:
+                audit = MODULE.inspect_pdf(path, "示例软件", assets_dir=root / "assets", expected_label="用户手册")
+
+        self.assertEqual(audit["pages"], 2)
+        self.assertEqual([row["page"] for row in audit["all_pages"]], [1, 2])
+        self.assertEqual(audit["confirmed_blank_pages"], [1, 2])
+        self.assertEqual(render.call_count, 2)
+        self.assertFalse(audit["first_has_title"])
+        self.assertFalse(audit["first_has_manual_label"])
+
+    def test_pdf_audit_finds_chinese_and_english_word_bookmark_errors_on_every_page(self):
+        class FakePage:
+            def __init__(self, text: str):
+                self.text = text
+
+            def extract_text(self):
+                return self.text
+
+            def get(self, key, default=None):
+                return default
+
+        class FakeReader:
+            pages = [
+                FakePage("示例软件\n使用说明书"),
+                FakePage("目录 3.1 系统登录 错误 ！ 未定义 书签 。"),
+                FakePage("Error ! Bookmark not   defined ."),
+            ]
+
+        with mock.patch.object(MODULE, "PdfReader", return_value=FakeReader()):
+            audit = MODULE.inspect_pdf(Path("mock.pdf"), "示例软件", expected_label="使用说明书")
+
+        self.assertEqual(
+            [(row["page"], row["type"]) for row in audit["bookmark_errors"]],
+            [(2, "未定义书签"), (3, "Bookmark not defined")],
+        )
+        self.assertIn("错误 ！ 未定义 书签", audit["bookmark_errors"][0]["snippet"])
+        self.assertIn("Error ! Bookmark not defined", audit["bookmark_errors"][1]["snippet"])
+        findings = MODULE._cover_pdf_findings(audit, word_pages=3, expected_label="使用说明书")
+        self.assertTrue(any("第 2 页" in item and "第 3 页" in item for item in findings))
 
 
 class _Callable:
@@ -100,6 +211,420 @@ class WordQueueTests(unittest.TestCase):
         reporter.update.assert_called_once_with("等待其他任务完成 Word 导出", 0, "说明书处理")
 
 
+class TransactionalCoverPipelineTests(unittest.TestCase):
+    def test_crash_recovery_restores_both_files_from_pending_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_root = Path(directory) / "source"
+            output_root = Path(directory) / "sample_已处理_20260925"
+            project = output_root / "project"
+            backup_dir = output_root / MODULE.COVER_BACKUP_DIRECTORY / "txn-1" / "project"
+            project.mkdir(parents=True)
+            backup_dir.mkdir(parents=True)
+            docx = project / "manual.docx"
+            pdf = project / "manual.pdf"
+            docx.write_bytes(b"new docx written before interruption")
+            pdf.write_bytes(b"original pdf")
+            (backup_dir / docx.name).write_bytes(b"original docx")
+            (backup_dir / pdf.name).write_bytes(b"original pdf")
+            journal = output_root / MODULE.COVER_TRANSACTION_FILENAME
+            MODULE.atomic_json(journal, {
+                "schema_version": 1,
+                "transaction_id": "txn-1",
+                "state": "PENDING",
+                "documents": [{
+                    "name": "软件", "folder": "project", "docx": "manual.docx", "pdf": "manual.pdf",
+                    "backup_dir": str(backup_dir), "had_pdf": True,
+                    "original_hashes": {
+                        "docx": MODULE._sha256_path(backup_dir / docx.name),
+                        "pdf": MODULE._sha256_path(backup_dir / pdf.name),
+                    },
+                    "state": "PENDING",
+                }],
+            })
+
+            recovered = MODULE.recover_pending_cover_transactions(source_root, output_prefix="sample_已处理_")
+
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(docx.read_bytes(), b"original docx")
+            self.assertEqual(pdf.read_bytes(), b"original pdf")
+            self.assertFalse(journal.exists())
+            self.assertFalse((output_root / MODULE.COVER_BACKUP_DIRECTORY).exists())
+            self.assertEqual(recovered[0]["actions"][0]["action"], "恢复修复前 DOCX/PDF 快照")
+
+    def test_successful_cover_pair_is_committed_and_transaction_files_are_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            docx = project / "manual.docx"
+            pdf = project / "manual.pdf"
+            docx.write_bytes(b"original docx")
+            pdf.write_bytes(b"original pdf")
+            plan_path = root / "plan.json"
+            report_path = root / "cover_result.json"
+            script_path = root / "pipeline.ps1"
+            script_path.write_text("", encoding="utf-8")
+            package = {
+                "name": "软件", "folder": "project", "docx": docx.name, "pdf": pdf.name,
+                "actions": ["ENSURE_COVER_FIRST_PAGE", "AUDIT_ALL_PAGES", "EXPORT_PDF"],
+            }
+            plan_path.write_text(json.dumps({"base": str(root), "packages": [package]}, ensure_ascii=False), encoding="utf-8")
+
+            class FakeProcess:
+                returncode = 0
+                pid = 12345
+
+                def __init__(self, command, **_kwargs):
+                    docx.write_bytes(b"committed docx")
+                    pdf.write_bytes(b"committed pdf")
+                    report_file = Path(command[command.index("-ReportPath") + 1])
+                    MODULE.atomic_json(report_file, {"packages": [{
+                        "name": "软件", "folder": "project", "status": "OK", "word_pages": 2,
+                        "cover_label": "用户手册", "failures": [], "attempts": [],
+                        "page_audit": [{"page": 1, "has_body_content": True}, {"page": 2, "has_body_content": True}],
+                    }]})
+
+                def communicate(self, timeout=None):
+                    return b"completed", None
+
+            clean_pdf_audit = {
+                "pages": 2, "first_has_title": True, "first_has_manual_label": True,
+                "first_label_matches_expected": True, "confirmed_blank_pages": [], "unresolved_blank_pages": [],
+                "blank_page_candidates": [],
+            }
+            with mock.patch.object(MODULE.subprocess, "Popen", side_effect=FakeProcess), \
+                    mock.patch.object(MODULE, "inspect_pdf", return_value=clean_pdf_audit), \
+                    mock.patch.object(MODULE.page_label_audit, "audit_docx_pdf_page_labels", return_value={"status": "complete", "pages": [], "issues": []}), \
+                    mock.patch.object(MODULE, "word_automation_lock", return_value=contextlib.nullcontext()), \
+                    mock.patch.object(MODULE, "list_word_pids", return_value=set()), \
+                    mock.patch.object(MODULE, "close_owned_word"):
+                report = MODULE.invoke_word_pipeline(root, plan_path, report_path, script_path, module="说明书处理")
+
+            self.assertEqual(report["packages"][0]["status"], "OK")
+            self.assertEqual(docx.read_bytes(), b"committed docx")
+            self.assertEqual(pdf.read_bytes(), b"committed pdf")
+            self.assertFalse((root / MODULE.COVER_TRANSACTION_FILENAME).exists())
+            self.assertFalse((root / MODULE.COVER_BACKUP_DIRECTORY).exists())
+
+    def test_bookmark_errors_still_fail_with_indeterminate_page_label_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            docx = project / "manual.docx"
+            pdf = project / "manual.pdf"
+            docx.write_bytes(b"original docx")
+            pdf.write_bytes(b"original pdf")
+            original_docx, original_pdf = docx.read_bytes(), pdf.read_bytes()
+            plan_path = root / "plan.json"
+            report_path = root / "cover_result.json"
+            script_path = root / "pipeline.ps1"
+            script_path.write_text("", encoding="utf-8")
+            plan_path.write_text(json.dumps({"base": str(root), "packages": [{
+                "name": "软件", "folder": "project", "docx": docx.name, "pdf": pdf.name,
+                "actions": ["ENSURE_COVER_FIRST_PAGE", "AUDIT_ALL_PAGES", "AUDIT_PAGE_LABELS", "EXPORT_PDF"],
+            }]}, ensure_ascii=False), encoding="utf-8")
+            launches = []
+
+            class FakeProcess:
+                returncode = 0
+                pid = 12345
+
+                def __init__(self, command, **_kwargs):
+                    launches.append(command)
+                    docx.write_bytes(b"modified docx")
+                    pdf.write_bytes(b"modified pdf")
+                    report_file = Path(command[command.index("-ReportPath") + 1])
+                    MODULE.atomic_json(report_file, {"packages": [{
+                        "name": "软件", "folder": "project", "status": "OK", "word_pages": 2,
+                        "cover_label": "用户手册", "failures": [], "attempts": [],
+                        "page_audit": [
+                            {"page": 1, "has_body_content": True},
+                            {"page": 2, "has_body_content": True},
+                        ],
+                    }]})
+
+                def communicate(self, timeout=None):
+                    return b"completed", None
+
+            bookmark_only_audit = {
+                "pages": 2, "first_has_title": True, "first_has_manual_label": True,
+                "first_label_matches_expected": True, "confirmed_blank_pages": [],
+                "unresolved_blank_pages": [], "blank_page_candidates": [],
+                "bookmark_errors": [
+                    {"page": 2, "type": "未定义书签", "snippet": "错误!未定义书签。"},
+                    {"page": 2, "type": "Bookmark not defined", "snippet": "Error! Bookmark not defined."},
+                ],
+            }
+            with mock.patch.object(MODULE.subprocess, "Popen", side_effect=FakeProcess), \
+                    mock.patch.object(MODULE, "inspect_pdf", return_value=bookmark_only_audit), \
+                    mock.patch.object(MODULE.page_label_audit, "audit_docx_pdf_page_labels", return_value={
+                        "status": "indeterminate", "pages": [], "issues": ["缺少 PDF 坐标证据"],
+                    }), \
+                    mock.patch.object(MODULE, "word_automation_lock", return_value=contextlib.nullcontext()), \
+                    mock.patch.object(MODULE, "list_word_pids", return_value=set()), \
+                    mock.patch.object(MODULE, "close_owned_word"):
+                report = MODULE.invoke_word_pipeline(root, plan_path, report_path, script_path, module="说明书处理")
+            restored_docx, restored_pdf = docx.read_bytes(), pdf.read_bytes()
+
+        result = report["packages"][0]
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(result["status"], "ROLLED_BACK")
+        self.assertTrue(result["snapshot_restored"])
+        self.assertFalse(result.get("retry_performed", False))
+        self.assertEqual(result["pdf_audit"]["confirmed_blank_pages"], [])
+        self.assertEqual(len(result["pdf_audit"]["bookmark_errors"]), 2)
+        self.assertEqual(result["pdf_audit"]["page_label_audit"]["status"], "indeterminate")
+        self.assertEqual(result["pdf_audit"]["page_label_audit"]["enforcement"], "informational_only")
+        self.assertTrue(any("Word 书签引用错误文本" in item for item in result["failures"]))
+        self.assertEqual(restored_docx, original_docx)
+        self.assertEqual(restored_pdf, original_pdf)
+
+    def test_failed_pdf_blank_page_retry_restores_original_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            docx = project / "manual.docx"
+            pdf = project / "manual.pdf"
+            docx.write_bytes(b"original docx")
+            pdf.write_bytes(b"original pdf")
+            original_docx, original_pdf = docx.read_bytes(), pdf.read_bytes()
+            plan_path = root / "plan.json"
+            report_path = root / "cover_result.json"
+            script_path = root / "pipeline.ps1"
+            script_path.write_text("", encoding="utf-8")
+            plan = {"base": str(root), "packages": [{
+                "name": "软件", "name_source": "unique_txt_filename", "docx_title": "旧名称",
+                "folder": "project", "docx": docx.name, "pdf": pdf.name,
+                "actions": ["ENSURE_COVER_FIRST_PAGE", "AUDIT_ALL_PAGES", "EXPORT_PDF"],
+            }]}
+            plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+            launches = []
+
+            class FakeProcess:
+                returncode = 0
+                pid = 12345
+
+                def __init__(self, command, **_kwargs):
+                    launches.append(command)
+                    docx.write_bytes(b"modified docx")
+                    pdf.write_bytes(b"modified pdf")
+                    report_file = Path(command[command.index("-ReportPath") + 1])
+                    package = json.loads(Path(command[command.index("-PlanPath") + 1]).read_text(encoding="utf-8"))["packages"][0]
+                    MODULE.atomic_json(report_file, {"packages": [{
+                        "name": package["name"], "folder": package["folder"], "status": "OK",
+                        "word_pages": 2, "cover_label": "用户手册", "failures": [], "attempts": [],
+                        "page_audit": [
+                            {"page": 1, "has_body_content": True},
+                            {"page": 2, "has_body_content": False},
+                        ],
+                    }]})
+
+                def communicate(self, timeout=None):
+                    return b"completed", None
+
+            blank_pdf_audit = {
+                "pages": 2, "first_has_title": True, "first_has_manual_label": True,
+                "first_label_matches_expected": True, "confirmed_blank_pages": [2],
+                "unresolved_blank_pages": [],
+                "blank_page_candidates": [{"page": 2, "confirmed_blank": True, "suspected_causes": ["Word 页映射为空"]}],
+                "bookmark_errors": [],
+            }
+            bookmark_error_pdf_audit = {
+                "pages": 2, "first_has_title": True, "first_has_manual_label": True,
+                "first_label_matches_expected": True, "confirmed_blank_pages": [],
+                "unresolved_blank_pages": [], "blank_page_candidates": [],
+                "bookmark_errors": [
+                    {"page": 2, "type": "未定义书签", "snippet": "错误!未定义书签。"},
+                    {"page": 2, "type": "Bookmark not defined", "snippet": "Error! Bookmark not defined."},
+                ],
+            }
+            with mock.patch.object(MODULE.subprocess, "Popen", side_effect=FakeProcess), \
+                    mock.patch.object(MODULE, "inspect_pdf", side_effect=[blank_pdf_audit, bookmark_error_pdf_audit]), \
+                    mock.patch.object(MODULE.page_label_audit, "audit_docx_pdf_page_labels", return_value={"status": "complete", "pages": [], "issues": []}), \
+                    mock.patch.object(MODULE, "word_automation_lock", return_value=contextlib.nullcontext()), \
+                    mock.patch.object(MODULE, "list_word_pids", return_value=set()), \
+                    mock.patch.object(MODULE, "close_owned_word"):
+                report = MODULE.invoke_word_pipeline(root, plan_path, report_path, script_path, module="说明书处理")
+            restored_docx = docx.read_bytes()
+            restored_pdf = pdf.read_bytes()
+
+        self.assertEqual(len(launches), 2)
+        result = report["packages"][0]
+        self.assertEqual(result["status"], "ROLLED_BACK")
+        self.assertTrue(result["snapshot_restored"])
+        self.assertTrue(result["retry_performed"])
+        self.assertEqual(max(item["attempt"] for item in result["attempts"]), 2)
+        self.assertEqual(len(result["pdf_audit"]["bookmark_errors"]), 2)
+        self.assertTrue(any("Word 书签引用错误文本" in item for item in result["failures"]))
+        self.assertEqual(restored_docx, original_docx)
+        self.assertEqual(restored_pdf, original_pdf)
+
+    def test_confirmed_page_label_truncation_is_reported_without_repair_or_rollback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            docx, pdf = project / "manual.docx", project / "manual.pdf"
+            docx.write_bytes(b"original docx")
+            pdf.write_bytes(b"original pdf")
+            plan_path, report_path, script_path = root / "plan.json", root / "result.json", root / "pipeline.ps1"
+            script_path.write_text("", encoding="utf-8")
+            locator = {
+                "id": "word/header1.xml#p0", "story_type": "header", "section_indices": [1],
+                "paragraph_index": 0, "prefix": "第", "suffix": "页", "ambiguous": False,
+            }
+            package = {
+                "name": "软件", "folder": "project", "docx": docx.name, "pdf": pdf.name,
+                "actions": ["AUDIT_ALL_PAGES", "AUDIT_PAGE_LABELS", "EXPORT_PDF"],
+            }
+            plan_path.write_text(json.dumps({"base": str(root), "packages": [package]}, ensure_ascii=False), encoding="utf-8")
+            launched_plans = []
+
+            class FakeProcess:
+                returncode = 0
+                pid = 12345
+
+                def __init__(self, command, **_kwargs):
+                    item_plan = json.loads(Path(command[command.index("-PlanPath") + 1]).read_text(encoding="utf-8"))
+                    launched_plans.append(item_plan["packages"][0])
+                    docx.write_bytes(b"modified docx")
+                    pdf.write_bytes(b"modified pdf")
+                    result_file = Path(command[command.index("-ReportPath") + 1])
+                    MODULE.atomic_json(result_file, {"packages": [{
+                        "name": "软件", "folder": "project", "status": "OK", "word_pages": 2,
+                        "failures": [], "attempts": [], "page_audit": [],
+                    }]})
+
+                def communicate(self, timeout=None):
+                    return b"completed", None
+
+            clean_pdf_audit = {
+                "pages": 2, "first_has_title": True, "first_has_manual_label": True,
+                "first_label_matches_expected": True, "confirmed_blank_pages": [], "unresolved_blank_pages": [],
+                "blank_page_candidates": [],
+            }
+            truncated = {
+                "status": "truncated", "issues": [],
+                "template_audit": {"templates": [locator]},
+                "pages": [{"page_number": 1, "status": "truncated", "matched_template_id": locator["id"]}],
+            }
+            with mock.patch.object(MODULE.subprocess, "Popen", side_effect=FakeProcess), \
+                    mock.patch.object(MODULE, "inspect_pdf", return_value=clean_pdf_audit), \
+                    mock.patch.object(MODULE.page_label_audit, "audit_docx_pdf_page_labels", return_value=truncated), \
+                    mock.patch.object(MODULE, "word_automation_lock", return_value=contextlib.nullcontext()), \
+                    mock.patch.object(MODULE, "list_word_pids", return_value=set()), \
+                    mock.patch.object(MODULE, "close_owned_word"):
+                report = MODULE.invoke_word_pipeline(root, plan_path, report_path, script_path, module="说明书处理")
+
+        self.assertEqual(len(launched_plans), 1)
+        self.assertEqual(report["packages"][0]["status"], "OK")
+        self.assertFalse(report["packages"][0]["snapshot_restored"])
+        self.assertEqual(report["packages"][0]["pdf_audit"]["page_label_audit"]["status"], "truncated")
+        self.assertEqual(report["packages"][0]["pdf_audit"]["page_label_audit"]["enforcement"], "informational_only")
+
+    def test_indeterminate_page_label_audit_is_reported_without_rollback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            docx, pdf = project / "manual.docx", project / "manual.pdf"
+            docx.write_bytes(b"original docx")
+            pdf.write_bytes(b"original pdf")
+            plan_path, report_path, script_path = root / "plan.json", root / "result.json", root / "pipeline.ps1"
+            script_path.write_text("", encoding="utf-8")
+            plan_path.write_text(json.dumps({"base": str(root), "packages": [{
+                "name": "软件", "folder": "project", "docx": docx.name, "pdf": pdf.name,
+                "actions": ["AUDIT_ALL_PAGES", "AUDIT_PAGE_LABELS", "EXPORT_PDF"],
+            }]}, ensure_ascii=False), encoding="utf-8")
+
+            class FakeProcess:
+                returncode = 0
+                pid = 12345
+
+                def __init__(self, command, **_kwargs):
+                    docx.write_bytes(b"modified docx")
+                    pdf.write_bytes(b"modified pdf")
+                    report_file = Path(command[command.index("-ReportPath") + 1])
+                    MODULE.atomic_json(report_file, {"packages": [{
+                        "name": "软件", "folder": "project", "status": "OK", "word_pages": 1,
+                        "failures": [], "attempts": [],
+                    }]})
+
+                def communicate(self, timeout=None):
+                    return b"completed", None
+
+            uncertain = {"status": "indeterminate", "pages": [], "issues": ["缺少 PDF 坐标证据"]}
+            clean_pdf_audit = {
+                "pages": 1, "first_has_title": True, "first_has_manual_label": True,
+                "first_label_matches_expected": True, "confirmed_blank_pages": [],
+                "unresolved_blank_pages": [], "blank_page_candidates": [], "bookmark_errors": [],
+            }
+            with mock.patch.object(MODULE.subprocess, "Popen", side_effect=FakeProcess), \
+                    mock.patch.object(MODULE, "inspect_pdf", return_value=clean_pdf_audit), \
+                    mock.patch.object(MODULE.page_label_audit, "audit_docx_pdf_page_labels", return_value=uncertain), \
+                    mock.patch.object(MODULE, "word_automation_lock", return_value=contextlib.nullcontext()), \
+                    mock.patch.object(MODULE, "list_word_pids", return_value=set()), \
+                    mock.patch.object(MODULE, "close_owned_word"):
+                report = MODULE.invoke_word_pipeline(root, plan_path, report_path, script_path, module="说明书处理")
+            final_docx, final_pdf = docx.read_bytes(), pdf.read_bytes()
+
+        self.assertEqual(report["packages"][0]["status"], "OK")
+        self.assertFalse(report["packages"][0]["snapshot_restored"])
+        self.assertIn("缺少 PDF 坐标证据", json.dumps(report, ensure_ascii=False))
+        self.assertEqual(report["packages"][0]["pdf_audit"]["page_label_audit"]["enforcement"], "informational_only")
+        self.assertEqual(final_docx, b"modified docx")
+        self.assertEqual(final_pdf, b"modified pdf")
+
+    def test_page_label_audit_error_is_reported_without_rollback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            docx, pdf = project / "manual.docx", project / "manual.pdf"
+            docx.write_bytes(b"original docx")
+            pdf.write_bytes(b"original pdf")
+            plan_path, report_path, script_path = root / "plan.json", root / "result.json", root / "pipeline.ps1"
+            script_path.write_text("", encoding="utf-8")
+            plan_path.write_text(json.dumps({"base": str(root), "packages": [{
+                "name": "软件", "folder": "project", "docx": docx.name, "pdf": pdf.name,
+                "actions": ["AUDIT_PAGE_LABELS", "EXPORT_PDF"],
+            }]}, ensure_ascii=False), encoding="utf-8")
+
+            class FakeProcess:
+                returncode = 0
+                pid = 12345
+
+                def __init__(self, command, **_kwargs):
+                    docx.write_bytes(b"modified docx")
+                    pdf.write_bytes(b"modified pdf")
+                    report_file = Path(command[command.index("-ReportPath") + 1])
+                    MODULE.atomic_json(report_file, {"packages": [{
+                        "name": "软件", "folder": "project", "status": "OK", "word_pages": 1,
+                        "failures": [], "attempts": [],
+                    }]})
+
+                def communicate(self, timeout=None):
+                    return b"completed", None
+
+            with mock.patch.object(MODULE.subprocess, "Popen", side_effect=FakeProcess), \
+                    mock.patch.object(MODULE.page_label_audit, "audit_docx_pdf_page_labels", side_effect=RuntimeError("读取页码坐标失败")), \
+                    mock.patch.object(MODULE, "word_automation_lock", return_value=contextlib.nullcontext()), \
+                    mock.patch.object(MODULE, "list_word_pids", return_value=set()), \
+                    mock.patch.object(MODULE, "close_owned_word"):
+                report = MODULE.invoke_word_pipeline(root, plan_path, report_path, script_path, module="说明书处理")
+            final_docx, final_pdf = docx.read_bytes(), pdf.read_bytes()
+        result = report["packages"][0]
+        self.assertEqual(result["status"], "OK")
+        self.assertFalse(result["snapshot_restored"])
+        self.assertEqual(result["pdf_audit"]["page_label_audit"]["status"], "error")
+        self.assertEqual(result["pdf_audit"]["page_label_audit"]["enforcement"], "informational_only")
+        self.assertIn("读取页码坐标失败", json.dumps(result, ensure_ascii=False))
+        self.assertEqual(final_docx, b"modified docx")
+        self.assertEqual(final_pdf, b"modified pdf")
+
+
 class PowerShellCoverSafetyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -111,8 +636,9 @@ class PowerShellCoverSafetyTests(unittest.TestCase):
         branch = self.script[start:end]
 
         self.assertIn("$otherText.Count -gt 0 -or $hasObjects", branch)
-        self.assertIn("{ break }", branch)
-        self.assertLess(branch.index("{ break }"), branch.index(".Delete()"))
+        self.assertIn("$minimumPage = [Math]::Max($minimumPage, $residualLabel.Page + 1)", branch)
+        self.assertIn("continue", branch)
+        self.assertLess(branch.index("continue"), branch.index(".Delete()"))
 
     def test_cover_boundary_includes_images_and_tables(self):
         start = self.script.index("function Ensure-CoverPageBoundary")
@@ -134,10 +660,19 @@ class PowerShellCoverSafetyTests(unittest.TestCase):
 
     def test_two_line_title_is_allowed_but_short_last_line_is_flagged(self):
         self.assertIn("if ($lines -le 2 -and -not $orphanedLastLine)", self.script)
-        self.assertIn('if ($coverAudit.Lines -gt 2)', self.script)
-        self.assertIn('if ($coverAudit.OrphanedLastLine)', self.script)
+        self.assertIn('if ($doCover -and $coverAudit.Lines -gt 2)', self.script)
+        self.assertIn('if ($doCover -and $coverAudit.OrphanedLastLine)', self.script)
 
-    def test_title_only_cover_is_accepted_without_inventing_subtitle(self):
+    def test_confirmed_title_only_cover_gets_missing_label_without_second_cover(self):
+        start = self.script.index("function Ensure-FirstPageCover")
+        end = self.script.index("function Get-WordPageAudit", start)
+        function = self.script[start:end]
+        self.assertIn('Result = "LABEL_ADDED"', function)
+        self.assertIn('InsertBefore("使用说明书`r")', function)
+        self.assertIn("Add-Cover $Document $Title", function)
+        self.assertIn("EXISTING_COVER", function)
+
+    def test_cover_style_can_format_existing_label_text(self):
         start = self.script.index("function Set-CoverTypography")
         end = self.script.index("function Remove-CoverVersion", start)
         function = self.script[start:end]
@@ -188,12 +723,13 @@ class PowerShellCoverSafetyTests(unittest.TestCase):
             ("如上图所示可以看到切割过程中，参数在发生变化。", "弘元绿能金刚线蓝宝石切片机控制系统软件", False),
             ("建筑项目数据综合分析平台是一款面向现代化大型建筑工程的数字化能效管理平台", "建筑项目数据综合分析平台", False),
         ]
-        commands = [*definitions]
+        rule_path = ROOT / "scripts" / "cover_rules.ps1"
+        commands = [f". '{str(rule_path)}'", *definitions]
         for text, title, expected in cases:
             commands.append(f"if ((Test-PostCoverFragment '{text}' '{title}') -ne ${str(expected).lower()}) {{ throw 'fragment rule mismatch' }}")
         encoded = base64.b64encode("\n".join(commands).encode("utf-16le")).decode("ascii")
         result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-EncodedCommand", encoded],
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -203,6 +739,7 @@ class PowerShellCoverSafetyTests(unittest.TestCase):
         end = self.script.index("function Test-DuplicateCoverBlock", start)
         function = self.script[start:end]
         self.assertIn("Test-PostCoverFragment", function)
+        self.assertIn("Get-FrontParagraphs $Document 5", function)
         self.assertIn("$leadingFragment.Page -eq 2", function)
         self.assertIn("$Document.Range($leadingFragment.Start, $leadingFragment.End).Delete()", function)
         self.assertIn("$wdWithInTable", function)

@@ -23,6 +23,7 @@ from pathlib import Path
 from lxml import etree
 
 import archive_types
+import local_comment_translation
 
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -418,6 +419,123 @@ def clean_docx(path: Path) -> dict:
     return {"docx": str(path), "status": "CLEANED", "deletions": changed, "findings": [asdict(item) for item in findings]}
 
 
+def _comment_parts(comment: str, kind: str) -> tuple[str, str, str]:
+    if kind == "html":
+        return "<!--", comment[4:-3], "-->"
+    if kind == "block":
+        return "/*", comment[2:-2], "*/"
+    marker = "#" if comment.startswith("#") else "--" if comment.startswith("--") else "//"
+    return marker, comment[len(marker):], ""
+
+
+def _partition_translation(value: str, weights: list[int]) -> list[str]:
+    """Split a translated multi-paragraph comment at word boundaries."""
+    if len(weights) <= 1:
+        return [value]
+    total = max(1, sum(weights))
+    parts: list[str] = []
+    remaining = value
+    remaining_weight = total
+    for weight in weights[:-1]:
+        target = round(len(remaining) * weight / remaining_weight)
+        if target <= 0 or not remaining:
+            parts.append("")
+            remaining_weight -= weight
+            continue
+        lower = max(1, target - 24)
+        upper = min(len(remaining) - 1, target + 24)
+        candidates = [i for i, char in enumerate(remaining) if char.isspace() and lower <= i < upper]
+        cut = min(candidates, key=lambda i: abs(i - target)) if candidates else min(target, len(remaining) - 1)
+        parts.append(remaining[:cut])
+        remaining = remaining[cut:]
+        remaining_weight -= weight
+    parts.append(remaining)
+    return parts
+
+
+def translate_docx(path: Path, app_root: Path, target_lengths: list[int] | None = None) -> dict:
+    """Translate Han comments in-place while retaining Word paragraphs and runs."""
+    with zipfile.ZipFile(path) as archive:
+        xml = archive.read("word/document.xml")
+        parser = etree.XMLParser(remove_blank_text=False, resolve_entities=False)
+        root = etree.fromstring(xml, parser)
+        paragraphs = _paragraphs(root)
+        texts = [_paragraph_text(paragraph) for paragraph in paragraphs]
+        joined = "\n".join(texts)
+        ranges, uncertain = find_comment_ranges(joined)
+        offsets: list[int] = []
+        cursor = 0
+        for value in texts:
+            offsets.append(cursor)
+            cursor += len(value) + 1
+        replacements: dict[int, list[tuple[int, int, str]]] = {}
+        findings: list[Finding] = []
+        translated_lengths: list[int] = []
+        translated_parts: list[dict[str, Any]] = []
+        for start, end, kind in ranges:
+            first = next((i for i, offset in enumerate(offsets) if offset <= start < offset + len(texts[i])), None)
+            last = next((i for i, offset in enumerate(offsets) if offset < end <= offset + len(texts[i])), None)
+            if first is None or last is None:
+                raise RuntimeError("注释边界不完整；源文件保持不变")
+            original = joined[start:end]
+            marker, payload, suffix = _comment_parts(original, kind)
+            leading_len = len(payload) - len(payload.lstrip())
+            trailing_len = len(payload) - len(payload.rstrip())
+            leading = payload[:leading_len]
+            trailing = payload[len(payload) - trailing_len:] if trailing_len else ""
+            body = payload[leading_len:len(payload) - trailing_len if trailing_len else len(payload)]
+            target_chars = target_lengths[len(translated_lengths)] if target_lengths and len(translated_lengths) < len(target_lengths) else None
+            translated = local_comment_translation.translate_comment(body, app_root=app_root, target_chars=target_chars)
+            translated_lengths.append(len(translated))
+            result = marker + leading + translated + trailing + suffix
+            weights: list[int] = []
+            positions: list[tuple[int, int, int]] = []
+            for index in range(first, last + 1):
+                local_start = max(0, start - offsets[index])
+                local_end = min(len(texts[index]), end - offsets[index])
+                if local_end < local_start:
+                    local_end = local_start
+                weight = max(1, local_end - local_start)
+                weights.append(weight)
+                positions.append((index, local_start, local_end))
+            chunks = _partition_translation(result, weights)
+            for (index, local_start, local_end), chunk in zip(positions, chunks):
+                replacements.setdefault(index, []).append((local_start, local_end, chunk))
+            findings.append(Finding(first + 1, "translated", original, result, "离线中文注释翻译"))
+            translated_parts.append({"paragraphs": [item[0] + 1 for item in positions], "parts": chunks, "text": result})
+        for index, entries in replacements.items():
+            changed_text = texts[index]
+            for start, end, result in sorted(entries, reverse=True):
+                original = changed_text[start:end]
+                changed_text = changed_text[:start] + result + changed_text[end:]
+                findings.append(Finding(index + 1, "translated", original, result, "离线中文注释翻译"))
+            _set_paragraph_text(paragraphs[index], changed_text)
+        output_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        members = [(item, output_xml if item.filename == "word/document.xml" else archive.read(item.filename)) for item in archive.infolist()]
+    changed = len(ranges)
+    if changed:
+        fd, temp_name = tempfile.mkstemp(prefix=path.stem + "-translated-", suffix=".docx", dir=path.parent)
+        os.close(fd)
+        temp = Path(temp_name)
+        try:
+            with zipfile.ZipFile(temp, "w") as output:
+                for item, content in members:
+                    output.writestr(item, content)
+            with zipfile.ZipFile(temp) as check:
+                check.testzip()
+                etree.fromstring(check.read("word/document.xml"))
+            os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
+    return {
+        "docx": str(path), "status": "CLEANED", "deletions": changed,
+        "translated_comments": changed, "translated_lengths": translated_lengths,
+        "translated_parts": translated_parts,
+        "findings": [asdict(item) for item in sorted(findings, key=lambda item: item.paragraph)],
+        "uncertain": [asdict(item) for item in uncertain],
+    }
+
+
 def _find_7z(app_root: Path) -> Path:
     candidates = [
         app_root / "tools/7z/7z.exe",
@@ -535,10 +653,14 @@ def _write_report(path: Path, report: dict) -> None:
                 f"{html.escape(item.get('original', ''))} → {html.escape(item.get('result', ''))} "
                 f"{html.escape(item.get('reason', ''))}</li>" for item in document.get("findings", [])
             )
-            rows.append(f"<article><h3>{html.escape(document_name)}</h3><p>状态：{html.escape(document.get('status', ''))}；删除 {document.get('deletions', 0)} 处</p><ul>{findings}</ul></article>")
+            count_label = "翻译" if document.get("translated_comments") is not None else "待处理"
+            page_note = ""
+            if document.get("target_pages"):
+                page_note = f"；页数目标/实际 {document.get('target_pages')}/{document.get('actual_pages', '未读取')}"
+            rows.append(f"<article><h3>{html.escape(document_name)}</h3><p>状态：{html.escape(document.get('status', ''))}；{count_label} {document.get('translated_comments', document.get('deletions', 0))} 处{html.escape(page_note)}</p><ul>{findings}</ul></article>")
     state = "执行结果" if report.get("applied") else "执行前预览"
-    document = f"""<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><title>代码注释清理{state}</title>
-<style>body{{font:15px/1.6 'Microsoft YaHei',sans-serif;max-width:1200px;margin:30px auto;color:#17202a}}article{{border:1px solid #d9e2ec;padding:14px;margin:12px 0}}h1{{color:#165dff}}li{{white-space:pre-wrap;margin:6px 0}}.note{{background:#fff7e6;padding:12px}}</style></head><body><h1>代码中文注释清理—{state}</h1><p class=\"note\">只处理名称以“代码.docx”结尾的文件；TXT 和说明文件未修改。不确定项保留并列在下方。</p>{''.join(rows)}</body></html>"""
+    document = f"""<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><title>代码注释英文翻译{state}</title>
+<style>body{{font:15px/1.6 'Microsoft YaHei',sans-serif;max-width:1200px;margin:30px auto;color:#17202a}}article{{border:1px solid #d9e2ec;padding:14px;margin:12px 0}}h1{{color:#165dff}}li{{white-space:pre-wrap;margin:6px 0}}.note{{background:#fff7e6;padding:12px}}</style></head><body><h1>代码注释英文翻译与页数保持—{state}</h1><p class=\"note\">只处理名称以“代码.docx”结尾的文件；仅替换中文注释文本，保留现有 Word 段落和格式属性。不确定项保留并列在下方。</p>{''.join(rows)}</body></html>"""
     path.with_suffix(".html").write_text(document, encoding="utf-8")
 
 
@@ -580,7 +702,139 @@ def _kill_owned_processes(process: subprocess.Popen, pid_path: Path) -> None:
     subprocess.run(["taskkill", "/PID", str(word_pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
 
-def _export_pdf(docx: Path, app_root: Path, work: Path) -> tuple[bool, str]:
+def pdf_page_count(pdf: Path | None) -> int | None:
+    if not pdf or not pdf.is_file():
+        return None
+    try:
+        from pypdf import PdfReader
+        return len(PdfReader(str(pdf)).pages)
+    except Exception:
+        return None
+
+
+def word_page_count(docx: Path, app_root: Path, work: Path) -> int:
+    """Ask Microsoft Word to repaginate a read-only DOCX without exporting PDF."""
+    script = app_root / "scripts" / "export_modified_pdf_item.ps1"
+    result_path = work / (hashlib.sha1((str(docx) + "|count").encode("utf-8")).hexdigest() + ".json")
+    pid_path = result_path.with_suffix(".pid")
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+        "-DocxPath", str(docx), "-ResultPath", str(result_path), "-PidPath", str(pid_path), "-CountOnly",
+    ]
+    with _word_lock():
+        process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, check=False)
+    if process.returncode != 0 or not result_path.is_file():
+        detail = process.stdout.decode("utf-8", errors="replace")[-800:]
+        raise RuntimeError(f"Word 页数读取失败：{detail}")
+    result = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    if result.get("status") != "OK" or int(result.get("pages", 0)) <= 0:
+        raise RuntimeError("Word 未返回有效页数")
+    return int(result["pages"])
+
+
+def remove_translated_comment_docx(path: Path, comment: dict[str, Any]) -> bool:
+    """Remove one newly translated comment while preserving the other DOCX text and formatting."""
+    with zipfile.ZipFile(path) as archive:
+        parser = etree.XMLParser(remove_blank_text=False, resolve_entities=False)
+        root = etree.fromstring(archive.read("word/document.xml"), parser)
+        paragraphs = _paragraphs(root)
+        positions = list(zip(comment.get("paragraphs", []), comment.get("parts", [])))
+        if not positions:
+            return False
+        for paragraph_number, part in sorted(positions, reverse=True):
+            index = int(paragraph_number) - 1
+            if not part or index < 0 or index >= len(paragraphs):
+                continue
+            paragraph = paragraphs[index]
+            current_text = _paragraph_text(paragraph)
+            local_start = current_text.rfind(part)
+            if local_start < 0:
+                return False
+            changed_text = current_text[:local_start] + current_text[local_start + len(part):]
+            if not changed_text.strip() and not _must_retain_paragraph(paragraph):
+                parent = paragraph.getparent()
+                if parent is not None:
+                    parent.remove(paragraph)
+            else:
+                _set_paragraph_text(paragraph, changed_text)
+        output_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        members = [(item, output_xml if item.filename == "word/document.xml" else archive.read(item.filename)) for item in archive.infolist()]
+    fd, temp_name = tempfile.mkstemp(prefix=path.stem + "-shorter-", suffix=".docx", dir=path.parent)
+    os.close(fd)
+    temp = Path(temp_name)
+    try:
+        with zipfile.ZipFile(temp, "w") as output:
+            for item, content in members:
+                output.writestr(item, content)
+        with zipfile.ZipFile(temp) as check:
+            check.testzip()
+            etree.fromstring(check.read("word/document.xml"))
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+    return True
+
+
+def translate_and_fit_docx(path: Path, app_root: Path, work: Path, target_pages: int | None = None) -> dict:
+    """Translate once; if over target, remove translated comments until Word reaches the limit."""
+    if target_pages is None:
+        target_pages = word_page_count(path, app_root, work)
+    row = translate_docx(path, app_root)
+    pages = word_page_count(path, app_root, work)
+    row["target_pages"] = target_pages
+    row["actual_pages"] = pages
+    row["page_match"] = pages == target_pages
+    row["page_attempts"] = 1
+    row["removed_translated_comments"] = 0
+    if pages <= target_pages or not row.get("translated_comments"):
+        return row
+
+    best_docx = path.read_bytes()
+    best_pages = pages
+    best_removed = 0
+    comments = list(reversed(row.get("translated_parts", [])))
+    max_removals = min(len(comments), max(32, (pages - target_pages) * 32))
+    removed = 0
+    index = 0
+    while index < max_removals:
+        batch = comments[index:min(index + 4, max_removals)]
+        before_docx, before_pages = path.read_bytes(), pages
+        removed_in_batch = 0
+        for comment in batch:
+            if remove_translated_comment_docx(path, comment):
+                removed += 1
+                removed_in_batch += 1
+        index += len(batch)
+        if not removed_in_batch:
+            continue
+        pages = word_page_count(path, app_root, work)
+        row["page_attempts"] += 1
+        if abs(pages - target_pages) < abs(best_pages - target_pages):
+            best_pages, best_docx, best_removed = pages, path.read_bytes(), removed
+        if pages <= target_pages:
+            if pages < target_pages:
+                path.write_bytes(before_docx)
+                pages = before_pages
+                removed -= removed_in_batch
+                for comment in batch:
+                    if not remove_translated_comment_docx(path, comment):
+                        continue
+                    removed += 1
+                    pages = word_page_count(path, app_root, work)
+                    row["page_attempts"] += 1
+                    if pages <= target_pages:
+                        break
+            best_pages, best_docx, best_removed = pages, path.read_bytes(), removed
+            break
+    path.write_bytes(best_docx)
+    row["actual_pages"] = best_pages
+    row["page_match"] = best_pages == target_pages
+    row["removed_translated_comments"] = best_removed
+    return row
+
+
+def _export_pdf(docx: Path, app_root: Path, work: Path, expected_pages: int | None = None) -> tuple[bool, str]:
     pdf = docx.with_suffix(".pdf")
     temp_pdf = work / "pdf" / (hashlib.sha1(str(docx).encode("utf-8")).hexdigest() + ".pdf")
     result_path = temp_pdf.with_suffix(".json")
@@ -612,12 +866,17 @@ def _export_pdf(docx: Path, app_root: Path, work: Path) -> tuple[bool, str]:
         method = "LibreOffice"
     try:
         from pypdf import PdfReader
-        if temp_pdf.stat().st_size <= 0 or len(PdfReader(str(temp_pdf)).pages) <= 0:
+        actual_pages = len(PdfReader(str(temp_pdf)).pages)
+        if temp_pdf.stat().st_size <= 0 or actual_pages <= 0:
             raise ValueError("无有效页")
+        if expected_pages is not None and abs(actual_pages - expected_pages) > 1:
+            return False, f"页数偏差超过 1 页：原 PDF {expected_pages} 页，翻译后 {actual_pages} 页；已保留原 PDF"
         target_temp = pdf.with_name(pdf.name + ".easysoftware.tmp")
         shutil.copy2(temp_pdf, target_temp)
         os.replace(target_temp, pdf)
-        return True, method
+        if expected_pages is not None and actual_pages != expected_pages:
+            return True, f"{method}；目标 {expected_pages} 页，实际 {actual_pages} 页（偏差 1 页）"
+        return True, f"{method}；共 {actual_pages} 页"
     except Exception as exc:
         return False, f"新 PDF 验证失败：{exc}；已保留原 PDF"
 
@@ -626,7 +885,13 @@ def run(
     source: Path, work: Path, app_root: Path, apply: bool = False,
     skip_preview: bool = False, progress=None,
 ) -> dict:
-    archives = discover_archives(source.resolve())
+    from validation_isolation import require_validation_path
+
+    source = require_validation_path(source, kind="material")
+    work = require_validation_path(work, kind="workspace")
+    archives = discover_archives(source)
+    for archive in archives:
+        require_validation_path(archive, kind="material", same_run_as=source)
     if not archives:
         raise ValueError("所选路径内没有压缩包，也没有可直接处理的代码材料（名称以“代码.docx”或“代码.pdf”结尾的文件）")
     report = {"version": RULE_VERSION, "created_at": datetime.now().astimezone().isoformat(), "source": str(source.resolve()), "applied": apply, "archives": []}
@@ -671,12 +936,13 @@ def run(
                 while output.exists():
                     output = archive.parent / f"{output_base}_已处理_{stamp}_{suffix}"
                     suffix += 1
+                require_validation_path(output, kind="material", same_run_as=archive)
                 shutil.copytree(root, output)
                 applied_documents = []
                 for discovered in _document_rows(output, inspect=False):
                     project_name = Path(discovered.get("docx") or discovered.get("pdf") or "未识别项目").stem
                     if progress:
-                        progress.update("清理代码注释", completed, project_name, active=True, failures=failures, archive=archive.name)
+                        progress.update("离线翻译代码注释并匹配页数", completed, project_name, active=True, failures=failures, archive=archive.name)
                     if discovered["status"] != "READY":
                         applied_documents.append(discovered)
                         failures += 1
@@ -686,11 +952,13 @@ def run(
                         continue
                     docx = Path(discovered["docx"])
                     try:
-                        row = clean_docx(docx)
+                        original_pdf = Path(discovered["pdf"]) if discovered.get("pdf") else None
+                        target_pages = pdf_page_count(original_pdf)
+                        row = translate_and_fit_docx(docx, app_root, work, target_pages)
                         if row["deletions"]:
                             if progress:
                                 progress.update("导出代码PDF", completed, project_name, active=True, failures=failures, archive=archive.name)
-                            success, detail = _export_pdf(docx, app_root, work)
+                            success, detail = _export_pdf(docx, app_root, work, row.get("target_pages"))
                             row["pdf_status"] = "REPLACED" if success else "PRESERVED"
                             row["pdf_detail"] = detail
                             if not success:
@@ -698,7 +966,7 @@ def run(
                                 failures += 1
                         else:
                             row["pdf_status"] = "UNCHANGED"
-                            row["pdf_detail"] = "未删除注释，无需重新导出"
+                            row["pdf_detail"] = "未发现待翻译的中文注释，无需重新导出"
                     except Exception as exc:
                         row = {"docx": str(docx), "status": "FAILED", "deletions": 0, "error": str(exc), "findings": []}
                         failures += 1
@@ -741,7 +1009,7 @@ def run(
     failures = max(failures, report_failures)
     final_status = ("CODE_COMMENT_CLEANUP_PARTIAL" if failures else "CODE_COMMENT_CLEANUP_OK") if apply else "NEEDS_CODE_COMMENT_REVIEW"
     if progress:
-        progress.update("代码注释清理完成" if apply else "代码注释预览完成", total, status="DONE" if not failures else "FAILED", active=False, failures=failures)
+        progress.update("代码注释翻译完成" if apply else "代码注释预览完成", total, status="DONE" if not failures else "FAILED", active=False, failures=failures)
     return {
         "status": final_status,
         "report": str(report_path.with_suffix(".html")), "report_json": str(report_path),

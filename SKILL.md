@@ -31,6 +31,14 @@ Use `--approve all` when every remaining project passes. Packaging contains only
 
 For `MISSING_DEPENDENCIES`, `FAILED`, or any other status, report the exact returned error and `work_dir`. Do not switch to manual document processing.
 
+## 标题正文 Jev 评分
+
+- 标题只取严格配对 TXT 文件名主干；正文从 DOCX OOXML 提取全部可见段落与表格文字，按原顺序连同段落结构字段发送，不做抽样、摘要或静默截断。
+- 默认 `provider=typesafe_jev`，使用标准库 HTTP 调用 `https://api.typesafe.ai/v1/systemone` 和固定模型 `jev-1.13.0`。从 `TYPESAFE_API_KEY` 环境变量读取凭据；不得把 key 写入配置、报告或缓存身份。便携 Python 不要求安装 TypeSafe SDK。明确选择 `provider=local_llama` 时可回滚旧 runtime。
+- 一次 Score 请求对 0–4 有序语义等级评分，再线性映射到 0–100。唯一可配置合格线产生 `MATCH` 或 `MISMATCH`；默认 70 尚未校准。confidence 和等级概率仅作监控指标，不参与二分结果。
+- 有效语义状态只有 `MATCH`、`MISMATCH`。API key 缺失、服务错误、无效响应、配对问题及完整输入超出限制均记 `NOT_EVALUATED`/失败；不可把 Score-only 结果包装成段落引文。超限时不裁剪正文。
+- 默认 `mode=shadow`、`enforce=false`；没有真实 key 和 13 件模型评估时，不宣称业务标签验收通过。
+
 ## Complete programmatic scope
 
 The unified program must preserve every existing function:
@@ -66,6 +74,7 @@ The unified program must preserve every existing function:
 
 - `scripts/process_batch.py` for extraction, audit, repair, verification, and visual evidence;
 - `scripts/word_manual_pipeline_stable.ps1` for description DOCX repair/export;
+- `scripts/title_body_qualification.py` and `scripts/typesafe_jev_runtime.py` for TXT-title/full-body Jev scoring and `NOT_EVALUATED` diagnostics;
 - `scripts/repair_code_headers.ps1` for code DOCX header repair/export;
 - `scripts/package_approved_modified.py` for approved-folder ZIP/RAR creation and integrity testing.
 

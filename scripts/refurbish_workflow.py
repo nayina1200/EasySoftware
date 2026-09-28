@@ -11,10 +11,16 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from validation_isolation import ValidationIsolationError, activate_optimization_isolation, require_validation_path
 
 
 VERSION = "1.0.0"
 DEFAULT_BASE_URL = "http://36.212.60.8:10000"
+DEVELOPMENT_MARKER = Path(__file__).resolve().parents[1] / ".optimization-dev"
+
+
+def _development_copy_read_only() -> bool:
+    return DEVELOPMENT_MARKER.is_file() or os.environ.get("EASYSOFTWARE_DEVELOPMENT_READ_ONLY") == "1"
 
 
 class WorkflowError(RuntimeError):
@@ -145,6 +151,8 @@ def _append_batch(report: dict[str, Any], row: dict[str, Any], workflow: str, or
 
 
 def run_workflow(api: RefurbishApi, operator: str, begin: str = "", end: str = "", dry_run: bool = False) -> dict[str, Any]:
+    if _development_copy_read_only() and not dry_run:
+        raise WorkflowError("优化开发版已启用只读隔离，拒绝提交订单恢复请求。")
     begin = _date_value(begin)
     end = _date_value(end, end=True)
     if begin and end and begin > end:
@@ -289,6 +297,21 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--report", default="")
     args = parser.parse_args()
+    try:
+        activate_optimization_isolation()
+    except ValidationIsolationError as exc:
+        return emit({"version": VERSION, "status": "ISOLATION_BLOCKED", "error": str(exc)}, 2)
+    if _development_copy_read_only() and args.report.strip():
+        try:
+            require_validation_path(args.report, kind="workspace")
+        except ValidationIsolationError as exc:
+            return emit({"version": VERSION, "status": "ISOLATION_BLOCKED", "error": str(exc)}, 2)
+    if _development_copy_read_only() and not args.dry_run:
+        return emit_with_report(args.report, {
+            "version": VERSION,
+            "status": "DEVELOPMENT_READ_ONLY",
+            "error": "优化开发版已启用只读隔离；请在稳定使用版进行正式订单恢复操作。",
+        }, 2)
     token = args.token.strip() or os.environ.get(args.token_env, "").strip()
     if not token:
         return emit_with_report(args.report, {"version": VERSION, "status": "AUTH_REQUIRED", "error": "未接入 Edge 或 Chrome 登录令牌"}, 2)

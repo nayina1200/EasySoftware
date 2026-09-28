@@ -159,6 +159,7 @@ class ProgressReportingTests(unittest.TestCase):
                 "--work-dir", str(work),
             ]
             with mock.patch.dict(sys.modules, {"code_comment_cleaner": failing_module}), \
+                    mock.patch.object(WORKFLOW, "activate_optimization_isolation", return_value=False), \
                     mock.patch.object(sys, "argv", arguments), \
                     contextlib.redirect_stdout(__import__("io").StringIO()):
                 exit_code = WORKFLOW.main()

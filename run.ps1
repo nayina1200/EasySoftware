@@ -2,6 +2,14 @@
 
 $ErrorActionPreference = "Stop"
 $projectRoot = $PSScriptRoot
+if (Test-Path -LiteralPath (Join-Path $projectRoot ".optimization-dev")) {
+    $isolatedLauncher = Join-Path $projectRoot "启动优化开发版.ps1"
+    if (-not (Test-Path -LiteralPath $isolatedLauncher -PathType Leaf)) {
+        throw "优化开发版隔离启动器缺失，已阻止未隔离启动：$isolatedLauncher"
+    }
+    if ($SelfTest) { & $isolatedLauncher -SelfTest } else { & $isolatedLauncher }
+    exit $LASTEXITCODE
+}
 $entry = Join-Path $projectRoot "scripts\unified_workflow.py"
 $env:PYTHONIOENCODING = "utf-8"
 

@@ -2,6 +2,35 @@
 $scriptRoot = Split-Path -Parent $PSScriptRoot
 $entry = Join-Path $PSScriptRoot "refurbish_workflow.py"
 $env:PYTHONIOENCODING = "utf-8"
+$script:isOptimizationDev = Test-Path -LiteralPath (Join-Path $scriptRoot ".optimization-dev")
+
+function Assert-NoReparseComponents([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw "拒绝空隔离路径。" }
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $cursor = [IO.Path]::GetPathRoot($fullPath)
+    $relativePath = $fullPath.Substring($cursor.Length)
+    $segments = @($relativePath.Split([char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar), [StringSplitOptions]::RemoveEmptyEntries))
+    foreach ($segment in $segments) {
+        $cursor = Join-Path $cursor $segment
+        $item = Get-Item -LiteralPath $cursor -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "优化开发版隔离路径包含链接或重解析点：$cursor" }
+    }
+}
+
+if ($script:isOptimizationDev) {
+    $validationRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $scriptRoot) "EasySoftware_优化验证材料"))
+    $fixedUserDataRoot = Join-Path $validationRoot "state\user-data"
+    $fixedTempRoot = Join-Path $validationRoot "temp"
+    foreach ($path in @($validationRoot, $fixedUserDataRoot, $fixedTempRoot)) {
+        Assert-NoReparseComponents $path
+    }
+    New-Item -ItemType Directory -Path $fixedTempRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $fixedUserDataRoot -Force | Out-Null
+    $env:TEMP = $fixedTempRoot
+    $env:TMP = $fixedTempRoot
+    $env:EASYSOFTWARE_USER_DATA_ROOT = $fixedUserDataRoot
+    $env:EASYSOFTWARE_DEVELOPMENT_READ_ONLY = "1"
+}
 
 Add-Type @"
 using System;
@@ -136,6 +165,10 @@ $previewBox.Text = "只预览，不提交接口（建议先预览一次）"
 $previewBox.Location = New-Object System.Drawing.Point(430, 184)
 $previewBox.Size = New-Object System.Drawing.Size(300, 28)
 $previewBox.Checked = $true
+if ($script:isOptimizationDev) {
+    $previewBox.Text = "优化开发版：只读预览"
+    $previewBox.Enabled = $false
+}
 $form.Controls.Add($previewBox)
 
 $runButton = New-Object System.Windows.Forms.Button
@@ -187,11 +220,22 @@ $script:process = $null
 $script:stdoutPath = $null
 $script:stderrPath = $null
 $script:reportPath = $null
-$script:settingsDirectory = Join-Path $env:LOCALAPPDATA "EasySoftware"
+$script:userDataRoot = if ($script:isOptimizationDev) {
+    $fixedUserDataRoot
+} elseif (-not [string]::IsNullOrWhiteSpace($env:EASYSOFTWARE_USER_DATA_ROOT)) {
+    [IO.Path]::GetFullPath($env:EASYSOFTWARE_USER_DATA_ROOT)
+} elseif ($script:isOptimizationDev) {
+    Join-Path (Split-Path -Parent $scriptRoot) "EasySoftware_优化验证材料\state\user-data"
+} else {
+    Join-Path $env:LOCALAPPDATA "EasySoftware"
+}
+$script:settingsDirectory = $script:userDataRoot
 $script:settingsPath = Join-Path $script:settingsDirectory "refurbish-settings.json"
+if ($script:isOptimizationDev) { Assert-NoReparseComponents $script:settingsPath }
 
 function Read-SavedToken {
     try {
+        if ($script:isOptimizationDev) { Assert-NoReparseComponents $script:settingsPath }
         if (-not (Test-Path -LiteralPath $script:settingsPath)) { return "" }
         $settings = Get-Content -LiteralPath $script:settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
         if ([string]::IsNullOrWhiteSpace([string]$settings.token_protected)) { return "" }
@@ -204,6 +248,7 @@ function Read-SavedToken {
 }
 
 function Save-Token([string]$Token) {
+    if ($script:isOptimizationDev) { Assert-NoReparseComponents $script:settingsPath }
     New-Item -ItemType Directory -Path $script:settingsDirectory -Force | Out-Null
     $plain = [Text.Encoding]::UTF8.GetBytes($Token)
     $protected = [Security.Cryptography.ProtectedData]::Protect($plain, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
@@ -212,6 +257,7 @@ function Save-Token([string]$Token) {
 }
 
 function Clear-SavedToken {
+    if ($script:isOptimizationDev) { Assert-NoReparseComponents $script:settingsPath }
     if (Test-Path -LiteralPath $script:settingsPath) {
         Remove-Item -LiteralPath $script:settingsPath -Force
     }
@@ -229,14 +275,22 @@ function Start-Workflow {
     $arguments = @("$entry", "--operator", $operatorBox.Text.Trim(), "--base-url", "http://36.212.60.8:10000")
     if (-not [string]::IsNullOrWhiteSpace($beginBox.Text)) { $arguments += @("--begin", $beginBox.Text.Trim()) }
     if (-not [string]::IsNullOrWhiteSpace($endBox.Text)) { $arguments += @("--end", $endBox.Text.Trim()) }
-    if ($previewBox.Checked) { $arguments += "--dry-run" }
-    $reportDirectory = Join-Path $env:LOCALAPPDATA "EasySoftware\refurbish-reports"
-    New-Item -ItemType Directory -Path $reportDirectory -Force | Out-Null
+    if ($previewBox.Checked -or $script:isOptimizationDev) { $arguments += "--dry-run" }
+    $reportDirectory = Join-Path $script:userDataRoot "refurbish-reports"
     $script:reportPath = Join-Path $reportDirectory ("refurbish-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".html")
+    if ($script:isOptimizationDev) {
+        Assert-NoReparseComponents $reportDirectory
+        Assert-NoReparseComponents $script:reportPath
+    }
+    New-Item -ItemType Directory -Path $reportDirectory -Force | Out-Null
     $arguments += @("--report", $script:reportPath)
     $argumentText = ($arguments | ForEach-Object { Quote-Argument $_ }) -join " "
     $script:stdoutPath = [IO.Path]::GetTempFileName()
     $script:stderrPath = [IO.Path]::GetTempFileName()
+    if ($script:isOptimizationDev) {
+        Assert-NoReparseComponents $script:stdoutPath
+        Assert-NoReparseComponents $script:stderrPath
+    }
     $previousToken = $env:EASYSOFTWARE_REFURBISH_TOKEN
     try {
         $env:EASYSOFTWARE_REFURBISH_TOKEN = $tokenBox.Text.Trim()

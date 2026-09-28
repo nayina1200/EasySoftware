@@ -7,3 +7,10 @@ __pycache__/
 解压版/
 修改版/
 .Temp/
+vision_config.json
+title_body_config.json
+.optimization-dev
+启动优化开发版.ps1
+.omc/
+_jev_*/
+_year_policy_validation_*/

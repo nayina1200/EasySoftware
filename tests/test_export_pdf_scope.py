@@ -117,6 +117,7 @@ class ExportCliScopeTests(unittest.TestCase):
 
         argv = ["unified_workflow.py"] + arguments
         with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(WORKFLOW, "activate_optimization_isolation", return_value=False), \
                 mock.patch.object(WORKFLOW, "export_modified_pdfs", side_effect=record_base), \
                 mock.patch.object(WORKFLOW, "find_python", return_value=Path(sys.executable)), \
                 contextlib.redirect_stdout(io.StringIO()):

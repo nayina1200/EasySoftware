@@ -1,0 +1,10 @@
+{
+  "base_url": "http://127.0.0.1:3458/v1",
+  "model": "sensenova-6.8-flash-lite",
+  "api_keys": [],
+  "timeout_seconds": 30,
+  "max_image_bytes": 4000000,
+  "max_image_side": 1600,
+  "jpeg_quality": 85,
+  "retry_count": 2
+}

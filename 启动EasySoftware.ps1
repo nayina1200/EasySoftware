@@ -5,6 +5,68 @@ $projectRoot = $PSScriptRoot
 $entry = Join-Path $projectRoot "scripts\unified_workflow.py"
 $env:PYTHONIOENCODING = "utf-8"
 
+function Assert-NoReparseComponents([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw "拒绝空隔离路径。" }
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $cursor = [IO.Path]::GetPathRoot($fullPath)
+    $relativePath = $fullPath.Substring($cursor.Length)
+    $segments = @($relativePath.Split([char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar), [StringSplitOptions]::RemoveEmptyEntries))
+    foreach ($segment in $segments) {
+        $cursor = Join-Path $cursor $segment
+        if (Test-Path -LiteralPath $cursor) {
+            $item = Get-Item -LiteralPath $cursor -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "优化开发版隔离路径包含链接或重解析点：$cursor"
+            }
+        }
+    }
+}
+
+$script:isOptimizationDev = Test-Path -LiteralPath (Join-Path $projectRoot ".optimization-dev")
+if ($script:isOptimizationDev) {
+    $script:validationRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $projectRoot) "EasySoftware_优化验证材料"))
+    Assert-NoReparseComponents $script:validationRoot
+    $script:validationRunsRoot = Join-Path $script:validationRoot "runs"
+    $script:devPaths = @{
+        Temp = Join-Path $script:validationRoot "temp"
+        PyCache = Join-Path $script:validationRoot "cache\python"
+        YoloCache = Join-Path $script:validationRoot "cache\yolo"
+        UserData = Join-Path $script:validationRoot "state\user-data"
+        DateTool = Join-Path $script:validationRoot "dependencies\date_ocr"
+        Llama = Join-Path $script:validationRoot "dependencies\llama"
+        VisionConfig = Join-Path $script:validationRoot "config\vision_config.json"
+    }
+    $requiredDevPaths = @(
+        (Join-Path $projectRoot "python\python.exe"),
+        (Join-Path $script:devPaths.DateTool "_internal\python.exe"),
+        (Join-Path $script:devPaths.DateTool "app.py"),
+        (Join-Path $projectRoot "scripts\rapid_ocr_bridge.py"),
+        (Join-Path $projectRoot "scripts\date_year_rewriter_bridge.py"),
+        (Join-Path $script:devPaths.Llama "llama-server.exe"),
+        (Join-Path $script:validationRoot "dependencies\model\QwenPaw-Flash-2B-Q4_K_M.gguf"),
+        $script:devPaths.VisionConfig
+    )
+    foreach ($required in $requiredDevPaths) {
+        Assert-NoReparseComponents $required
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "优化开发版隔离依赖不完整；为避免能力静默降级，已阻止启动：$required" }
+    }
+    foreach ($directory in @($script:devPaths.Temp, $script:devPaths.PyCache, $script:devPaths.YoloCache, $script:devPaths.UserData, $script:validationRunsRoot)) {
+        Assert-NoReparseComponents $directory
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    $env:TEMP = $script:devPaths.Temp
+    $env:TMP = $script:devPaths.Temp
+    $env:PYTHONPYCACHEPREFIX = $script:devPaths.PyCache
+    $env:YOLO_CONFIG_DIR = $script:devPaths.YoloCache
+    $env:EASYSOFTWARE_USER_DATA_ROOT = $script:devPaths.UserData
+    $env:EASYSOFTWARE_DATE_TOOL_ROOT = $script:devPaths.DateTool
+    $env:EASYSOFTWARE_LLAMA_HOME = $script:devPaths.Llama
+    $env:EASYSOFTWARE_VISION_CONFIG = $script:devPaths.VisionConfig
+    $env:EASYSOFTWARE_VALIDATION_ROOT = $script:validationRoot
+    $env:EASYSOFTWARE_VALIDATION_RUNS_ROOT = $script:validationRunsRoot
+    $env:EASYSOFTWARE_DEVELOPMENT_READ_ONLY = "1"
+}
+
 # 便携版增强：把捆绑的工具目录加入 PATH，使 find_7z / find_rar / poppler 能找到
 foreach ($sub in @("tools\7z", "tools\rar")) {
     $toolDir = Join-Path $projectRoot $sub
@@ -16,11 +78,26 @@ foreach ($sub in @("tools\7z", "tools\rar")) {
 function Find-Python {
     # 便携版优先使用捆绑的 Python 运行时
     $bundledPython = Join-Path $projectRoot "python\python.exe"
-    if (Test-Path -LiteralPath $bundledPython) {
+    $moduleCheck = if ($script:isOptimizationDev) {
+        "import lxml, PIL, pypdf, pypdfium2, pdfminer"
+    } else {
+        "import lxml, PIL, pypdf, pypdfium2"
+    }
+    if (Test-Path -LiteralPath $bundledPython -PathType Leaf) {
         try {
-            & $bundledPython -c "import lxml, PIL, pypdf, pypdfium2" 2>$null
+            & $bundledPython -c $moduleCheck 2>$null
             if ($LASTEXITCODE -eq 0) { return $bundledPython }
         } catch {}
+    }
+    if ($script:isOptimizationDev) {
+        $isolatedPython = [string]$env:EASYSOFTWARE_PYTHON
+        if (-not [string]::IsNullOrWhiteSpace($isolatedPython) -and (Test-Path -LiteralPath $isolatedPython -PathType Leaf)) {
+            try {
+                & $isolatedPython -c $moduleCheck 2>$null
+                if ($LASTEXITCODE -eq 0) { return $isolatedPython }
+            } catch {}
+        }
+        return $null
     }
     $candidates = @()
     $command = Get-Command python.exe -ErrorAction SilentlyContinue
@@ -78,9 +155,60 @@ function Test-ArchiveName([string]$Value) {
     return $false
 }
 
+function Assert-OptimizationPath([string]$Path, [switch]$Material) {
+    if (-not $script:isOptimizationDev) { return }
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw "优化开发版隔离拒绝空路径。" }
+    $target = [IO.Path]::GetFullPath($Path)
+    if ($Material) {
+        Assert-NoReparseComponents $target
+        return
+    }
+    $allowedRoot = $script:validationRoot
+    $allowedRoot = [IO.Path]::GetFullPath($allowedRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $prefix = $allowedRoot + [IO.Path]::DirectorySeparatorChar
+    if (-not $target.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "优化开发版工作目录必须位于验证隔离目录内：$target"
+    }
+    $relative = $target.Substring($prefix.Length)
+    $segments = @($relative.Split([char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar), [StringSplitOptions]::RemoveEmptyEntries))
+    $workspaceAllowed = $false
+    foreach ($workspaceName in @("temp", "cache", "reports", "state")) {
+        $workspaceRoot = [IO.Path]::GetFullPath((Join-Path $script:validationRoot $workspaceName)).TrimEnd([IO.Path]::DirectorySeparatorChar)
+        if ($target.StartsWith($workspaceRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { $workspaceAllowed = $true }
+    }
+    if (-not $workspaceAllowed) { throw "优化开发版工作目录必须位于专用 temp/cache/reports/state 目录：$target" }
+    $rootCursor = $allowedRoot
+    while (-not [string]::IsNullOrWhiteSpace($rootCursor)) {
+        if (Test-Path -LiteralPath $rootCursor) {
+            $rootItem = Get-Item -LiteralPath $rootCursor -Force
+            if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "优化开发版隔离根或其父目录是链接路径：$rootCursor"
+            }
+        }
+        $parentCursor = Split-Path -Parent $rootCursor
+        if ([string]::Equals($parentCursor, $rootCursor, [StringComparison]::OrdinalIgnoreCase)) { break }
+        $rootCursor = $parentCursor
+    }
+    $cursor = $allowedRoot
+    $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    foreach ($segment in $segments) {
+        if ([string]::IsNullOrWhiteSpace($segment)) { continue }
+        $cursor = Join-Path $cursor $segment
+        if (Test-Path -LiteralPath $cursor) {
+            $item = Get-Item -LiteralPath $cursor -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "优化开发版隔离不接受指向其他位置的链接路径：$cursor"
+            }
+        }
+    }
+}
+
 function Prepare-ArchiveWorkspace([System.IO.FileInfo]$Archive) {
+    Assert-OptimizationPath $Archive.FullName -Material
     while ($Archive.Directory.Name -ieq $Archive.BaseName -and $Archive.Directory.Parent.Name -ieq $Archive.BaseName) {
         $target = Join-Path $Archive.Directory.Parent.FullName $Archive.Name
+        Assert-OptimizationPath $target -Material
+        Assert-OptimizationPath $Archive.Directory.FullName -Material
         if (Test-Path -LiteralPath $target) {
             $existing = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
             $incoming = (Get-FileHash -LiteralPath $Archive.FullName -Algorithm SHA256).Hash
@@ -95,8 +223,10 @@ function Prepare-ArchiveWorkspace([System.IO.FileInfo]$Archive) {
     }
     $folder = Join-Path $Archive.DirectoryName $Archive.BaseName
     if ($Archive.Directory.Name -ieq $Archive.BaseName) { return $Archive.FullName }
+    Assert-OptimizationPath $folder -Material
     New-Item -ItemType Directory -Path $folder -Force | Out-Null
     $target = Join-Path $folder $Archive.Name
+    Assert-OptimizationPath $target -Material
     if (Test-Path -LiteralPath $target) {
         $existing = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
         $incoming = (Get-FileHash -LiteralPath $Archive.FullName -Algorithm SHA256).Hash
@@ -109,12 +239,25 @@ function Prepare-ArchiveWorkspace([System.IO.FileInfo]$Archive) {
 }
 
 $python = Find-Python
+if ($script:isOptimizationDev) {
+    $datePython = Join-Path $script:devPaths.DateTool "_internal\python.exe"
+    & $datePython -c "import cv2, numpy, rapidocr, gradio, PIL, docx, ultralytics" 2>$null
+    if ($LASTEXITCODE -ne 0) { throw "日期 OCR 运行时无法加载必要引擎；为避免能力静默降级，已阻止启动。" }
+}
 if ($SelfTest) {
     Write-Host "EasySoftware GUI launcher self-test"
     Write-Host "Project root: $projectRoot"
     Write-Host "Python: $python"
     Write-Host "Entry: $entry"
     if ([string]::IsNullOrWhiteSpace($python) -or -not (Test-Path -LiteralPath $entry -PathType Leaf)) { exit 2 }
+    if ($script:isOptimizationDev) {
+        Assert-OptimizationPath (Join-Path $script:validationRunsRoot "__isolation_selftest\input") -Material
+        Assert-OptimizationPath (Join-Path (Split-Path -Parent $projectRoot) "formal-orders") -Material
+        $workspaceBlocked = $false
+        try { Assert-OptimizationPath (Join-Path (Split-Path -Parent $projectRoot) "formal-output") }
+        catch { $workspaceBlocked = $true }
+        if (-not $workspaceBlocked) { throw "隔离自检失败：验证区外工作目录未被阻止。" }
+    }
     & $python $entry --help
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     Write-Host "Self-test OK"
@@ -154,6 +297,13 @@ $subtitle.ForeColor = [System.Drawing.Color]::DimGray
 $subtitle.Location = New-Object System.Drawing.Point(25, 55)
 $subtitle.AutoSize = $true
 $form.Controls.Add($subtitle)
+
+$visionSettingsButton = New-Object System.Windows.Forms.Button
+$visionSettingsButton.Text = "视觉模型配置"
+$visionSettingsButton.Location = New-Object System.Drawing.Point(810, 20)
+$visionSettingsButton.Size = New-Object System.Drawing.Size(130, 32)
+$visionSettingsButton.Anchor = "Top,Right"
+$form.Controls.Add($visionSettingsButton)
 
 $inputBox = New-Object System.Windows.Forms.TextBox
 $inputBox.Location = New-Object System.Drawing.Point(26, 88)
@@ -238,40 +388,36 @@ $codeCommentButton.FlatStyle = "Flat"
 $form.Controls.Add($codeCommentButton)
 
 $documentStageLabel = New-Object System.Windows.Forms.Label
-$documentStageLabel.Text = "材料处理流程（勾选后预览）："
+$documentStageLabel.Text = "处理说明和代码流程："
 $documentStageLabel.Location = New-Object System.Drawing.Point(26, 179)
 $documentStageLabel.AutoSize = $true
 $documentStageLabel.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
 $form.Controls.Add($documentStageLabel)
 
-$manualStageCheck = New-Object System.Windows.Forms.CheckBox
-$manualStageCheck.Text = "说明书"
-$manualStageCheck.Location = New-Object System.Drawing.Point(248, 176)
-$manualStageCheck.Size = New-Object System.Drawing.Size(100, 27)
-$manualStageCheck.Checked = $true
-$form.Controls.Add($manualStageCheck)
-
-$codeStageCheck = New-Object System.Windows.Forms.CheckBox
-$codeStageCheck.Text = "代码"
-$codeStageCheck.Location = New-Object System.Drawing.Point(355, 176)
-$codeStageCheck.Size = New-Object System.Drawing.Size(85, 27)
-$codeStageCheck.Checked = $true
-$form.Controls.Add($codeStageCheck)
-
-$txtStageCheck = New-Object System.Windows.Forms.CheckBox
-$txtStageCheck.Text = "TXT占位"
-$txtStageCheck.Location = New-Object System.Drawing.Point(447, 176)
-$txtStageCheck.Size = New-Object System.Drawing.Size(120, 27)
-$txtStageCheck.Checked = $true
-$form.Controls.Add($txtStageCheck)
+$workflowOptionsButton = New-Object System.Windows.Forms.Button
+$workflowOptionsButton.Text = "自定义步骤…"
+$workflowOptionsButton.Location = New-Object System.Drawing.Point(190, 174)
+$workflowOptionsButton.Size = New-Object System.Drawing.Size(125, 30)
+$form.Controls.Add($workflowOptionsButton)
 
 $stageSelectionHint = New-Object System.Windows.Forms.Label
-$stageSelectionHint.Text = "未勾选的流程将跳过"
+$stageSelectionHint.Text = "完整处理"
 $stageSelectionHint.ForeColor = [System.Drawing.Color]::DimGray
-$stageSelectionHint.Location = New-Object System.Drawing.Point(587, 180)
-$stageSelectionHint.AutoSize = $true
+$stageSelectionHint.Location = New-Object System.Drawing.Point(327, 180)
+$stageSelectionHint.Size = New-Object System.Drawing.Size(370, 24)
+$stageSelectionHint.Anchor = "Top,Left,Right"
+$stageSelectionHint.AutoSize = $false
 $stageSelectionHint.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 8.5)
 $form.Controls.Add($stageSelectionHint)
+
+$skipTopicMismatchCheck = New-Object System.Windows.Forms.CheckBox
+$skipTopicMismatchCheck.Text = "跳过标题正文不匹配项目（默认）"
+$skipTopicMismatchCheck.Location = New-Object System.Drawing.Point(720, 176)
+$skipTopicMismatchCheck.Size = New-Object System.Drawing.Size(250, 27)
+$skipTopicMismatchCheck.Checked = $true
+$skipTopicMismatchCheck.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 8.5)
+$skipTopicMismatchCheck.Anchor = "Top,Right"
+$form.Controls.Add($skipTopicMismatchCheck)
 
 $workflowGuide = New-Object System.Windows.Forms.Label
 $workflowGuide.Text = "工作流：1 选择材料  >  2 首轮看图并微调 Word  >  3 二次处理  >  4 终审  >  5 导出 PDF  >  6 压缩交付"
@@ -361,25 +507,206 @@ $script:workDir = $null
 $script:reviewStage = $null
 $script:fromExtracted = $false
 $script:exportWorkDir = $null
-$script:documentStages = $null
+$script:workflowOptionMetadata = [ordered]@{
+    match_title_body = @{ Group = "匹配度检测"; Label = "标题与说明书正文主题匹配"; Tip = "逐件输出 0–100 主题相似度与判定依据；默认资格筛选会运行。" }
+    match_manual_ocr = @{ Group = "匹配度检测"; Label = "截图 OCR 与软件主题匹配"; Tip = "抽样识别说明书界面图并检查与项目主题的相关性。" }
+    match_manual_vision = @{ Group = "匹配度检测"; Label = "视觉模型复核截图"; Tip = "只作为相关/不相关/无法判断的人工复核证据；自动依赖 OCR 候选筛选。" }
+    match_code = @{ Group = "匹配度检测"; Label = "代码 DOCX/PDF 配套检查"; Tip = "检查同名配套文件和代码文档中的中文注释候选。" }
+    match_txt = @{ Group = "匹配度检测"; Label = "TXT 名称、字段与主题检查"; Tip = "检查编码、字段、软件名称、主要功能及主题冲突。" }
+    manual_body_years = @{ Group = "说明书内容处理"; Label = "检查/修正说明书正文年份"; Tip = "按既有规则处理高置信时效语境中的正文年份。" }
+    manual_image_dates = @{ Group = "说明书内容处理"; Label = "检查/修正说明书图片日期"; Tip = "只更新早于目标年份的有效日期年份；自动运行 OCR 相关性预检。" }
+    manual_cover = @{ Group = "说明书页面整理"; Label = "整理说明书封面"; Tip = "检查并整理封面及其与正文的分页边界。" }
+    manual_header = @{ Group = "说明书页面整理"; Label = "整理说明书页眉"; Tip = "单独处理页眉内容，不自动补页码。" }
+    manual_page_numbers = @{ Group = "说明书页面整理"; Label = "整理说明书页码"; Tip = "单独检查和补齐动态页码，不自动整理页眉。" }
+    manual_pdf = @{ Group = "说明书页面整理"; Label = "导出说明书 PDF"; Tip = "在所选说明书修改全部完成后导出配套 PDF。" }
+    code_cleanup = @{ Group = "代码处理"; Label = "清理代码中文注释"; Tip = "仅清理识别出的中文注释。" }
+    code_pdf = @{ Group = "代码处理"; Label = "导出代码 PDF"; Tip = "代码 DOCX 清理后重新导出同名 PDF。" }
+    txt_repair = @{ Group = "TXT 处理"; Label = "修复 TXT 主要功能字段"; Tip = "保留原编码和其他字段，只清理主要功能字段中的既定格式问题。" }
+}
+$script:workflowOptionGroups = [ordered]@{
+    "匹配度检测" = @("match_title_body", "match_manual_ocr", "match_manual_vision", "match_code", "match_txt")
+    "说明书内容处理" = @("manual_body_years", "manual_image_dates")
+    "说明书页面整理" = @("manual_cover", "manual_header", "manual_page_numbers", "manual_pdf")
+    "代码处理" = @("code_cleanup", "code_pdf")
+    "TXT 处理" = @("txt_repair")
+}
+$script:documentStages = @($script:workflowOptionMetadata.Keys)
 
 function Get-SelectedDocumentStages {
-    $selected = @()
-    if ($manualStageCheck.Checked) { $selected += "manual" }
-    if ($codeStageCheck.Checked) { $selected += "code" }
-    if ($txtStageCheck.Checked) { $selected += "txt_placeholder" }
-    return ($selected -join ",")
+    return (@($script:documentStages) -join ",")
 }
 
-function Get-DocumentStageSummary([string]$Stages) {
-    $selected = @($Stages -split ",")
-    $run = @()
-    $skip = @()
-    foreach ($stage in @(@("manual", "说明书"), @("code", "代码"), @("txt_placeholder", "TXT占位"))) {
-        if ($selected -contains $stage[0]) { $run += $stage[1] } else { $skip += $stage[1] }
+function Get-DocumentStageSummary($Stages) {
+    if ($null -eq $Stages) {
+        $selected = @()
+    } elseif ($Stages -is [string]) {
+        $selected = @($Stages -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    } else {
+        $selected = @($Stages | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
     }
-    return "执行：$($run -join ' → ')；跳过：$(if ($skip.Count) { $skip -join '、' } else { '无' })"
+    $matchCount = @($selected | Where-Object { $_ -like "match_*" }).Count
+    $manualCount = @($selected | Where-Object { $_ -like "manual_*" }).Count
+    $codeCount = @($selected | Where-Object { $_ -like "code_*" }).Count
+    $txtCount = @($selected | Where-Object { $_ -like "txt_*" }).Count
+    return "匹配检测 $matchCount 项；说明书 $manualCount 项；代码 $codeCount 项；TXT $txtCount 项"
 }
+
+function Update-DocumentWorkflowSummary {
+    $stageSelectionHint.Text = Get-DocumentStageSummary (Get-SelectedDocumentStages)
+}
+
+function New-WorkflowOptionCheckBox([System.Windows.Forms.Control]$Parent, [string]$OptionId, [int]$Y, [hashtable]$Controls, [System.Windows.Forms.ToolTip]$Tips) {
+    $metadata = $script:workflowOptionMetadata[$OptionId]
+    $check = New-Object System.Windows.Forms.CheckBox
+    $check.Text = [string]$metadata.Label
+    $check.Location = New-Object System.Drawing.Point(16, $Y)
+    $check.Size = New-Object System.Drawing.Size(640, 25)
+    $check.Checked = $script:documentStages -contains $OptionId
+    $check.Anchor = "Top,Left,Right"
+    $Tips.SetToolTip($check, [string]$metadata.Tip)
+    $Parent.Controls.Add($check)
+    $Controls[$OptionId] = $check
+}
+
+function Show-DocumentWorkflowOptions {
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "处理说明和代码 - 自定义流程"
+    $dialog.StartPosition = "CenterParent"
+    $dialog.Size = New-Object System.Drawing.Size(720, 680)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(680, 620)
+    $dialog.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
+    $note = New-Object System.Windows.Forms.Label
+    $note.Text = "可多选。系统按固定顺序执行；依赖步骤会自动加入并在预览报告列出。"
+    $note.Location = New-Object System.Drawing.Point(14, 12)
+    $note.Size = New-Object System.Drawing.Size(675, 24)
+    $dialog.Controls.Add($note)
+
+    $tabs = New-Object System.Windows.Forms.TabControl
+    $tabs.Location = New-Object System.Drawing.Point(12, 42)
+    $tabs.Size = New-Object System.Drawing.Size(680, 500)
+    $tabs.Anchor = "Top,Left,Right,Bottom"
+    $dialog.Controls.Add($tabs)
+    $controls = @{}
+    $tips = New-Object System.Windows.Forms.ToolTip
+    $tips.AutoPopDelay = 12000
+    $tips.InitialDelay = 350
+    $tips.ReshowDelay = 100
+
+    $matchTab = New-Object System.Windows.Forms.TabPage
+    $matchTab.Text = "匹配检测"
+    $matchPanel = New-Object System.Windows.Forms.Panel
+    $matchPanel.Dock = "Fill"
+    $matchPanel.AutoScroll = $true
+    $matchTab.Controls.Add($matchPanel)
+    $tabs.TabPages.Add($matchTab)
+    $y = 18
+    foreach ($id in $script:workflowOptionGroups["匹配度检测"]) {
+        New-WorkflowOptionCheckBox $matchPanel $id $y $controls $tips
+        $y += 42
+    }
+
+    $manualTab = New-Object System.Windows.Forms.TabPage
+    $manualTab.Text = "说明书"
+    $manualPanel = New-Object System.Windows.Forms.Panel
+    $manualPanel.Dock = "Fill"
+    $manualPanel.AutoScroll = $true
+    $manualTab.Controls.Add($manualPanel)
+    $tabs.TabPages.Add($manualTab)
+    $y = 14
+    foreach ($groupName in @("说明书内容处理", "说明书页面整理")) {
+        $ids = @($script:workflowOptionGroups[$groupName])
+        $box = New-Object System.Windows.Forms.GroupBox
+        $box.Text = $groupName
+        $box.Location = New-Object System.Drawing.Point(12, $y)
+        $box.Size = New-Object System.Drawing.Size(630, (35 + 42 * $ids.Count))
+        $box.Anchor = "Top,Left,Right"
+        $manualPanel.Controls.Add($box)
+        for ($index = 0; $index -lt $ids.Count; $index++) {
+            New-WorkflowOptionCheckBox $box $ids[$index] (22 + 42 * $index) $controls $tips
+        }
+        $y += $box.Height + 10
+    }
+
+    $otherTab = New-Object System.Windows.Forms.TabPage
+    $otherTab.Text = "代码与 TXT"
+    $otherPanel = New-Object System.Windows.Forms.Panel
+    $otherPanel.Dock = "Fill"
+    $otherPanel.AutoScroll = $true
+    $otherTab.Controls.Add($otherPanel)
+    $tabs.TabPages.Add($otherTab)
+    $y = 14
+    foreach ($groupName in @("代码处理", "TXT 处理")) {
+        $ids = @($script:workflowOptionGroups[$groupName])
+        $box = New-Object System.Windows.Forms.GroupBox
+        $box.Text = $groupName
+        $box.Location = New-Object System.Drawing.Point(12, $y)
+        $box.Size = New-Object System.Drawing.Size(630, (35 + 42 * $ids.Count))
+        $box.Anchor = "Top,Left,Right"
+        $otherPanel.Controls.Add($box)
+        for ($index = 0; $index -lt $ids.Count; $index++) {
+            New-WorkflowOptionCheckBox $box $ids[$index] (22 + 42 * $index) $controls $tips
+        }
+        $y += $box.Height + 10
+    }
+
+    $completeButton = New-Object System.Windows.Forms.Button
+    $completeButton.Text = "完整处理"
+    $completeButton.Location = New-Object System.Drawing.Point(12, 552)
+    $completeButton.Size = New-Object System.Drawing.Size(95, 30)
+    $dialog.Controls.Add($completeButton)
+    $checksButton = New-Object System.Windows.Forms.Button
+    $checksButton.Text = "只做检测"
+    $checksButton.Location = New-Object System.Drawing.Point(114, 552)
+    $checksButton.Size = New-Object System.Drawing.Size(95, 30)
+    $dialog.Controls.Add($checksButton)
+    $manualButton = New-Object System.Windows.Forms.Button
+    $manualButton.Text = "说明书"
+    $manualButton.Location = New-Object System.Drawing.Point(216, 552)
+    $manualButton.Size = New-Object System.Drawing.Size(85, 30)
+    $dialog.Controls.Add($manualButton)
+    $codeButton = New-Object System.Windows.Forms.Button
+    $codeButton.Text = "代码"
+    $codeButton.Location = New-Object System.Drawing.Point(308, 552)
+    $codeButton.Size = New-Object System.Drawing.Size(75, 30)
+    $dialog.Controls.Add($codeButton)
+    $txtButton = New-Object System.Windows.Forms.Button
+    $txtButton.Text = "TXT"
+    $txtButton.Location = New-Object System.Drawing.Point(390, 552)
+    $txtButton.Size = New-Object System.Drawing.Size(75, 30)
+    $dialog.Controls.Add($txtButton)
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text = "保存选择"
+    $okButton.Location = New-Object System.Drawing.Point(486, 552)
+    $okButton.Size = New-Object System.Drawing.Size(95, 30)
+    $dialog.Controls.Add($okButton)
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = "取消"
+    $cancelButton.Location = New-Object System.Drawing.Point(588, 552)
+    $cancelButton.Size = New-Object System.Drawing.Size(80, 30)
+    $dialog.Controls.Add($cancelButton)
+
+    $setPreset = {
+        param([string[]]$Ids)
+        foreach ($key in $controls.Keys) { $controls[$key].Checked = $Ids -contains $key }
+    }
+    $completeButton.Add_Click(({ & $setPreset @($script:workflowOptionMetadata.Keys) }).GetNewClosure())
+    $checksButton.Add_Click(({ & $setPreset @($script:workflowOptionMetadata.Keys | Where-Object { $_ -like "match_*" }) }).GetNewClosure())
+    $manualButton.Add_Click(({ & $setPreset @($script:workflowOptionMetadata.Keys | Where-Object { $_ -in @("match_title_body", "match_manual_ocr", "match_manual_vision") -or $_ -like "manual_*" }) }).GetNewClosure())
+    $codeButton.Add_Click(({ & $setPreset @("match_code", "code_cleanup", "code_pdf") }).GetNewClosure())
+    $txtButton.Add_Click(({ & $setPreset @("match_txt", "txt_repair") }).GetNewClosure())
+    $okButton.Add_Click(({ $dialog.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dialog.Close() }).GetNewClosure())
+    $cancelButton.Add_Click(({ $dialog.DialogResult = [System.Windows.Forms.DialogResult]::Cancel; $dialog.Close() }).GetNewClosure())
+    $dialog.AcceptButton = $okButton
+    $dialog.CancelButton = $cancelButton
+    if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+        $script:documentStages = @($script:workflowOptionMetadata.Keys | Where-Object { $controls[$_].Checked })
+        Update-DocumentWorkflowSummary
+    }
+    $tips.Dispose()
+    $dialog.Dispose()
+}
+
+Update-DocumentWorkflowSummary
 
 function Append-Log([string]$Text) {
     if ([string]::IsNullOrWhiteSpace($Text)) { return }
@@ -426,9 +753,9 @@ function Set-Busy([bool]$Busy, [string]$Status) {
     $refurbishButton.Enabled = -not $Busy
     $codeCommentButton.Enabled = -not $Busy
     $stageChecksEnabled = (-not $Busy) -and ($script:reviewStage -ne "documents")
-    $manualStageCheck.Enabled = $stageChecksEnabled
-    $codeStageCheck.Enabled = $stageChecksEnabled
-    $txtStageCheck.Enabled = $stageChecksEnabled
+    $workflowOptionsButton.Enabled = $stageChecksEnabled
+    $skipTopicMismatchCheck.Enabled = (-not $Busy) -and ($script:reviewStage -ne "documents")
+    $visionSettingsButton.Enabled = -not $Busy
     $exportButton.Enabled = (-not $Busy) -and (-not [string]::IsNullOrWhiteSpace($inputBox.Text))
     $packageButton.Enabled = (-not $Busy) -and ($null -ne $script:reviewPath)
     $recheckButton.Enabled = (-not $Busy) -and ($script:reviewStage -eq "final")
@@ -540,6 +867,24 @@ function Start-Operation([string[]]$Arguments, [string]$Operation) {
     if ($null -ne $script:process -and -not $script:process.HasExited) {
         Append-Log "已有任务正在运行，忽略重复启动。"
         return
+    }
+    if ($script:isOptimizationDev) {
+        try {
+            if ($Arguments.Count -lt 1) { throw "优化开发版隔离拒绝缺少材料路径的操作。" }
+            Assert-OptimizationPath $Arguments[0] -Material
+            for ($index = 0; $index -lt ($Arguments.Count - 1); $index++) {
+                switch ($Arguments[$index]) {
+                    "--work-dir" { Assert-OptimizationPath $Arguments[$index + 1] }
+                    "--extracted" { Assert-OptimizationPath $Arguments[$index + 1] -Material }
+                    "--modified" { Assert-OptimizationPath $Arguments[$index + 1] -Material }
+                    "--input-archive" { Assert-OptimizationPath $Arguments[$index + 1] -Material }
+                }
+            }
+        } catch {
+            Append-Log $_.Exception.Message
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "优化开发版隔离", "OK", "Warning") | Out-Null
+            return
+        }
     }
     $script:stdoutPath = [IO.Path]::GetTempFileName()
     $script:stderrPath = [IO.Path]::GetTempFileName()
@@ -670,7 +1015,15 @@ $timer.Add_Tick({
         $caption = if ($result.status -eq "DOCUMENT_PROCESSING_OK") { "材料统一处理完成" } else { "材料处理部分完成，请复核异常" }
         Set-Busy $false ($caption + "：失败/待处理 " + [string]$result.failures + " 项；" + (Get-DocumentStageSummary $script:documentStages))
         $packageButton.Enabled = $false
-        [System.Windows.Forms.MessageBox]::Show(($caption + "。`n`n输出目录：`n" + [string]$result.output + "`n`n报告：`n" + [string]$result.report), "EasySoftware", "OK", $(if ($result.status -eq "DOCUMENT_PROCESSING_OK") { "Information" } else { "Warning" })) | Out-Null
+        Append-Log ($caption + "；失败/待处理 " + [string]$result.failures + " 项")
+        Append-Log ("输出目录：" + [string]$result.output)
+        Append-Log ("处理报告：" + [string]$result.report)
+        if ($reviewButton.Enabled) {
+            try { Start-Process -FilePath $script:reviewPath -ErrorAction Stop }
+            catch { Append-Log ("自动打开报告失败，可点击报告按钮：" + $_.Exception.Message) }
+        } else {
+            [System.Windows.Forms.MessageBox]::Show(("处理结束，但报告文件不存在：`n" + [string]$result.report), "EasySoftware", "OK", "Warning") | Out-Null
+        }
     } elseif ($result.status -eq "CODE_COMMENT_CLEANUP_OK") {
         $script:reviewPath = [string]$result.report
         $script:reviewStage = "code-comments-done"
@@ -760,6 +1113,21 @@ $folderButton.Add_Click({
 
 $inputBox.Add_TextChanged({ Update-ExportAvailability })
 
+$workflowOptionsButton.Add_Click({ Show-DocumentWorkflowOptions })
+
+$visionSettingsButton.Add_Click({
+    $configPath = if ($script:isOptimizationDev) { $env:EASYSOFTWARE_VISION_CONFIG } else { Join-Path $projectRoot "vision_config.json" }
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        $examplePath = Join-Path $projectRoot "vision_config.example.json"
+        if (-not (Test-Path -LiteralPath $examplePath)) {
+            [System.Windows.Forms.MessageBox]::Show("找不到视觉模型配置模板：$examplePath", "EasySoftware", "OK", "Error") | Out-Null
+            return
+        }
+        Copy-Item -LiteralPath $examplePath -Destination $configPath
+    }
+    Start-Process -FilePath "notepad.exe" -ArgumentList (Quote-Argument $configPath)
+})
+
 $codeCommentButton.Add_Click({
     $value = $inputBox.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($value) -or -not (Test-Path -LiteralPath $value)) {
@@ -771,11 +1139,10 @@ $codeCommentButton.Add_Click({
         [System.Windows.Forms.MessageBox]::Show("请至少勾选一个材料处理流程。", "EasySoftware", "OK", "Warning") | Out-Null
         return
     }
-    if (-not $manualStageCheck.Checked -and -not $codeStageCheck.Checked) {
-        [System.Windows.Forms.MessageBox]::Show("TXT 流程目前仅作占位登记，请至少勾选说明书或代码。", "EasySoftware", "OK", "Warning") | Out-Null
+    if ($script:documentStages.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("请至少勾选一个检测或处理步骤。", "EasySoftware", "OK", "Warning") | Out-Null
         return
     }
-    $script:documentStages = $selectedStages
     $script:batchRoot = (Get-Item -LiteralPath $value).FullName
     $bytes = [Text.Encoding]::UTF8.GetBytes($script:batchRoot.ToLowerInvariant())
     $hash = [Security.Cryptography.SHA1]::Create().ComputeHash($bytes)
@@ -789,7 +1156,9 @@ $codeCommentButton.Add_Click({
     $logBox.Clear()
     Append-Log ("材料统一处理预览：" + $script:batchRoot)
     Append-Log (Get-DocumentStageSummary $script:documentStages)
-    Start-Operation -Arguments @($script:batchRoot, "--work-dir", $script:workDir, "--process-documents", "--document-stages", $script:documentStages) -Operation "正在预检所选材料流程..."
+    $arguments = @($script:batchRoot, "--work-dir", $script:workDir, "--process-documents", "--document-stages", $selectedStages)
+    if (-not $skipTopicMismatchCheck.Checked) { $arguments += "--include-topic-mismatch" }
+    Start-Operation -Arguments $arguments -Operation "正在预检所选材料流程..."
 })
 
 $exportButton.Add_Click({
@@ -992,7 +1361,9 @@ $packageButton.Add_Click({
     if ($script:reviewStage -eq "documents") {
         $packageButton.Enabled = $false
         Append-Log ("确认处理，" + (Get-DocumentStageSummary $script:documentStages))
-        Start-Operation -Arguments @($script:batchRoot, "--work-dir", $script:workDir, "--apply-document-processing", "--document-stages", $script:documentStages) -Operation "正在处理所选材料流程..."
+        $arguments = @($script:batchRoot, "--work-dir", $script:workDir, "--apply-document-processing", "--document-stages", (Get-SelectedDocumentStages))
+        if (-not $skipTopicMismatchCheck.Checked) { $arguments += "--include-topic-mismatch" }
+        Start-Operation -Arguments $arguments -Operation "正在处理所选材料流程..."
         return
     }
     if ($script:reviewStage -eq "code-comments") {

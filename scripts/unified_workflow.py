@@ -18,6 +18,7 @@ import contextlib
 from pathlib import Path
 
 import archive_types
+from validation_isolation import ValidationIsolationError, activate_optimization_isolation, require_validation_path
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
@@ -265,11 +266,13 @@ def detect_format(batch_root: Path) -> str | None:
 
 def prepare_archive_workspace(archive: Path) -> Path:
     """Place a selected archive in its own same-named folder before processing."""
-    archive = archive.resolve()
+    archive = require_validation_path(archive, kind="material")
     # Recover archives created by the 3.3.0 folder-comparison bug:
     # <name>/<name>/<name>.rar -> <name>/<name>.rar.
     while archive.parent.name.casefold() == archive.stem.casefold() and archive.parent.parent.name.casefold() == archive.stem.casefold():
         target = archive.parent.parent / archive.name
+        require_validation_path(target, kind="material")
+        require_validation_path(archive.parent, kind="material")
         if target.exists():
             if hashlib.sha256(target.read_bytes()).digest() != hashlib.sha256(archive.read_bytes()).digest():
                 raise ValueError(f"同名文件夹中已有不同的压缩包：{target}")
@@ -283,8 +286,10 @@ def prepare_archive_workspace(archive: Path) -> Path:
     target_folder = archive.parent / archive.stem
     if archive.parent.name.casefold() == archive.stem.casefold():
         return archive
+    require_validation_path(target_folder, kind="material")
     target_folder.mkdir(exist_ok=True)
     target = target_folder / archive.name
+    require_validation_path(target, kind="material")
     if target.exists():
         if hashlib.sha256(target.read_bytes()).digest() != hashlib.sha256(archive.read_bytes()).digest():
             raise ValueError(f"同名文件夹中已有不同的压缩包：{target}")
@@ -381,23 +386,36 @@ def result_cell(issue: str, actions: str, final: str) -> str:
     )
 
 
-def text_difference(before: str, after: str) -> tuple[str, str]:
-    before_parts, after_parts = [], []
-    for tag, first_start, first_end, second_start, second_end in difflib.SequenceMatcher(None, before, after).get_opcodes():
-        left, right = html.escape(before[first_start:first_end]), html.escape(after[second_start:second_end])
-        before_parts.append(f"<mark>{left}</mark>" if tag in {"delete", "replace"} else left)
-        after_parts.append(f"<mark>{right}</mark>" if tag in {"insert", "replace"} else right)
-    return "".join(before_parts), "".join(after_parts)
-
-
 def changes_html(changes: list[dict], heading: str) -> str:
     if not changes:
         return ""
     rows = []
+    context_size = 24
     for change in changes:
-        before, after = text_difference(str(change.get("before", "")), str(change.get("after", "")))
-        rows.append(f'<div class="txt-change"><b>修改前</b><p>{before}</p><b>修改后</b><p>{after}</p></div>')
-    return f'<section class="txt-changes"><h4>{html.escape(heading)}</h4>' + "".join(rows) + "</section>"
+        before_text = str(change.get("before", ""))
+        after_text = str(change.get("after", ""))
+        for tag, before_start, before_end, after_start, after_end in difflib.SequenceMatcher(None, before_text, after_text).get_opcodes():
+            if tag == "equal":
+                continue
+
+            def snippet(value: str, start: int, end: int) -> str:
+                left = max(0, start - context_size)
+                right = min(len(value), end + context_size)
+                prefix = "…" if left else ""
+                suffix = "…" if right < len(value) else ""
+                changed = value[start:end]
+                if len(changed) > 120:
+                    omitted = len(changed) - 80
+                    changed = f"{changed[:40]}…{changed[-40:]}（修改段共 {len(value[start:end])} 字，中间省略 {omitted} 字）"
+                changed_html = f"<mark>{html.escape(changed)}</mark>" if changed else "<mark>（无）</mark>"
+                return prefix + html.escape(value[left:start]) + changed_html + html.escape(value[end:right]) + suffix
+
+            before = snippet(before_text, before_start, before_end)
+            after = snippet(after_text, after_start, after_end)
+            rows.append(f'<div class="txt-change"><b>修改前</b><p>{before}</p><b>修改后</b><p>{after}</p></div>')
+    if not rows:
+        return ""
+    return f'<section class="txt-changes"><h4>{html.escape(heading)}</h4><p>仅显示修改点及附近上下文，黄色部分为具体差异。</p>' + "".join(rows) + "</section>"
 
 
 def build_image_review(work: Path, input_target: Path, batch_root: Path, python: Path, args) -> tuple[Path, dict]:
@@ -499,6 +517,7 @@ def build_review(work: Path, input_target: Path, batch_root: Path, modified: Pat
             "parentheses_to_commas": "括号改为逗号",
             "quotes_removed": "删除双引号",
             "duplicate_punctuation_removed": "删除重复标点",
+            "leading_punctuation_removed": "清理开头异常标点",
             "ordinal_markers_removed": "删除序号或序数词",
         }
         repair_text = "；".join(f"{repair_labels.get(key, key)} {value} 处" for key, value in repairs.items()) or "无需修改"
@@ -833,19 +852,32 @@ def main() -> int:
     parser.add_argument("--clean-code-comments", action="store_true", help="独立预览代码DOCX中含汉字的真实注释，不进入其他流程")
     parser.add_argument("--apply-comment-cleanup", action="store_true", help="确认后执行代码注释清理并重新导出代码PDF")
     parser.add_argument("--skip-comment-preview", action="store_true", help="跳过代码注释清理预览（规则稳定后可用）")
-    parser.add_argument("--process-documents", action="store_true", help="预览说明书、代码、TXT占位统一处理流程")
-    parser.add_argument("--apply-document-processing", action="store_true", help="确认后按说明书、代码、TXT占位顺序执行统一处理")
-    parser.add_argument("--document-stages", default="manual,code,txt_placeholder",
-                        help="选择文档处理阶段，逗号分隔：manual,code,txt_placeholder；至少包含 manual 或 code")
+    parser.add_argument("--process-documents", action="store_true", help="预览说明书、代码、TXT统一处理流程")
+    parser.add_argument("--apply-document-processing", action="store_true", help="确认后按说明书、代码、TXT顺序执行统一处理")
+    parser.add_argument("--document-stages", default="all",
+                        help="可多选步骤：match_title_body,match_manual_ocr,match_manual_vision,match_code,match_txt,manual_body_years,manual_image_dates,manual_cover,manual_header,manual_page_numbers,manual_pdf,code_cleanup,code_pdf,txt_repair；也可用 all/manual/code/txt/checks 预设。")
+    parser.add_argument("--include-topic-mismatch", action="store_true",
+                        help="关闭默认的标题正文主题冲突跳过，继续处理这些项目")
     args = parser.parse_args()
 
-    input_target = args.batch_root.resolve()
+    try:
+        activate_optimization_isolation()
+        input_target = require_validation_path(args.batch_root, kind="material")
+        for explicit_material_path in (args.extracted, args.modified):
+            if explicit_material_path is not None:
+                require_validation_path(explicit_material_path, kind="material", same_run_as=input_target)
+        if args.work_dir is not None:
+            require_validation_path(args.work_dir, kind="workspace")
+        require_validation_path(default_work_dir(input_target), kind="workspace")
+    except ValidationIsolationError as exc:
+        return emit({"version": VERSION, "status": "ISOLATION_BLOCKED", "error": str(exc)}, 2)
     if not input_target.exists() and archive_types.is_archive_file(input_target):
         nested = input_target.parent / input_target.stem / input_target.name
         if nested.is_file():
-            input_target = nested.resolve()
+            input_target = require_validation_path(nested, kind="material", same_run_as=input_target)
     if args.clean_code_comments or args.apply_comment_cleanup or args.skip_comment_preview:
         work = (args.work_dir or default_work_dir(input_target) / "code-comment-cleanup").resolve()
+        require_validation_path(work, kind="workspace")
         progress = ProgressReporter(work)
         try:
             from code_comment_cleaner import run as run_code_comment_cleaner
@@ -864,6 +896,7 @@ def main() -> int:
             return emit({"version": VERSION, "status": "FAILED", "error": str(exc), "work_dir": str(work)}, 2)
     if args.process_documents or args.apply_document_processing:
         work = (args.work_dir or default_work_dir(input_target) / "document-processing").resolve()
+        require_validation_path(work, kind="workspace")
         progress = ProgressReporter(work)
         try:
             from combined_document_workflow import run as run_combined_document_workflow
@@ -871,6 +904,7 @@ def main() -> int:
                 input_target, work, HERE.parent,
                 apply=bool(args.apply_document_processing), progress=progress,
                 document_stages=args.document_stages,
+                skip_topic_mismatch=not args.include_topic_mismatch,
             )
             return emit(result, 0 if result.get("status") == "DOCUMENT_PROCESSING_OK" else 2)
         except Exception as exc:
@@ -899,6 +933,10 @@ def main() -> int:
             extracted = (args.extracted or batch_root / "解压版").resolve()
             modified = (args.modified or resolve_modified_directory(batch_root, input_target if input_target.is_dir() else None)).resolve()
     work = (args.work_dir or default_work_dir(input_target)).resolve()
+    batch_root = require_validation_path(batch_root, kind="material", same_run_as=input_target)
+    extracted = require_validation_path(extracted, kind="material", same_run_as=batch_root)
+    modified = require_validation_path(modified, kind="material", same_run_as=batch_root)
+    require_validation_path(work, kind="workspace")
     python = find_python(args.python)
     if python is None:
         return emit({"version": VERSION, "status": "MISSING_DEPENDENCIES", "required": ["Python 3.10+", "lxml", "Pillow", "pypdf"]}, 2)
