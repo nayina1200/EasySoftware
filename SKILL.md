@@ -7,6 +7,16 @@ description: Fully programmatic audit, DOCX-first repair, two-stage visual revie
 
 Use the single program entrypoint. Before modifying this program, read and follow `开发维护规则.md`.
 
+## 登录后下载订单资料
+
+在主窗口点击“下载订单资料”可先从登录中的订单系统取回一个已完成批次，再进入候选审查：
+
+- 由人工在独立 Chrome 窗口登录；程序只连接 `127.0.0.1` 上的调试端口，不主动查询、记录或导出账号、密码、Cookie、令牌或浏览器存储。Chrome 会在专用配置目录中按正常机制维护登录状态。
+- 输入订单名称/编号或批次号后，在助手中点击一次“搜索并下载”。助手先只读检查完整结果，只有唯一批次时才点击对应行“打包”一次；不会自动轮询或处理多个批次。
+- 按下载 ZIP 内的实际文件条目数（排除目录）保存为 `客户名_件数件.zip`，使用同名子目录并禁止覆盖已有文件。
+- “下载校验后自动开始候选审查处理”默认不勾选。勾选后，ZIP 校验完成会打开主窗口、预填路径并启动原有处理流程；流程在需要人工审核时停下。未勾选时保留下载结果，可稍后使用“交给候选审查”按钮打开并预填，不自动启动。
+- 不要自动点击搜索结果以外的管理操作，也不要把登录状态或订单信息写入日志。
+
 ## Entry command
 
 Resolve `SKILL_DIR` as the directory containing this `SKILL.md`, then run:

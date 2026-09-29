@@ -1,4 +1,4 @@
-﻿param([switch]$SelfTest)
+﻿param([switch]$SelfTest, [string]$InputPath = "", [switch]$AutoStart)
 
 $ErrorActionPreference = "Stop"
 $projectRoot = $PSScriptRoot
@@ -377,6 +377,16 @@ $refurbishButton.ForeColor = [System.Drawing.Color]::White
 $refurbishButton.FlatStyle = "Flat"
 $form.Controls.Add($refurbishButton)
 
+$orderDownloadButton = New-Object System.Windows.Forms.Button
+$orderDownloadButton.Text = "下载订单资料"
+$orderDownloadButton.Location = New-Object System.Drawing.Point(610, 591)
+$orderDownloadButton.Size = New-Object System.Drawing.Size(160, 38)
+$orderDownloadButton.Anchor = "Bottom,Right"
+$orderDownloadButton.BackColor = [System.Drawing.Color]::FromArgb(35, 109, 173)
+$orderDownloadButton.ForeColor = [System.Drawing.Color]::White
+$orderDownloadButton.FlatStyle = "Flat"
+$form.Controls.Add($orderDownloadButton)
+
 $codeCommentButton = New-Object System.Windows.Forms.Button
 $codeCommentButton.Text = "处理说明和代码"
 $codeCommentButton.Location = New-Object System.Drawing.Point(796, 135)
@@ -751,6 +761,7 @@ function Set-Busy([bool]$Busy, [string]$Status) {
     $archiveButton.Enabled = -not $Busy
     $folderButton.Enabled = -not $Busy
     $refurbishButton.Enabled = -not $Busy
+    $orderDownloadButton.Enabled = -not $Busy
     $codeCommentButton.Enabled = -not $Busy
     $stageChecksEnabled = (-not $Busy) -and ($script:reviewStage -ne "documents")
     $workflowOptionsButton.Enabled = $stageChecksEnabled
@@ -1348,6 +1359,15 @@ $refurbishButton.Add_Click({
     Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $helper) -WindowStyle Normal
 })
 
+$orderDownloadButton.Add_Click({
+    $helper = Join-Path $projectRoot "scripts\order_material_downloader_gui.ps1"
+    if (-not (Test-Path -LiteralPath $helper)) {
+        [System.Windows.Forms.MessageBox]::Show("订单资料下载助手文件不存在：$helper", "EasySoftware", "OK", "Error") | Out-Null
+        return
+    }
+    Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $helper) -WindowStyle Normal
+})
+
 $recheckButton.Add_Click({
     if ($script:reviewStage -ne "final" -or [string]::IsNullOrWhiteSpace($script:batchRoot)) { return }
     $script:workDir = Get-MainWorkDir
@@ -1401,5 +1421,49 @@ $form.Add_FormClosing({
         if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { $_.Cancel = $true }
     }
 })
+
+if (-not [string]::IsNullOrWhiteSpace($InputPath)) {
+    try {
+        $resolvedInputPath = [System.IO.Path]::GetFullPath($InputPath)
+        if (-not (Test-Path -LiteralPath $resolvedInputPath)) {
+            [System.Windows.Forms.MessageBox]::Show("传入的订单资料不存在：$resolvedInputPath", "EasySoftware", "OK", "Error") | Out-Null
+        }
+        else {
+            $inputBox.Text = $resolvedInputPath
+            Update-ExportAvailability
+            if ($AutoStart) {
+                if (Test-ArchivePath $resolvedInputPath) {
+                    $script:autoStartAfterShown = $true
+                    $statusLabel.Text = "订单资料已载入；窗口显示后将自动开始处理。"
+                }
+                else {
+                    $statusLabel.Text = "路径已载入；自动处理仅支持有效的压缩包，请检查后手动开始。"
+                    [System.Windows.Forms.MessageBox]::Show("自动处理未启动：输入路径不是有效的压缩包文件。", "EasySoftware", "OK", "Warning") | Out-Null
+                }
+            }
+            else {
+                $statusLabel.Text = "已载入订单资料；检查路径后点击开始处理。"
+            }
+        }
+    }
+    catch {
+        $script:autoStartAfterShown = $false
+        [System.Windows.Forms.MessageBox]::Show("订单资料路径无效：$($_.Exception.Message)", "EasySoftware", "OK", "Error") | Out-Null
+    }
+}
+elseif ($AutoStart) {
+    [System.Windows.Forms.MessageBox]::Show("未提供订单资料路径，已取消自动处理。", "EasySoftware", "OK", "Warning") | Out-Null
+}
+
+$form.Add_Shown({
+    if (-not $script:autoStartAfterShown) { return }
+    $script:autoStartAfterShown = $false
+    $form.BeginInvoke([System.Windows.Forms.MethodInvoker]{
+        $candidatePath = $inputBox.Text.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($candidatePath) -and (Test-ArchivePath $candidatePath)) {
+            $startButton.PerformClick()
+        }
+    }) | Out-Null
+}.GetNewClosure())
 
 [void]$form.ShowDialog()
