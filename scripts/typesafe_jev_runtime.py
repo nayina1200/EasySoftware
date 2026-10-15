@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import dataclasses
 import email.utils
+import errno
 import hashlib
 import json
 import math
 import os
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -46,12 +49,14 @@ class RuntimeStatus:
 
 
 class _RuntimeFailure(RuntimeError):
-    def __init__(self, code: str, reason: str, *, attempts: int = 0, elapsed_ms: int = 0):
+    def __init__(self, code: str, reason: str, *, attempts: int = 0, elapsed_ms: int = 0,
+                 transport_details: dict[str, Any] | None = None):
         super().__init__(reason)
         self.code = code
         self.reason = reason
         self.attempts = attempts
         self.elapsed_ms = elapsed_ms
+        self.transport_details = transport_details or {}
 
 
 def _number(value: Any) -> float | None:
@@ -93,6 +98,10 @@ class TypeSafeJevRuntime:
         self.max_retries = retries if isinstance(retries, int) and not isinstance(retries, bool) and 0 <= retries <= _MAX_RETRIES else _MAX_RETRIES
         retry_after = _number(provider.get("max_retry_after_seconds", _MAX_RETRY_AFTER_SECONDS))
         self.max_retry_after_seconds = retry_after if retry_after is not None and 0 <= retry_after <= _MAX_RETRY_AFTER_SECONDS else _MAX_RETRY_AFTER_SECONDS
+        deadline = _number(provider.get("request_deadline_seconds"))
+        self.request_deadline_seconds = deadline if deadline is not None and 0.1 <= deadline <= 180 else min(
+            60.0, self.request_timeout_seconds * 2 + self.max_retry_after_seconds
+        )
         max_chars = provider.get("max_request_characters", _DEFAULT_MAX_REQUEST_CHARACTERS)
         self.max_request_characters = max_chars if isinstance(max_chars, int) and not isinstance(max_chars, bool) and 1000 <= max_chars <= 32_000 else _DEFAULT_MAX_REQUEST_CHARACTERS
         self.policy_version = str(config.get("policy_version", POLICY_VERSION))
@@ -172,11 +181,18 @@ class TypeSafeJevRuntime:
             method="POST",
         )
         started = time.monotonic()
+        deadline = started + self.request_deadline_seconds
         attempts = 0
         for retry_index in range(self.max_retries + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _RuntimeFailure("REQUEST_TIMEOUT", "TypeSafe 请求已达到本材料的总时间预算",
+                                      attempts=attempts, elapsed_ms=int((time.monotonic() - started) * 1000))
             attempts += 1
+            request_phase = "open_https_response"
             try:
-                with urllib.request.urlopen(request, timeout=self.request_timeout_seconds) as response:
+                with urllib.request.urlopen(request, timeout=min(self.request_timeout_seconds, remaining)) as response:
+                    request_phase = "read_https_response"
                     value = json.loads(response.read().decode("utf-8"))
                 if not isinstance(value, dict):
                     raise _RuntimeFailure("MODEL_INTERFACE_ERROR", "TypeSafe JSON 顶层不是对象", attempts=attempts)
@@ -184,7 +200,7 @@ class TypeSafeJevRuntime:
             except urllib.error.HTTPError as exc:
                 elapsed_ms = int((time.monotonic() - started) * 1000)
                 if exc.code in {429, 529} and retry_index < self.max_retries:
-                    delay = self._retry_delay(exc, retry_index)
+                    delay = min(self._retry_delay(exc, retry_index), max(0.0, deadline - time.monotonic()))
                     if delay:
                         time.sleep(delay)
                     continue
@@ -206,9 +222,40 @@ class TypeSafeJevRuntime:
                 raise _RuntimeFailure(code, reason, attempts=attempts, elapsed_ms=elapsed_ms) from None
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 elapsed_ms = int((time.monotonic() - started) * 1000)
-                code = "REQUEST_TIMEOUT" if isinstance(exc, TimeoutError) else "MODEL_UNAVAILABLE"
+                cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                timed_out = isinstance(cause, (TimeoutError, socket.timeout))
+                missing_path = isinstance(cause, FileNotFoundError) and bool(cause.filename)
+                certificate_error = isinstance(cause, ssl.SSLCertVerificationError)
+                transient = (
+                    timed_out or isinstance(cause, (ConnectionError, socket.gaierror))
+                    or isinstance(cause, OSError) and cause.errno in {
+                        errno.ENOENT, errno.ECONNRESET, errno.ECONNREFUSED, errno.ECONNABORTED,
+                        errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH,
+                    }
+                ) and not (missing_path or certificate_error)
+                if transient and retry_index < self.max_retries and time.monotonic() < deadline:
+                    delay = min(0.5 * (2 ** retry_index), self.max_retry_after_seconds,
+                                max(0.0, deadline - time.monotonic()))
+                    if delay:
+                        time.sleep(delay)
+                    continue
+                code = "REQUEST_TIMEOUT" if timed_out else "MODEL_UNAVAILABLE"
+                details = {
+                    "exception_type": type(exc).__name__, "reason_type": type(cause).__name__,
+                    "phase": request_phase,
+                    "errno": getattr(cause, "errno", None), "winerror": getattr(cause, "winerror", None),
+                    "missing_file": self._redact(str(cause.filename)) if missing_path else None,
+                    "certificate_error": certificate_error, "retryable": transient,
+                }
                 reason = self._redact(f"TypeSafe 请求失败：{type(exc).__name__}: {exc}")
-                raise _RuntimeFailure(code, reason, attempts=attempts, elapsed_ms=elapsed_ms) from None
+                if missing_path:
+                    reason += "；本机网络/证书配置引用的文件不存在，请核对缺失路径"
+                elif certificate_error:
+                    reason += "；HTTPS 证书校验失败，请检查证书和代理配置"
+                else:
+                    reason += f"；已尝试 {attempts} 次，连接仍未恢复"
+                raise _RuntimeFailure(code, reason, attempts=attempts, elapsed_ms=elapsed_ms,
+                                      transport_details=details) from None
             except (UnicodeError, json.JSONDecodeError) as exc:
                 elapsed_ms = int((time.monotonic() - started) * 1000)
                 raise _RuntimeFailure("MODEL_INTERFACE_ERROR", f"TypeSafe 响应不是有效 JSON：{type(exc).__name__}",
@@ -309,6 +356,7 @@ class TypeSafeJevRuntime:
                 "output_tokens": usage_value.get("output_tokens") if isinstance(usage_value, dict) else None,
             }
             elapsed_ms = int((time.monotonic() - started) * 1000)
+            self._status = RuntimeStatus("ready", model_id=self.model_id)
             return {
                 "status": status,
                 "judgment_source": "typesafe_jev_score",
@@ -346,8 +394,10 @@ class TypeSafeJevRuntime:
                 "status": "NOT_EVALUATED", "reason": exc.reason, "failure": exc.code,
                 "diagnostic_code": exc.code, "core_claims": [], "evidence": [],
                 "diagnostics": {"model_id": self.model_id, "generation_requests": exc.attempts or attempts,
-                                "retry_count": retries, "elapsed_ms": exc.elapsed_ms or int((time.monotonic() - started) * 1000),
-                                "request_elapsed_ms": request_elapsed},
+                                "retry_count": max(0, exc.attempts - 1), "elapsed_ms": exc.elapsed_ms or int((time.monotonic() - started) * 1000),
+                                "request_elapsed_ms": exc.elapsed_ms or request_elapsed,
+                                "transport_error": exc.transport_details,
+                                "request_deadline_seconds": self.request_deadline_seconds},
             }
         except (KeyError, TypeError, ValueError) as exc:
             self._status = RuntimeStatus("degraded", "MODEL_INTERFACE_ERROR", str(exc), self.model_id)

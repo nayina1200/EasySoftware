@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import subprocess
@@ -7,13 +9,29 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+import order_download_core
 from order_download_core import finalize_download, safe_component, validate_zip
 
 
 class OrderDownloadCoreTests(unittest.TestCase):
+    def test_cli_success_receipt_is_ascii_safe_for_powershell(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["order_download_core.py", "finalize", "--source", "download.zip", "--destination", "deliver", "--customer", "客户"]),
+            mock.patch.object(Path, "resolve", autospec=True, side_effect=lambda path, strict=False: path),
+            mock.patch.object(order_download_core, "validate_zip", return_value=5),
+            mock.patch.object(order_download_core, "_copy_validated_zip", return_value=Path("D:/订单/客户_5件/客户_5件.zip")),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(order_download_core.main(), 0)
+        receipt = output.getvalue()
+        receipt.encode("ascii")
+        self.assertEqual(json.loads(receipt)["count"], 5)
+
     def make_zip(self, path: Path, content: bytes = b"material") -> Path:
         with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("order/document.txt", content)
@@ -61,6 +79,12 @@ class OrderDownloadCoreTests(unittest.TestCase):
             output = finalize_download(source, root / "deliver", "客户")
             self.assertEqual(output.name, "客户_2件.zip")
 
+    def test_validate_zip_accepts_single_member_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "single.zip"
+            self.make_zip(source)
+            self.assertEqual(validate_zip(source), 1)
+
     def test_finalize_rejects_empty_archive_and_invalid_zip(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -101,10 +125,62 @@ class OrderDownloadCoreTests(unittest.TestCase):
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
+            completed.stdout.encode("ascii")
             result = json.loads(completed.stdout)
             self.assertEqual(result["status"], "OK")
             self.assertEqual(result["count"], 1)
             self.assertEqual(result["filename"], "客户_1件.zip")
+
+    def test_cli_marks_invalid_zip_as_validation_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "broken.zip"
+            source.write_bytes(b"not a zip")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "order_download_core.py"),
+                    "finalize",
+                    "--source", str(source),
+                    "--destination", str(root / "deliver"),
+                    "--customer", "客户",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["stage"], "validation")
+
+    def test_cli_marks_archive_publish_failure_separately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.make_zip(root / "download.zip")
+            existing = root / "deliver" / "客户_1件" / "客户_1件.zip"
+            existing.parent.mkdir(parents=True)
+            existing.write_bytes(b"keep me")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "order_download_core.py"),
+                    "finalize",
+                    "--source", str(source),
+                    "--destination", str(root / "deliver"),
+                    "--customer", "客户",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["stage"], "save")
+            self.assertEqual(existing.read_bytes(), b"keep me")
 
 
 if __name__ == "__main__":

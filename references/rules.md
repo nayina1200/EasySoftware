@@ -114,3 +114,9 @@
 - Omit all normal-by-file entries.
 - Treat the consolidated HTML—containing processed-description-PDF pages 1–2, code edges, interface/login evidence, and programmatic errors—as the sole pre-packaging approval gate.
 - After layout confirmation, delete confirmed delivery-temporary files (`*.tmp`, `*.temp`, and Word `~$*` files) from the modified tree, then create and integrity-test one archive inside `修改版`, named after the batch root. Include only the user-approved processed program directories and exclude backup/hidden directories. Preserve the incoming format (ZIP to ZIP, RAR to RAR); remove a same-name archive of the other format only after the selected archive passes, then report its path, file count, removed temporary files, and SHA-256.
+
+
+## 说明书 AI 空心线
+
+- 说明书页面整理可单独检查 DOCX 中横向细长的空心矩形线条。
+- 命中时在报告中单列说明书名称，并提示“需要将该说明书（说明书名称）发给其他人”。该项只检测并报告，不修改材料；未选择和未发现应分别说明。

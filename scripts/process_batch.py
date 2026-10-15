@@ -39,7 +39,7 @@ import page_label_audit
 from validation_isolation import activate_optimization_isolation, require_validation_path
 
 
-VERSION = "3.4.26"
+VERSION = "3.4.28"
 CODE_WORD_TIMEOUT_SECONDS = 20
 CODE_FALLBACK_TIMEOUT_SECONDS = 30
 WORD_AUTOMATION_MUTEX = "Local\\EasySoftware.WordAutomation.v1"

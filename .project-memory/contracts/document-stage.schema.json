@@ -2,7 +2,7 @@
   "schema_version": 1,
   "stage_order": ["title_body_qualification", "manual_content", "manual_page_layout_and_pdf", "code_and_pdf", "txt", "unified_report"],
   "selectable_workflow_options": [
-    "match_title_body", "match_manual_ocr", "match_manual_vision", "match_code", "match_txt",
+    "match_title_body", "match_software_name", "match_manual_ocr", "match_manual_vision", "match_code", "match_txt",
     "manual_body_years", "manual_image_dates", "manual_cover", "manual_header", "manual_page_numbers", "manual_pdf",
     "code_cleanup", "code_pdf", "txt_repair"
   ],
@@ -26,21 +26,27 @@
     "cover_name_source": "unique_txt_stem_else_project_folder",
     "cover_always_runs_word_audit": true,
     "cover_requires_pdf_export_and_full_book_scan": true,
+    "cover_word_rules_version": "3.4.28",
+    "cover_block_excludes_tables_and_toc": true,
+    "cover_leading_noncover_table_policy": "fail_with_manual_review_before_range_zero_insert",
+    "cover_version_removal_on_protected_table": "manual_review_without_cell_write",
+    "cover_typography_requires_contiguous_same_page_title_and_label": true,
+    "blank_page_audit_reuse": "inside_repair_only_while_layout_unchanged; refresh_after_break_or_section_mutation_and_terminal_compaction_or_restore; independent_final_word_and_pdf_audits_preserved",
     "blank_page_audit_excludes_headers_footers": true,
     "cover_targeted_retry_limit": 1,
     "cover_failure_restores_docx_pdf_pair": true,
     "cover_recovery_journal_persisted_with_output": true,
     "cover_startup_recovers_interrupted_processed_siblings": true,
-    "cover_report_fields": ["name_source", "name_conflicts", "page_audit", "pdf_audit", "confirmed_blank_pages", "broken_bookmark_fields_unlinked", "attempts", "snapshot_restored", "failures"],
+    "cover_report_fields": ["name_source", "name_conflicts", "page_audit", "pdf_audit", "confirmed_blank_pages", "broken_bookmark_fields_unlinked", "attempts", "snapshot_restored", "failures", "cover_typography_workload", "word_blank_page_audit_count", "cover_label_layout_failed"],
     "pdf_audit_fields": ["bookmark_errors"],
     "pdf_bookmark_error_patterns": ["错误!未定义书签。", "Error! Bookmark not defined."],
     "pdf_bookmark_errors_fail_final_qa_and_restore_snapshot": true,
     "pdf_export": true
   },
   "qualification": {
-    "mode": {"allowed": ["off", "shadow", "enforced"], "default": "shadow"},
-    "enforce_default": false,
-    "skip_mismatch_requested_default": false,
+    "mode": {"allowed": ["off", "shadow", "enforced"], "default": "enforced"},
+    "enforce_default": true,
+    "skip_mismatch_requested_default": true,
     "not_evaluated_action": {"allowed": ["hold_changes", "continue_with_review"], "default": "hold_changes"},
     "title_source": "unique_paired_txt_filename_stem_only",
     "pairing": "strict_directory_local_one_to_one_txt_and_manual_docx; missing_or_ambiguous_is_NOT_EVALUATED",
@@ -55,12 +61,17 @@
     "cache_failures": "do_not_cache_NOT_EVALUATED_service_or_input_failures",
     "legacy_off_mode_similarity": "optional_uncalibrated_legacy_diagnostic_only",
     "cache_write_failure": "report_warning_and_continue_with_current_result",
-    "skip_scope": "exact_associated_files_only",
-    "retain_original_in_output": true,
+    "output_selection": "MATCH_only; MISMATCH and NOT_EVALUATED remain in the original input and are not copied",
+    "skip_scope": "exact_associated_files_in_shared_directories; copy_complete_isolated_project_directories_only_when_every_scanned_project_beneath_them_is_MATCH",
+    "retain_original_in_output": false,
+    "output_counts": {
+      "qualified": "number_of_MATCH_projects_copied_for_processing",
+      "total": "number_of_title_body_project_records_before_filtering_including_MISMATCH_and_NOT_EVALUATED"
+    },
     "read_only_scan_when_manual_stage_unselected": true,
     "report_fields": ["mode", "provider", "model_id", "prompt_version", "policy_version", "projects", "semantic_status", "classification_method", "diagnostic_code", "failure_count", "action", "associated_files", "score_raw", "score_0_100", "score_probabilities", "confidence", "decision_threshold", "threshold_calibrated", "usage", "elapsed_ms", "request_characters", "cache_enabled", "cache_failure_count", "cache_hit_count", "model_request_count"],
-    "shadow_never_gates": true,
-    "enforced_mismatch_skip_requires_explicit_request": true,
+    "match_only_output_requires_valid_match": true,
+    "include_topic_mismatch_flag_overrides_match_only_output": true,
     "mismatch_clipboard": {
       "trigger": "apply_after_title_body_qualification_before_remaining_stages",
       "owner_window": "valid_temporary_hidden_window",
@@ -73,6 +84,24 @@
     },
     "thirteen_item_user_fixture": "tests/fixtures/title_body/beijing_qinyun_20260926_labels.json",
     "enforced_release_requires_independent_heldout_acceptance": true
+  },
+  "name_consistency": {
+    "rule_version": "software-name-consistency-v2",
+    "warning_fields": ["findings", "warning_count"],
+    "pending_fields": ["review_findings", "review_count"],
+    "pending_status": "PENDING_REVIEW",
+    "pending_display": "collapsed_details_not_counted_as_warning",
+    "decision_scope": "explicit_product_identity_evidence_only",
+    "additional_model_requests": 0,
+    "affects_material_selection": false
+  },
+  "ocr_company_keyword_alert": {
+    "trigger": "OCR sample text contains literal 公司",
+    "input": "existing sampled image OCR output",
+    "additional_ocr_or_model_calls": 0,
+    "display": "red report warning with project, image, matched OCR lines",
+    "selection_effect": "review_only_no_automatic_skip_or_write",
+    "coverage": "sampled_images_only"
   },
   "vision": {
     "protocol": "openai_compatible_chat_completions",

@@ -204,83 +204,80 @@ if (Test-DuplicateCoverBlock $doc '示例软件') { throw 'An exact title after 
         self.assertIn("$unresolvedBlankPages.Count -gt 0", script)
         self.assertIn('全书仍存在无法安全修复的空白页:', script)
 
-    def test_blank_page_removes_its_own_page_break_paragraph_only(self):
-        repair_function = extract_function("Repair-TerminalBlankParagraph") + "\n" + extract_function("Repair-WordBlankPages")
+    def test_unclassified_blank_page_break_stays_unresolved(self):
+        repair_function = extract_function("Repair-WordBlankPages")
         harness = r'''
 $wdActiveEndPageNumber = 3
 $wdWithInTable = 12
-$script:EmptyPageNumbers = @(2, 3, 4, 5)
-$script:ProtectBreak = $false
+$script:AuditCalls = 0
 $script:DeletedStarts = @()
-$script:ParagraphRanges = @()
-$script:BreakCharacterPages = @{}
 function Get-WordPageAudit($Document) {
-    $pages = @([pscustomobject]@{ page = 1; has_body_content = $true })
-    for ($page = 2; $page -le 6; $page++) {
-        $pages += [pscustomobject]@{ page = $page; has_body_content = ($page -notin $script:EmptyPageNumbers) }
-    }
-    return $pages
+    $script:AuditCalls++
+    return @(
+        [pscustomobject]@{ page = 1; has_body_content = $true; visible_text = @('Page 1 body'); page_breaks = 0; section_breaks = 0; page_break_before = 0; section_starts = @(); tables = 0; inline_images = 0; floating_shapes = 0 },
+        [pscustomobject]@{ page = 2; has_body_content = $false; visible_text = @(); page_breaks = 1; section_breaks = 0; page_break_before = 0; section_starts = @(); tables = 0; inline_images = 0; floating_shapes = 0 }
+    )
 }
-function Test-RangeHasProtectedContent($Document, $Range, [bool]$CheckParagraphBreakBefore = $false, [bool]$AllowPageBreak = $false, [bool]$AllowSectionBreak = $false) { return ($script:ProtectBreak -and [int]$Range.Start -eq 200) }
-function New-MockRange([int]$start, [int]$end, [string]$text, [int]$page, [int]$breakPage = $page) {
-    $range = [pscustomobject]@{ Start = $start; End = $end; Text = $text; Page = $page; ParagraphFormat = [pscustomobject]@{ PageBreakBefore = $false } }
-    $breakOffset = $text.IndexOf([char]12)
-    if ($breakOffset -ge 0) { $script:BreakCharacterPages[$start + $breakOffset] = $breakPage }
-    $range | Add-Member ScriptMethod Information { param($kind) if ($kind -eq 12) { return 0 }; return $this.Page }
-    $range | Add-Member ScriptMethod Delete {
-        $script:DeletedStarts += [int]$this.Start
-        $pageToRemove = if ([int]$this.Page -eq 1) { 2 } else { [int]$this.Page }
-        $script:EmptyPageNumbers = @($script:EmptyPageNumbers | Where-Object { $_ -ne $pageToRemove })
-    }
-    return $range
-}
-$previousBoundary = New-MockRange 100 108 "第9页正文`f`r" 1
-$blankPageBreak = New-MockRange 200 203 " `f`r" 2
-if ($blankPageBreak.Text -notmatch '^[ \t]*\x0C[ \t]*\r?$' -or $blankPageBreak.Information(3) -ne 2) { throw "Mock blank paragraph mismatch: length=$($blankPageBreak.Text.Length), page=$($blankPageBreak.Information(3)), codes=$(([int[]][char[]]$blankPageBreak.Text) -join ',')" }
-$script:ParagraphRanges = @($previousBoundary, $blankPageBreak)
-foreach ($page in 3..5) { $script:ParagraphRanges += (New-MockRange ($page * 100) (($page * 100) + 2) "`f`r" $page) }
-$paragraphs = [pscustomobject]@{ Count = $script:ParagraphRanges.Count }
-$paragraphs | Add-Member ScriptMethod Item { param($index) return [pscustomobject]@{ Range = $script:ParagraphRanges[$index - 1] } }
-$doc = [pscustomobject]@{ Sections = @(); Paragraphs = $paragraphs; Content = [pscustomobject]@{ End = 300 } }
+$paragraphRange = [pscustomobject]@{ Start = 200; End = 202; Text = "`f`r"; Page = 2; ParagraphFormat = [pscustomobject]@{ PageBreakBefore = $false } }
+$paragraphRange | Add-Member ScriptMethod Information { param($kind) if ($kind -eq 12) { return $false }; return $this.Page }
+$paragraphRange | Add-Member ScriptMethod Delete { $script:DeletedStarts += [int]$this.Start }
+$paragraph = [pscustomobject]@{ Range = $paragraphRange }
+$paragraphs = [pscustomobject]@{ Count = 1 }
+$paragraphs | Add-Member ScriptMethod Item { param($index) return $paragraph }
+$doc = [pscustomobject]@{ Sections = @(); Paragraphs = $paragraphs; Content = [pscustomobject]@{ End = 300 }; InlineShapes = @(); Shapes = @(); Tables = @() }
+$doc | Add-Member ScriptMethod Range { throw 'An unclassified blank page must not be edited' }
+$doc | Add-Member ScriptMethod Repaginate { }
+function Test-RangeHasProtectedContent($Document, $Range, [bool]$CheckParagraphBreakBefore = $false, [bool]$AllowPageBreak = $false, [bool]$AllowSectionBreak = $false) { return $false }
+function Repair-TerminalBlankParagraph($Document, $Audit) { return [pscustomobject]@{ Changed = $false; Change = $null; Diagnostic = $null } }
+$result = Repair-WordBlankPages $doc
+if ($result.Changed -or $script:DeletedStarts.Count -ne 0) { throw 'An unclassified blank-page break was deleted' }
+if ($result.UnresolvedPages.Count -ne 1 -or $result.UnresolvedPages[0].page -ne 2) { throw 'An unclassified blank page was not reported as unresolved' }
+'''
+        run_powershell(repair_function + "\r\n" + harness)
+
+    def test_duplicate_page_break_at_next_page_section_start_is_removed(self):
+        repair_function = extract_function("Repair-WordBlankPages")
+        harness = r'''
+$wdActiveEndPageNumber = 3
+$wdWithInTable = 12
+$script:DeletedStarts = @()
+$script:AuditCalls = 0
+$script:ParagraphRange = [pscustomobject]@{ Start = 17; End = 19; Text = "`f`r"; Page = 2; ParagraphFormat = [pscustomobject]@{ PageBreakBefore = $false } }
+$script:ParagraphRange | Add-Member ScriptMethod Information { param($kind) if ($kind -eq 12) { return $false }; return $this.Page }
+$paragraph = [pscustomobject]@{ Range = $script:ParagraphRange }
+$paragraphs = [pscustomobject]@{ Count = 1 }
+$paragraphs | Add-Member ScriptMethod Item { param($index) return $paragraph }
+$section = [pscustomobject]@{ Range = [pscustomobject]@{ Start = 17; End = 100 }; PageSetup = [pscustomobject]@{ SectionStart = 2 } }
+$doc = [pscustomobject]@{ Sections = @($section); Paragraphs = $paragraphs; Content = [pscustomobject]@{ End = 100 }; InlineShapes = @(); Shapes = @(); Tables = @() }
 $doc | Add-Member ScriptMethod Range {
     param($start, $end)
-    $range = [pscustomobject]@{ Start = [int]$start; End = [int]$end; Page = [int]$script:BreakCharacterPages[[int]$start] }
-    $range | Add-Member ScriptMethod Information { param($kind) if ($kind -eq 12) { return 0 }; return $this.Page }
+    $range = [pscustomobject]@{ Start = [int]$start; End = [int]$end; Text = if ([int]$end -eq ([int]$start + 1)) { [string][char]12 } else { '' }; Page = 2 }
+    $range | Add-Member ScriptMethod Information { param($kind) if ($kind -eq 12) { return $false }; return $this.Page }
     $range | Add-Member ScriptMethod Delete {
         $script:DeletedStarts += [int]$this.Start
-        $pageToRemove = if ([int]$this.Page -eq 1) { 2 } else { [int]$this.Page }
-        $script:EmptyPageNumbers = @($script:EmptyPageNumbers | Where-Object { $_ -ne $pageToRemove })
+        $script:ParagraphRange.Text = [string][char]13
+        $script:ParagraphRange.End = 18
     }
     return $range
 }
 $doc | Add-Member ScriptMethod Repaginate { }
-$result = Repair-WordBlankPages $doc
-if (-not $result.Changed -or $script:EmptyPageNumbers.Count -gt 0) { throw 'All blank pages were not repaired and repaginated' }
-if ($script:DeletedStarts.Count -ne 4 -or ($script:DeletedStarts -join ',') -ne '201,300,400,500') {
-    throw "Expected only the four blank-page breaks to be deleted; removed starts: $($script:DeletedStarts -join ',')"
+function Get-WordPageAudit($Document) {
+    $script:AuditCalls++
+    $repaired = $script:DeletedStarts.Count -gt 0
+    return @(
+        [pscustomobject]@{ page = 1; has_body_content = $true; visible_text = @('Page 1 body'); page_breaks = 0; section_breaks = 0; page_break_before = 0; section_starts = @(); tables = 0; inline_images = 0; floating_shapes = 0 },
+        [pscustomobject]@{ page = 2; has_body_content = $repaired; visible_text = $(if ($repaired) { @('Section body') } else { @() }); page_breaks = $(if ($repaired) { 0 } else { 1 }); section_breaks = 1; page_break_before = 0; section_starts = @('new_page'); tables = 0; inline_images = 0; floating_shapes = 0 }
+    )
 }
-if ($previousBoundary.Text -notmatch '\x0C') { throw 'The normal page boundary on the preceding body page was changed' }
-if ($result.Changes[0].cause -ne '显式分页符') { throw 'Repair cause was not reported as an explicit page break' }
-if ($result.UnresolvedPages.Count -ne 0) { throw 'Repaired blank pages were reported as unresolved' }
-$script:EmptyPageNumbers = @(2)
-$script:DeletedStarts = @()
-$script:ProtectBreak = $true
-$blocked = Repair-WordBlankPages $doc
-if ($blocked.Changed -or $script:DeletedStarts.Count -gt 0) { throw 'Protected blank-page content was deleted' }
-if ($blocked.UnresolvedPages.Count -ne 1 -or $blocked.UnresolvedPages[0].page -ne 2) { throw 'Protected blank page was not reported as unresolved' }
-$script:EmptyPageNumbers = @(2)
-$script:DeletedStarts = @()
-$script:ProtectBreak = $false
-$priorPageBreak = New-MockRange 600 602 "`f`r" 1 1
-$script:ParagraphRanges = @($priorPageBreak)
-$paragraphs = [pscustomobject]@{ Count = $script:ParagraphRanges.Count }
-$paragraphs | Add-Member ScriptMethod Item { param($index) return [pscustomobject]@{ Range = $script:ParagraphRanges[$index - 1] } }
-$doc.Paragraphs = $paragraphs
-$priorBoundaryFix = Repair-WordBlankPages $doc
-if (-not $priorBoundaryFix.Changed -or $script:DeletedStarts.Count -ne 1 -or $script:DeletedStarts[0] -ne 600) { throw 'A standalone break mapped to the preceding page did not repair the adjacent confirmed blank page' }
-if ($priorBoundaryFix.Changes[0].cause -ne '显式分页符（空白页前边界）') { throw 'The preceding-page boundary repair was not identified in the report' }
+function Test-RangeHasProtectedContent($Document, $Range, [bool]$CheckParagraphBreakBefore = $false, [bool]$AllowPageBreak = $false, [bool]$AllowSectionBreak = $false) { return $false }
+function Repair-TerminalBlankParagraph($Document, $Audit) { return [pscustomobject]@{ Changed = $false; Change = $null; Diagnostic = $null } }
+$result = Repair-WordBlankPages $doc
+if (-not $result.Changed -or $script:DeletedStarts.Count -ne 1 -or $script:DeletedStarts[0] -ne 17) { throw "The duplicate page break at the section start was not removed exactly once: changed=$($result.Changed), deleted=$($script:DeletedStarts -join ','), unresolved=$($result.UnresolvedPages | ConvertTo-Json -Compress), audits=$($script:AuditCalls)" }
+if ([string]$script:ParagraphRange.Text -cne [string][char]13 -or $section.Range.Start -ne 17 -or $section.PageSetup.SectionStart -ne 2) { throw 'The section paragraph mark or next-page section boundary was not preserved' }
+if ($result.Changes[0].cause -ne '下一页分节起始页重复显式分页符' -or $result.UnresolvedPages.Count -ne 0) { throw 'The targeted boundary repair was not reported as resolved' }
+if ($script:AuditCalls -ne 2) { throw 'The repair did not refresh the page audit after deleting the form-feed' }
 '''
-        run_powershell(repair_function + "\n" + harness)
+        run_powershell(repair_function + "\r\n" + harness)
 
     def test_word_page_audit_returns_ascending_pages_and_marks_terminal_blank(self):
         functions = extract_function("Clean-Text") + "\n" + extract_function("Get-WordPageAudit")

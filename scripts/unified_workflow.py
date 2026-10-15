@@ -97,6 +97,7 @@ class ProgressReporter:
         self.started = time.perf_counter()
         self.completed = 0
         self.failures = 0
+        self._progress_warning_reported = False
 
     def set_total(self, total: int) -> None:
         """Publish a stable denominator after a workflow prepares its task list."""
@@ -133,7 +134,12 @@ class ProgressReporter:
         }
         if error:
             row["error"] = error
-        atomic_json(self.path, row)
+        try:
+            atomic_json(self.path, row)
+        except PermissionError as exc:
+            if not self._progress_warning_reported:
+                print(f"无法更新界面进度文件，材料处理继续：{exc}", file=sys.stderr)
+                self._progress_warning_reported = True
 
 
 def emit(value: dict, code: int = 0) -> int:
@@ -152,6 +158,12 @@ def atomic_json(path: Path, value) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    for delay in (0.02, 0.05, 0.1, 0.2, 0.4):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            time.sleep(delay)
     os.replace(temporary, path)
 
 
@@ -418,8 +430,57 @@ def changes_html(changes: list[dict], heading: str) -> str:
     return f'<section class="txt-changes"><h4>{html.escape(heading)}</h4><p>仅显示修改点及附近上下文，黄色部分为具体差异。</p>' + "".join(rows) + "</section>"
 
 
-def build_image_review(work: Path, input_target: Path, batch_root: Path, python: Path, args) -> tuple[Path, dict]:
+def preview_clean_report(extracted: Path, work: Path, python: Path) -> dict:
+    """Run the read-only title/body gate early so its report is available on the first review page."""
+    qualification_work = work / "title-body-qualification-preview"
+    result = run_json([
+        str(python), str(Path(__file__).resolve()), str(extracted),
+        "--work-dir", str(qualification_work), "--process-documents",
+        "--document-stages", "match_title_body",
+    ])
+    report = (
+        load_json(qualification_work / "combined_document_preview.json", {}) or {}
+        if result.get("status") == "NEEDS_DOCUMENT_PROCESSING_REVIEW" else {}
+    )
+    qualification = report.get("qualification", {})
+    if not isinstance(qualification, dict):
+        qualification = {}
+    clipboard = qualification.get("mismatch_clipboard", {})
+    if not isinstance(clipboard, dict):
+        clipboard = {}
+    text = str(clipboard.get("text") or "")
+    held = [
+        item for item in qualification.get("projects", [])
+        if isinstance(item, dict)
+        and str(item.get("semantic_status", item.get("status", ""))).upper() == "NOT_EVALUATED"
+    ]
+    if not text:
+        if result.get("status") == "NEEDS_DOCUMENT_PROCESSING_REVIEW" and held:
+            text = "其余材料正在处理，以下材料不匹配：\n（当前没有已确认的不匹配项；未完成评估的材料见页面提示）"
+        elif result.get("status") == "NEEDS_DOCUMENT_PROCESSING_REVIEW":
+            text = "本批次未发现标题与正文不匹配材料。"
+        else:
+            text = "标题与正文资格预检未完成，请在继续处理前检查处理状态。"
+    return {
+        "text": text,
+        "status": str(result.get("status") or "FAILED"),
+        "held_count": len(held),
+        "work_dir": str(qualification_work),
+    }
+
+
+def build_image_review(work: Path, input_target: Path, batch_root: Path, python: Path, args, clean_report: dict | None = None) -> tuple[Path, dict]:
     preview = load_json(work / "preview" / "preview.json", {}) or {}
+    clean_report = clean_report or {}
+    clean_report_text = str(clean_report.get("text") or "标题与正文资格预检未完成，请在继续处理前检查处理状态。")
+    clean_report_held_count = int(clean_report.get("held_count", 0) or 0)
+    held_notice = (f'<p class="login-bad">另有 {clean_report_held_count} 项未能完成资格评估，请人工确认后再继续。</p>' if clean_report_held_count else "")
+    clean_report_panel = (
+        '<section class="clean-report"><h2>标题正文不匹配报告文本</h2>'
+        '<p>此处可复制不匹配材料清单，供后续整理报告使用。</p>'
+        f'<textarea id="cleanReport" readonly>{html.escape(clean_report_text)}</textarea>{held_notice}'
+        '<button type="button" onclick="copyCleanReport()">复制报告文本</button></section>'
+    )
     cards = []
     projects = []
     for index, row in enumerate(preview.get("packages", []), 1):
@@ -461,11 +522,11 @@ def build_image_review(work: Path, input_target: Path, batch_root: Path, python:
     command.extend(["--reject-images", "未通过序号"])
     actions = '''<section class="review-actions"><h2>审核完成后继续</h2><p>确认已勾选所有需要退回的项目后，再复制序号或返回程序。</p><button onclick="copy()">复制未通过序号</button><button onclick="returnToApp()">返回程序继续处理</button><code id="out">未勾选任何项目：全部继续处理</code></section>'''
     document = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>首轮图片审核</title>
-<style>body{{font:15px/1.5 "Microsoft YaHei",sans-serif;margin:0;background:#f3f5f7;color:#182230}}main{{max-width:1200px;margin:auto;padding:24px}}.flow{{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 20px}}.flow span{{padding:6px 10px;border:1px solid #c7d7ff;background:#fff;color:#516078;font-size:13px}}.flow .current{{background:#165dff;border-color:#165dff;color:#fff;font-weight:700}}.project{{background:#fff;border:1px solid #dce2e8;margin:16px 0;padding:18px}}.visual img{{display:block;max-width:100%;max-height:800px;margin-top:10px;border:1px solid #dce2e8}}.visual a{{color:#165dff}}.word-link{{margin-left:10px;color:#087443;font-weight:700}}button{{padding:9px 14px;background:#165dff;color:#fff;border:0}}.reject-label{{margin-left:10px;color:#b42318;font-size:13px}}.login-bad{{padding:8px 10px;background:#fff0ef;color:#b42318;border-left:4px solid #d92d20}}.login-ok{{color:#087443}}.review-actions{{margin:24px 0 0;padding:20px;background:#fff;border:2px solid #165dff}}.review-actions h2{{margin:0 0 6px}}.review-actions button{{margin:8px 10px 8px 0}}.review-actions code{{display:block;padding:9px;background:#eef4ff;color:#163a70}}</style></head>
-<body><main><h1>首轮图片审核</h1><div class="flow"><span>1 选择材料</span><span class="current">2 看图并微调 Word</span><span>3 自动二次处理</span><span>4 终审</span><span>5 导出 PDF</span><span>6 压缩交付</span></div><p>图片无明显问题时，可先点项目旁的“打开说明 Word”微调；完成后回到程序继续二次处理。只勾选图片不合格、需要退回的项目。</p>{''.join(cards)}{actions}</main>
-<script>function copy(){{let v=[...document.querySelectorAll('.rejection:checked')].map(x=>x.value).join(',');out.textContent=v||'none';navigator.clipboard&&navigator.clipboard.writeText(v||'none')}}function returnToApp(){{copy();window.close()}}</script></body></html>'''
+<style>body{{font:15px/1.5 "Microsoft YaHei",sans-serif;margin:0;background:#f3f5f7;color:#182230}}main{{max-width:1200px;margin:auto;padding:24px}}.flow{{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 20px}}.flow span{{padding:6px 10px;border:1px solid #c7d7ff;background:#fff;color:#516078;font-size:13px}}.flow .current{{background:#165dff;border-color:#165dff;color:#fff;font-weight:700}}.project{{background:#fff;border:1px solid #dce2e8;margin:16px 0;padding:18px}}.visual img{{display:block;max-width:100%;max-height:800px;margin-top:10px;border:1px solid #dce2e8}}.visual a{{color:#165dff}}.word-link{{margin-left:10px;color:#087443;font-weight:700}}button{{padding:9px 14px;background:#165dff;color:#fff;border:0}}.reject-label{{margin-left:10px;color:#b42318;font-size:13px}}.login-bad{{padding:8px 10px;background:#fff0ef;color:#b42318;border-left:4px solid #d92d20}}.login-ok{{color:#087443}}.clean-report{{margin:24px 0;padding:20px;background:#fff;border:1px solid #dce2e8}}.clean-report h2{{margin:0 0 6px}}.clean-report textarea{{display:block;width:100%;min-height:110px;margin:10px 0;padding:10px;border:1px solid #c7d7ff;background:#f8faff;font:14px/1.6 Consolas,\"Microsoft YaHei\",sans-serif;white-space:pre-wrap}}.clean-report button{{margin-top:8px}}.review-actions{{margin:24px 0 0;padding:20px;background:#fff;border:2px solid #165dff}}.review-actions h2{{margin:0 0 6px}}.review-actions button{{margin:8px 10px 8px 0}}.review-actions code{{display:block;padding:9px;background:#eef4ff;color:#163a70}}</style></head>
+<body><main><h1>首轮图片审核</h1><div class="flow"><span>1 选择材料</span><span class="current">2 看图并微调 Word</span><span>3 自动二次处理</span><span>4 终审</span><span>5 导出 PDF</span><span>6 压缩交付</span></div><p>图片无明显问题时，可先点项目旁的“打开说明 Word”微调；完成后回到程序继续二次处理。只勾选图片不合格、需要退回的项目。</p>{clean_report_panel}{''.join(cards)}{actions}</main>
+<script>async function copyCleanReport(){{const text=document.getElementById("cleanReport").value;try{{await navigator.clipboard.writeText(text)}}catch(error){{const area=document.getElementById("cleanReport");area.focus();area.select();document.execCommand("copy")}}}}function copy(){{let v=[...document.querySelectorAll('.rejection:checked')].map(x=>x.value).join(',');out.textContent=v||'none';navigator.clipboard&&navigator.clipboard.writeText(v||'none')}}function returnToApp(){{copy();window.close()}}</script></body></html>'''
     review.write_text(document, encoding="utf-8")
-    manifest = {"version": VERSION, "input_target": str(input_target.resolve()), "batch_root": str(batch_root), "review": str(review), "projects": projects, "next": subprocess.list2cmdline(command)}
+    manifest = {"version": VERSION, "input_target": str(input_target.resolve()), "batch_root": str(batch_root), "review": str(review), "projects": projects, "clean_report": clean_report_text, "qualification_status": str(clean_report.get("status", "")), "next": subprocess.list2cmdline(command)}
     atomic_json(work / "image_review.json", manifest)
     return review, manifest
 
@@ -627,7 +688,8 @@ def process_all(args, python: Path, input_target: Path, batch_root: Path, extrac
     if not packages:
         return {"status": "FAILED", "error": "未发现可处理项目", "work_dir": str(work)}
     if args.approve_images is None and args.reject_images is None:
-        review, manifest = build_image_review(work, input_target, batch_root, python, args)
+        clean_report = preview_clean_report(extracted, work, python)
+        review, manifest = build_image_review(work, input_target, batch_root, python, args, clean_report)
         return {
             "version": VERSION,
             "status": "NEEDS_IMAGE_REVIEW",
@@ -815,6 +877,10 @@ def export_modified_pdfs(modified: Path, work: Path, progress: ProgressReporter 
         if result is None:
             return failed_result(decode_process_output(completed.stdout)[-2000:] or "导出未返回报告")
         result["work_dir"] = str(work)
+        if result.get("status") == "EXPORT_FAILED":
+            first_failure = next((row for row in result.get("files", []) if row.get("status") == "FAILED"), None)
+            if first_failure:
+                result["error"] = f"{first_failure.get('name', 'Word 文档')}：{first_failure.get('error', '导出失败')}"
         if progress:
             processed = sum(int(result.get(key, 0) or 0) for key in ("exported", "skipped", "failed"))
             progress.update(
@@ -855,7 +921,9 @@ def main() -> int:
     parser.add_argument("--process-documents", action="store_true", help="预览说明书、代码、TXT统一处理流程")
     parser.add_argument("--apply-document-processing", action="store_true", help="确认后按说明书、代码、TXT顺序执行统一处理")
     parser.add_argument("--document-stages", default="all",
-                        help="可多选步骤：match_title_body,match_manual_ocr,match_manual_vision,match_code,match_txt,manual_body_years,manual_image_dates,manual_cover,manual_header,manual_page_numbers,manual_pdf,code_cleanup,code_pdf,txt_repair；也可用 all/manual/code/txt/checks 预设。")
+                        help="可多选步骤：match_title_body,match_software_name,match_manual_ocr,match_manual_vision,match_code,match_txt,manual_body_years,manual_image_dates,manual_cover,manual_header,manual_page_numbers,manual_pdf,code_cleanup,code_pdf,txt_repair；也可用 all/manual/code/txt/checks 预设。")
+    parser.add_argument("--expand-order-downloads", action="store_true",
+                        help="订单下载目录中先展开已校验 ZIP，再进入统一材料流程")
     parser.add_argument("--include-topic-mismatch", action="store_true",
                         help="关闭默认的标题正文主题冲突跳过，继续处理这些项目")
     args = parser.parse_args()
@@ -889,10 +957,13 @@ def main() -> int:
             return emit(result, 0 if result.get("status") == "CODE_COMMENT_CLEANUP_OK" else 2)
         except Exception as exc:
             progress.set_total(max(1, progress.total, progress.completed))
-            progress.update(
-                "代码注释清理失败", progress.total, "处理终止",
-                status="FAILED", error=str(exc), active=False, failures=progress.failures + 1,
-            )
+            try:
+                progress.update(
+                    "代码注释清理失败", progress.total, "处理终止",
+                    status="FAILED", error=str(exc), active=False, failures=progress.failures + 1,
+                )
+            except OSError:
+                pass
             return emit({"version": VERSION, "status": "FAILED", "error": str(exc), "work_dir": str(work)}, 2)
     if args.process_documents or args.apply_document_processing:
         work = (args.work_dir or default_work_dir(input_target) / "document-processing").resolve()
@@ -905,14 +976,18 @@ def main() -> int:
                 apply=bool(args.apply_document_processing), progress=progress,
                 document_stages=args.document_stages,
                 skip_topic_mismatch=not args.include_topic_mismatch,
+                expand_order_downloads=args.expand_order_downloads,
             )
             return emit(result, 0 if result.get("status") == "DOCUMENT_PROCESSING_OK" else 2)
         except Exception as exc:
             progress.set_total(max(1, progress.total, progress.completed))
-            progress.update(
-                "材料统一处理失败", progress.total, "处理终止",
-                status="FAILED", error=str(exc), active=False, failures=progress.failures + 1,
-            )
+            try:
+                progress.update(
+                    "材料统一处理失败", progress.total, "处理终止",
+                    status="FAILED", error=str(exc), active=False, failures=progress.failures + 1,
+                )
+            except OSError:
+                pass
             return emit({"version": VERSION, "status": "FAILED", "error": str(exc), "work_dir": str(work)}, 2)
     selected_archive = input_target if input_target.is_file() and archive_types.is_archive_file(input_target) else None
     if selected_archive is not None:

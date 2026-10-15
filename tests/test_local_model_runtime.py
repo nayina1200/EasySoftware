@@ -96,9 +96,9 @@ class LocalModelRuntimeConfigTests(unittest.TestCase):
     def test_strategy_config_keeps_runtime_settings_nested(self):
         config_path = ROOT / "scripts" / "title_body_config.example.json"
         runtime = MODULE.LocalModelRuntime(config_path)
-        self.assertEqual(runtime.config["mode"], "shadow")
+        self.assertEqual(runtime.config["mode"], "enforced")
         self.assertEqual(runtime.config["unknown_action"], "hold_changes")
-        self.assertFalse(runtime.config["skip_mismatch_requested"])
+        self.assertTrue(runtime.config["skip_mismatch_requested"])
         self.assertEqual(runtime.config["runtime"]["expected_server_version"], "9442")
         self.assertEqual(runtime.config["request_timeout_seconds"], 20)
 

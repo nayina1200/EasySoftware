@@ -91,6 +91,21 @@ class ExportDirectoryResolutionTests(unittest.TestCase):
 
 
 class ExportModifiedPdfsScopeTests(unittest.TestCase):
+    def test_child_failure_detail_is_returned_to_gui(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            folder = material_dir(base, "材料")
+            report = {
+                "status": "EXPORT_FAILED", "exported": 0, "skipped": 0, "failed": 1,
+                "files": [{"name": "项目说明", "status": "FAILED", "error": "CHILD_PROCESS_NO_REPORT: exit=1: startup error"}],
+            }
+            with mock.patch.object(WORKFLOW.shutil, "which", return_value="powershell.exe"), \
+                    mock.patch.object(WORKFLOW, "word_automation_lock", return_value=contextlib.nullcontext()), \
+                    mock.patch.object(WORKFLOW.subprocess, "run"), \
+                    mock.patch.object(WORKFLOW, "load_json", return_value=report):
+                result = WORKFLOW.export_modified_pdfs(folder, base / "work")
+            self.assertIn("startup error", result["error"])
+
     def test_reports_clear_error_when_directory_has_no_docx(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory) / "材料"

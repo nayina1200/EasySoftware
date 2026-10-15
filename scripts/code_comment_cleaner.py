@@ -656,7 +656,10 @@ def _write_report(path: Path, report: dict) -> None:
             count_label = "翻译" if document.get("translated_comments") is not None else "待处理"
             page_note = ""
             if document.get("target_pages"):
-                page_note = f"；页数目标/实际 {document.get('target_pages')}/{document.get('actual_pages', '未读取')}"
+                page_note = (
+                    f"；最低/实际页数 {document.get('target_pages')}/{document.get('actual_pages', '未读取')}"
+                    f"；第 60 页 {document.get('page_60_lines', '未读取')} 行"
+                )
             rows.append(f"<article><h3>{html.escape(document_name)}</h3><p>状态：{html.escape(document.get('status', ''))}；{count_label} {document.get('translated_comments', document.get('deletions', 0))} 处{html.escape(page_note)}</p><ul>{findings}</ul></article>")
     state = "执行结果" if report.get("applied") else "执行前预览"
     document = f"""<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><title>代码注释英文翻译{state}</title>
@@ -733,6 +736,52 @@ def word_page_count(docx: Path, app_root: Path, work: Path) -> int:
     return int(result["pages"])
 
 
+def _code_navigation_index(docx: Path) -> list[str]:
+    """Make a source-derived appendix without inventing code or repeating entries."""
+    with zipfile.ZipFile(docx) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    lines = ["Code navigation index — entries refer to the original listing paragraphs."]
+    for number, paragraph in enumerate(_paragraphs(root), 1):
+        value = " ".join(_paragraph_text(paragraph).split())
+        if len(value) < 3 or contains_han(value):
+            continue
+        lines.append(f"Paragraph {number}: {value[:100]}")
+    return lines
+
+
+def ensure_code_page_minimum(docx: Path, app_root: Path, work: Path, minimum_pages: int = 60) -> dict[str, int]:
+    """Measure page 60 and add a compact source index in one Word session if needed."""
+    script = app_root / "scripts" / "export_modified_pdf_item.ps1"
+    key = hashlib.sha1((str(docx) + "|minimum").encode("utf-8")).hexdigest()
+    result_path = work / f"{key}.json"
+    supplement_path = work / f"{key}.txt"
+    pid_path = work / f"{key}.pid"
+    work.mkdir(parents=True, exist_ok=True)
+    supplement_path.write_text("\n".join(_code_navigation_index(docx)), encoding="utf-8")
+    command = [
+        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+        "-DocxPath", str(docx), "-ResultPath", str(result_path), "-PidPath", str(pid_path),
+        "-CountOnly", "-MinimumPages", str(max(60, minimum_pages)), "-MinimumPageLines", "51",
+        "-SupplementPath", str(supplement_path),
+    ]
+    try:
+        with _word_lock():
+            process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120, check=False)
+        if process.returncode != 0 or not result_path.is_file():
+            detail = process.stdout.decode("utf-8", errors="replace")[-800:]
+            raise RuntimeError(f"第 60 页行数补足失败：{detail}")
+        result = json.loads(result_path.read_text(encoding="utf-8-sig"))
+        if result.get("status") != "OK":
+            raise RuntimeError(f"第 60 页行数补足失败：{result.get('error', 'Word 未返回结果')}")
+        pages = int(result.get("pages", 0))
+        lines = int(result.get("page_60_lines", 0))
+        if pages < max(60, minimum_pages) or lines < 51:
+            raise RuntimeError(f"补足后仍不达标：共 {pages} 页，第 60 页 {lines} 行")
+        return {"pages": pages, "page_60_lines": lines, "supplemented_lines": int(result.get("supplemented_lines", 0))}
+    finally:
+        supplement_path.unlink(missing_ok=True)
+
+
 def remove_translated_comment_docx(path: Path, comment: dict[str, Any]) -> bool:
     """Remove one newly translated comment while preserving the other DOCX text and formatting."""
     with zipfile.ZipFile(path) as archive:
@@ -777,60 +826,19 @@ def remove_translated_comment_docx(path: Path, comment: dict[str, Any]) -> bool:
 
 
 def translate_and_fit_docx(path: Path, app_root: Path, work: Path, target_pages: int | None = None) -> dict:
-    """Translate once; if over target, remove translated comments until Word reaches the limit."""
+    """Translate once and enforce the minimum without repeatedly restarting Word."""
     if target_pages is None:
         target_pages = word_page_count(path, app_root, work)
+    target_pages = max(60, target_pages)
     row = translate_docx(path, app_root)
-    pages = word_page_count(path, app_root, work)
+    metrics = ensure_code_page_minimum(path, app_root, work, target_pages)
     row["target_pages"] = target_pages
-    row["actual_pages"] = pages
-    row["page_match"] = pages == target_pages
+    row["actual_pages"] = metrics["pages"]
+    row["page_60_lines"] = metrics["page_60_lines"]
+    row["supplemented_lines"] = metrics["supplemented_lines"]
+    row["page_match"] = metrics["pages"] >= target_pages
     row["page_attempts"] = 1
     row["removed_translated_comments"] = 0
-    if pages <= target_pages or not row.get("translated_comments"):
-        return row
-
-    best_docx = path.read_bytes()
-    best_pages = pages
-    best_removed = 0
-    comments = list(reversed(row.get("translated_parts", [])))
-    max_removals = min(len(comments), max(32, (pages - target_pages) * 32))
-    removed = 0
-    index = 0
-    while index < max_removals:
-        batch = comments[index:min(index + 4, max_removals)]
-        before_docx, before_pages = path.read_bytes(), pages
-        removed_in_batch = 0
-        for comment in batch:
-            if remove_translated_comment_docx(path, comment):
-                removed += 1
-                removed_in_batch += 1
-        index += len(batch)
-        if not removed_in_batch:
-            continue
-        pages = word_page_count(path, app_root, work)
-        row["page_attempts"] += 1
-        if abs(pages - target_pages) < abs(best_pages - target_pages):
-            best_pages, best_docx, best_removed = pages, path.read_bytes(), removed
-        if pages <= target_pages:
-            if pages < target_pages:
-                path.write_bytes(before_docx)
-                pages = before_pages
-                removed -= removed_in_batch
-                for comment in batch:
-                    if not remove_translated_comment_docx(path, comment):
-                        continue
-                    removed += 1
-                    pages = word_page_count(path, app_root, work)
-                    row["page_attempts"] += 1
-                    if pages <= target_pages:
-                        break
-            best_pages, best_docx, best_removed = pages, path.read_bytes(), removed
-            break
-    path.write_bytes(best_docx)
-    row["actual_pages"] = best_pages
-    row["page_match"] = best_pages == target_pages
-    row["removed_translated_comments"] = best_removed
     return row
 
 
@@ -841,7 +849,12 @@ def _export_pdf(docx: Path, app_root: Path, work: Path, expected_pages: int | No
     pid_path = temp_pdf.with_suffix(".pid")
     temp_pdf.parent.mkdir(parents=True, exist_ok=True)
     script = app_root / "scripts/export_modified_pdf_item.ps1"
-    command = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-DocxPath", str(docx), "-TemporaryPdfPath", str(temp_pdf), "-ResultPath", str(result_path), "-PidPath", str(pid_path)]
+    command = [
+        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+        "-DocxPath", str(docx), "-TemporaryPdfPath", str(temp_pdf), "-ResultPath", str(result_path),
+        "-PidPath", str(pid_path), "-MinimumPages", str(max(60, expected_pages or 0)),
+        "-MinimumPageLines", "51",
+    ]
     with _word_lock():
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
@@ -853,29 +866,20 @@ def _export_pdf(docx: Path, app_root: Path, work: Path, expected_pages: int | No
             completed_returncode = None
     method = "Microsoft Word"
     if completed_returncode != 0 or not temp_pdf.is_file():
-        soffice = next((Path(value) for value in (shutil.which("soffice.exe"), r"C:\Program Files\LibreOffice\program\soffice.exe", r"C:\Program Files (x86)\LibreOffice\program\soffice.exe") if value and Path(value).is_file()), None)
-        if soffice is None:
-            return False, "Word 导出失败且未安装 LibreOffice；已保留原 PDF"
-        outdir = temp_pdf.parent / (temp_pdf.stem + "-lo")
-        outdir.mkdir(parents=True, exist_ok=True)
-        lo = subprocess.run([str(soffice), "--headless", "--convert-to", "pdf", "--outdir", str(outdir), str(docx)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90, check=False)
-        generated = outdir / (docx.stem + ".pdf")
-        if lo.returncode != 0 or not generated.is_file():
-            return False, "Word/LibreOffice 导出都失败；已保留原 PDF"
-        shutil.copy2(generated, temp_pdf)
-        method = "LibreOffice"
+        return False, "Word 导出失败；已保留原 PDF"
     try:
         from pypdf import PdfReader
         actual_pages = len(PdfReader(str(temp_pdf)).pages)
         if temp_pdf.stat().st_size <= 0 or actual_pages <= 0:
             raise ValueError("无有效页")
-        if expected_pages is not None and abs(actual_pages - expected_pages) > 1:
-            return False, f"页数偏差超过 1 页：原 PDF {expected_pages} 页，翻译后 {actual_pages} 页；已保留原 PDF"
+        minimum_pages = max(60, expected_pages or 0)
+        if actual_pages < minimum_pages:
+            return False, f"页数不足：至少 {minimum_pages} 页，导出后 {actual_pages} 页；已保留原 PDF"
         target_temp = pdf.with_name(pdf.name + ".easysoftware.tmp")
         shutil.copy2(temp_pdf, target_temp)
         os.replace(target_temp, pdf)
         if expected_pages is not None and actual_pages != expected_pages:
-            return True, f"{method}；目标 {expected_pages} 页，实际 {actual_pages} 页（偏差 1 页）"
+            return True, f"{method}；至少 {minimum_pages} 页，实际 {actual_pages} 页"
         return True, f"{method}；共 {actual_pages} 页"
     except Exception as exc:
         return False, f"新 PDF 验证失败：{exc}；已保留原 PDF"
@@ -951,11 +955,13 @@ def run(
                             progress.update("项目跳过", completed, project_name, status="FAILED", active=False, failures=failures, archive=archive.name, error=discovered.get("error"))
                         continue
                     docx = Path(discovered["docx"])
+                    original_pdf = Path(discovered["pdf"]) if discovered.get("pdf") else None
+                    original_docx_bytes = docx.read_bytes()
+                    original_pdf_bytes = original_pdf.read_bytes() if original_pdf and original_pdf.is_file() else None
                     try:
-                        original_pdf = Path(discovered["pdf"]) if discovered.get("pdf") else None
                         target_pages = pdf_page_count(original_pdf)
                         row = translate_and_fit_docx(docx, app_root, work, target_pages)
-                        if row["deletions"]:
+                        if row["page_match"]:
                             if progress:
                                 progress.update("导出代码PDF", completed, project_name, active=True, failures=failures, archive=archive.name)
                             success, detail = _export_pdf(docx, app_root, work, row.get("target_pages"))
@@ -964,10 +970,15 @@ def run(
                             if not success:
                                 row["status"] = "CLEANED_PDF_FAILED"
                                 failures += 1
+                                docx.write_bytes(original_docx_bytes)
+                                if original_pdf and original_pdf_bytes is not None:
+                                    original_pdf.write_bytes(original_pdf_bytes)
                         else:
-                            row["pdf_status"] = "UNCHANGED"
-                            row["pdf_detail"] = "未发现待翻译的中文注释，无需重新导出"
+                            raise RuntimeError("代码文档页数或第 60 页行数不足")
                     except Exception as exc:
+                        docx.write_bytes(original_docx_bytes)
+                        if original_pdf and original_pdf_bytes is not None:
+                            original_pdf.write_bytes(original_pdf_bytes)
                         row = {"docx": str(docx), "status": "FAILED", "deletions": 0, "error": str(exc), "findings": []}
                         failures += 1
                     applied_documents.append(row)

@@ -659,7 +659,41 @@ class PowerShellCoverSafetyTests(unittest.TestCase):
         self.assertNotIn("wdPaperA4", function)
 
     def test_two_line_title_is_allowed_but_short_last_line_is_flagged(self):
-        self.assertIn("if ($lines -le 2 -and -not $orphanedLastLine)", self.script)
+        start = self.script.index("function Set-CoverTypography")
+        end = self.script.index("function Remove-CoverVersion", start)
+        function = self.script[start:end]
+        checks = r'''
+$ast = (Get-Command Set-CoverTypography).ScriptBlock.Ast
+$guardClause = $null
+foreach ($node in $ast.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.IfStatementAst] }, $true)) {
+    foreach ($clause in $node.Clauses) {
+        $variables = @($clause.Item1.FindAll({ param($part) $part -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { $_.VariablePath.UserPath.ToLowerInvariant() })
+        if ($variables -contains 'lines' -and $variables -contains 'orphanedlastline' -and $variables -contains 'labellayoutfailed' -and $clause.Item2.Extent.Text -match '\bbreak\b') {
+            $guardClause = $clause.Item1
+            break
+        }
+    }
+    if ($null -ne $guardClause) { break }
+}
+if ($null -eq $guardClause) { throw 'Could not find the typography convergence exit condition' }
+$guard = [scriptblock]::Create($guardClause.Extent.Text)
+$cases = @(
+    [pscustomobject]@{ Lines = 2; Orphaned = $false; LabelFailed = $false; Expected = $true },
+    [pscustomobject]@{ Lines = 2; Orphaned = $false; LabelFailed = $true; Expected = $false },
+    [pscustomobject]@{ Lines = 3; Orphaned = $false; LabelFailed = $false; Expected = $false },
+    [pscustomobject]@{ Lines = 2; Orphaned = $true; LabelFailed = $false; Expected = $false }
+)
+foreach ($case in $cases) {
+    $lines = $case.Lines; $orphanedLastLine = $case.Orphaned; $labelLayoutFailed = $case.LabelFailed
+    if ([bool](& $guard) -ne $case.Expected) { throw "Unexpected convergence decision for $($case | ConvertTo-Json -Compress)" }
+}
+'''
+        encoded = base64.b64encode((function + "\n" + checks).encode("utf-16le")).decode("ascii")
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-EncodedCommand", encoded],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn('if ($doCover -and $coverAudit.Lines -gt 2)', self.script)
         self.assertIn('if ($doCover -and $coverAudit.OrphanedLastLine)', self.script)
 
@@ -677,8 +711,12 @@ class PowerShellCoverSafetyTests(unittest.TestCase):
         end = self.script.index("function Remove-CoverVersion", start)
         function = self.script[start:end]
 
-        self.assertIn("if ($null -eq $titleItem)", function)
-        self.assertNotIn("$null -eq $titleItem -or $null -eq $labelItem", function)
+        # Dynamic table/TOC/body protection is covered by test_cover_performance.
+        self.assertIn("$_.Page -eq 1 -and -not $_.InTable -and $_.Style -notmatch '(?i)TOC|目录'", function)
+        self.assertIn("$items = @(Get-FrontParagraphs $Document 2)", function)
+        self.assertIn("$block = Find-CoverBlock $items $Title 1 1 $true", function)
+        self.assertIn("if ($null -ne $labelItem)", function)
+        self.assertNotIn("$labelRange.Text =", function)
         self.assertIn("LabelPresent", function)
         self.assertIn("$between | Sort-Object Index -Descending", function)
         self.assertIn("$_.Text -ne \"\"", function)
@@ -807,9 +845,28 @@ if (Test-PageHasObjects $doc 1) { throw 'floating shape was assigned to wrong pa
         start = self.script.index("function Set-CoverTypography")
         end = self.script.index("function Remove-CoverVersion", start)
         function = self.script[start:end]
-        self.assertIn("$titleRange.Font.Size = [double]$size", function)
-        self.assertIn("$labelRange.Font.Size = [double]$size", function)
-        self.assertIn("$labelRange.ParagraphFormat.SpaceBefore = [double]48", function)
+        checks = r'''
+$ast = (Get-Command Set-CoverTypography).ScriptBlock.Ast
+$assignments = @($ast.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))
+$doubleSizeAssignments = @($assignments | Where-Object {
+    $left = $_.Left.Extent.Text -replace '\s', ''
+    $right = $_.Right.Extent.Text -replace '\s', ''
+    $left -match '(?i)\.Font\.Size$' -and $right -match '^\[double\]\$size$'
+})
+$labelSpacingAssignments = @($assignments | Where-Object {
+    $left = $_.Left.Extent.Text -replace '\s', ''
+    $right = $_.Right.Extent.Text -replace '\s', ''
+    $left -match '(?i)\.ParagraphFormat\.SpaceBefore$' -and $right -match '^\[double\]48$'
+})
+if ($doubleSizeAssignments.Count -lt 2) { throw 'Title and label font sizes must both use double values' }
+if ($labelSpacingAssignments.Count -lt 1) { throw 'The label must retain 48 points of spacing using a double value' }
+'''
+        encoded = base64.b64encode((function + "\n" + checks).encode("utf-16le")).decode("ascii")
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-EncodedCommand", encoded],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
 
 if __name__ == "__main__":

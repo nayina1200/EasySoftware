@@ -93,12 +93,14 @@ def main() -> int:
     parser.add_argument("--customer", required=True)
     args = parser.parse_args()
 
+    failure_stage = "validation"
     try:
         source = args.source.resolve(strict=True)
         file_count = validate_zip(source)
+        failure_stage = "save"
         output = _copy_validated_zip(source, args.destination, args.customer, file_count)
     except Exception as exc:
-        print(json.dumps({"status": "FAILED", "error": str(exc)}, ensure_ascii=False))
+        print(json.dumps({"status": "FAILED", "stage": failure_stage, "error": str(exc)}, ensure_ascii=True))
         return 1
     print(json.dumps({
         "status": "OK",
@@ -106,7 +108,7 @@ def main() -> int:
         "directory": str(output.parent),
         "filename": output.name,
         "count": file_count,
-    }, ensure_ascii=False))
+    }, ensure_ascii=True))
     return 0
 
 

@@ -12,7 +12,7 @@ import sys
 import time
 import zipfile
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -24,31 +24,36 @@ import archive_types
 import code_comment_cleaner
 import manual_content_stage
 import process_batch
+from software_name_consistency import check_software_names, render_name_warnings
 
 
 VERSION = 1
 PREVIEW_STATUS = "NEEDS_DOCUMENT_PROCESSING_REVIEW"
 WORKFLOW_OPTION_ORDER = (
-    "match_title_body", "match_manual_ocr", "match_manual_vision", "match_code", "match_txt",
-    "manual_body_years", "manual_image_dates", "manual_cover", "manual_header", "manual_page_numbers", "manual_pdf",
+    "match_title_body", "match_software_name", "match_manual_ocr", "match_manual_vision", "match_code", "match_txt",
+    "manual_body_years", "manual_image_dates", "manual_ai_hollow_lines", "manual_cover", "manual_header", "manual_page_numbers", "manual_pdf",
     "code_cleanup", "code_pdf", "txt_repair",
 )
 WORKFLOW_GROUPS = {
     "all": WORKFLOW_OPTION_ORDER,
     "checks": tuple(item for item in WORKFLOW_OPTION_ORDER if item.startswith("match_")),
-    "manual": WORKFLOW_OPTION_ORDER[:3] + WORKFLOW_OPTION_ORDER[5:11],
+    "manual": tuple(option for option in WORKFLOW_OPTION_ORDER if option in {
+        "match_title_body", "match_software_name", "match_manual_ocr", "match_manual_vision"
+    } or option.startswith("manual_")),
     "code": ("match_code", "code_cleanup", "code_pdf"),
     "txt": ("match_txt", "txt_repair"),
 }
 DEFAULT_WORKFLOW_OPTIONS = WORKFLOW_OPTION_ORDER
 WORKFLOW_OPTION_LABELS = {
     "match_title_body": "标题与说明书正文主题匹配",
+    "match_software_name": "软件名称一致性检查（本地）",
     "match_manual_ocr": "截图 OCR 与软件主题匹配",
     "match_manual_vision": "视觉模型复核截图",
     "match_code": "代码 DOCX/PDF 配套检查",
     "match_txt": "TXT 名称、字段与主题检查",
     "manual_body_years": "检查/修正说明书正文年份",
     "manual_image_dates": "检查/修正说明书图片日期",
+    "manual_ai_hollow_lines": "检测空心线",
     "manual_cover": "整理说明书封面",
     "manual_header": "整理说明书页眉",
     "manual_page_numbers": "整理说明书页码",
@@ -62,7 +67,7 @@ WORKFLOW_OPTION_LABELS = {
 def _expand_workflow_options(stages: str | list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
     if stages is None:
         return DEFAULT_WORKFLOW_OPTIONS
-    requested = stages.split(",") if isinstance(stages, str) else stages
+    requested = re.split(r"[,\s]+", stages.strip()) if isinstance(stages, str) else stages
     selected: set[str] = set()
     for raw in requested:
         stage = str(raw).strip()
@@ -146,16 +151,17 @@ def _publish_progress(
 
 
 class _StageProgress:
-    def __init__(self, progress: Any, offset: int, failures: int = 0):
+    def __init__(self, progress: Any, offset: int, failures: int = 0, floor_current: int = 0):
         self.progress = progress
         self.offset = offset
         self.failures = failures
+        self.floor_current = floor_current
 
     def update(self, phase: str, current: int = 0, name: str = "", **details: Any) -> None:
         _publish_progress(
             self.progress,
             phase,
-            self.offset + current,
+            max(self.floor_current, self.offset + current),
             name,
             status=str(details.get("status", "RUNNING")),
             failures=max(self.failures, int(details.get("failures", 0))),
@@ -164,7 +170,7 @@ class _StageProgress:
         )
 
 
-def _material_root(source: Path, work: Path, app_root: Path) -> tuple[Path, str]:
+def _material_root(source: Path, work: Path, app_root: Path, *, expand_order_downloads: bool = False) -> tuple[Path, str]:
     source = source.resolve()
     if source.is_file():
         if not archive_types.is_archive_file(source):
@@ -190,6 +196,18 @@ def _material_root(source: Path, work: Path, app_root: Path) -> tuple[Path, str]
     if source.is_dir():
         if "_已处理_" in source.name:
             raise ValueError("不能把已处理目录再次作为输入")
+        if expand_order_downloads:
+            nested_state_path = work / "combined_nested_archives.json"
+            try:
+                prior = json.loads(nested_state_path.read_text(encoding="utf-8")) if nested_state_path.is_file() else []
+            except (OSError, json.JSONDecodeError):
+                prior = []
+            hashes = process_batch.HashCache(work / "combined_hashes.json")
+            nested = process_batch.expand_nested_archives(
+                source, process_batch.find_7z(), max(1, min(4, os.cpu_count() or 1)), hashes, prior_results=prior,
+            )
+            hashes.save()
+            nested_state_path.write_text(json.dumps(nested, ensure_ascii=False, indent=2), encoding="utf-8")
         return source, source.name
     raise FileNotFoundError(f"输入不存在：{source}")
 
@@ -373,26 +391,26 @@ def _title_body_config(app_root: Path) -> tuple[Path, dict[str, Any]]:
     example = next((path for path in example_candidates if path.is_file()), example_candidates[-1])
     config_path = configured if configured.is_file() else example
     if not config_path.is_file():
-        return config_path, {"mode": "shadow", "not_evaluated_action": "hold_changes"}
+        return config_path, {"mode": "enforced", "skip_mismatch_requested": True, "not_evaluated_action": "hold_changes"}
     try:
         value = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return config_path, {"mode": "shadow", "not_evaluated_action": "hold_changes", "config_error": "标题正文配置无法读取"}
+        return config_path, {"mode": "enforced", "skip_mismatch_requested": True, "not_evaluated_action": "hold_changes", "config_error": "标题正文配置无法读取"}
     if not isinstance(value, dict):
-        return config_path, {"mode": "shadow", "not_evaluated_action": "hold_changes", "config_error": "标题正文配置格式无效"}
-    mode = str(value.get("mode", "shadow")).casefold()
+        return config_path, {"mode": "enforced", "skip_mismatch_requested": True, "not_evaluated_action": "hold_changes", "config_error": "标题正文配置格式无效"}
+    mode = str(value.get("mode", "enforced")).casefold()
     if mode not in {"off", "shadow", "enforced"}:
-        mode = "shadow"
-        value["config_error"] = "无效模式已安全回退到 shadow"
+        mode = "enforced"
+        value["config_error"] = "无效模式已安全回退到 enforced"
     value["mode"] = mode
     value["not_evaluated_action"] = value.get("not_evaluated_action", value.get("unknown_action", "hold_changes"))
     value.pop("unknown_action", None)
     if value["not_evaluated_action"] not in {"hold_changes", "continue_with_review"}:
         value["not_evaluated_action"] = "hold_changes"
         value["config_error"] = value.get("config_error") or "无效 not_evaluated_action 已安全回退到 hold_changes"
-    if not isinstance(value.get("skip_mismatch_requested", False), bool):
-        value["skip_mismatch_requested"] = False
-        value["config_error"] = value.get("config_error") or "无效 skip_mismatch_requested 已安全回退为 false"
+    if not isinstance(value.get("skip_mismatch_requested", True), bool):
+        value["skip_mismatch_requested"] = True
+        value["config_error"] = value.get("config_error") or "无效 skip_mismatch_requested 已安全回退为 true"
     value.setdefault("prompt_version", "title-body-jev-domain-fit-score-v3")
     value.setdefault("policy_version", "title-body-jev-threshold-policy-v1")
     provider = str(value.get("provider", "typesafe_jev")).casefold()
@@ -403,6 +421,17 @@ def _title_body_config(app_root: Path) -> tuple[Path, dict[str, Any]]:
     return config_path, value
 
 
+def _source_name_audit(source: dict[str, Any], config: dict[str, Any], enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {"status": "NOT_CHECKED", "warning_count": 0, "findings": [], "reason": "未选择软件名称一致性检查"}
+    alias_map = config.get("software_name_aliases", {})
+    aliases = alias_map.get(source.get("title", ""), []) if isinstance(alias_map, dict) else []
+    return check_software_names(
+        str(source.get("title") or ""), source.get("paragraphs", []),
+        aliases=aliases if isinstance(aliases, list) else [],
+    )
+
+
 def _scan_title_body_qualification(
     root: Path,
     progress: Any = None,
@@ -411,6 +440,8 @@ def _scan_title_body_qualification(
     app_root: Path | None = None,
     config_path: Path | None = None,
     progress_current: int | None = None,
+    check_names: bool = True,
+    local_only: bool = False,
 ) -> dict[str, Any]:
     """Qualify paired TXT/DOCX materials once, without loading images or Word."""
     root = root.resolve()
@@ -427,18 +458,18 @@ def _scan_title_body_qualification(
                 config = raw_config
         except (OSError, UnicodeError, json.JSONDecodeError):
             config.setdefault("config_error", "标题正文配置无法读取")
-    mode = str(config.get("mode", "shadow")).casefold()
+    mode = str(config.get("mode", "enforced")).casefold()
     if mode not in {"off", "shadow", "enforced"}:
-        mode = "shadow"
-        config["config_error"] = config.get("config_error") or "无效模式已安全回退到 shadow"
+        mode = "enforced"
+        config["config_error"] = config.get("config_error") or "无效模式已安全回退到 enforced"
     config["mode"] = mode
     config["not_evaluated_action"] = config.get("not_evaluated_action", config.get("unknown_action", "hold_changes"))
     if config["not_evaluated_action"] not in {"hold_changes", "continue_with_review"}:
         config["not_evaluated_action"] = "hold_changes"
         config["config_error"] = config.get("config_error") or "无效 not_evaluated_action 已安全回退到 hold_changes"
-    if not isinstance(config.get("skip_mismatch_requested", False), bool):
-        config["skip_mismatch_requested"] = False
-        config["config_error"] = config.get("config_error") or "无效 skip_mismatch_requested 已安全回退为 false"
+    if not isinstance(config.get("skip_mismatch_requested", True), bool):
+        config["skip_mismatch_requested"] = True
+        config["config_error"] = config.get("config_error") or "无效 skip_mismatch_requested 已安全回退为 true"
     config.setdefault("prompt_version", "title-body-jev-domain-fit-score-v3")
     config.setdefault("policy_version", "title-body-jev-threshold-policy-v1")
     provider = str(config.get("provider", "typesafe_jev")).casefold()
@@ -446,7 +477,34 @@ def _scan_title_body_qualification(
         config["config_error"] = config.get("config_error") or "无效 provider 已安全回退到 typesafe_jev"
         provider = "typesafe_jev"
     config["provider"] = provider
+    if local_only:
+        from title_body_qualification import scan_title_body_inputs
+        sources = scan_title_body_inputs(root)
+        projects = []
+        for source in sources:
+            projects.append({
+                "name": source.get("title") or Path(source["relative_path"]).stem.removesuffix("说明"),
+                "relative_path": source["relative_path"],
+                "status": "NOT_RUN", "semantic_status": "NOT_RUN",
+                "classification_method": "local_name_rules",
+                "name_consistency": _source_name_audit(source, config, check_names),
+                "reason": "本次仅运行本地名称检查，未选择主题评分",
+                "action": "CONTINUE_WITH_REVIEW", "cache_hit": False,
+                "result": {}, "associated_files": source.get("associated_files", []),
+            })
+        return {
+            "status": "COMPLETED", "mode": mode, "provider": "local_name_rules", "model_id": None,
+            "scanned_count": len(projects), "cache_hit_count": 0, "model_request_count": 0,
+            "failure_count": 0, "failures": [], "projects": projects,
+            "name_warning_count": sum(item["name_consistency"]["warning_count"] for item in projects),
+            "name_warning_names": [item["name"] for item in projects if item["name_consistency"]["warning_count"]],
+            "disqualified_projects": [], "_inputs_by_relative_path": {},
+        }
     if mode == "off":
+        from title_body_qualification import scan_title_body_inputs
+        local_inputs = {
+            item["relative_path"]: item for item in scan_title_body_inputs(root)
+        } if check_names else {}
         projects: list[dict[str, Any]] = []
         legacy_mismatches: list[dict[str, Any]] = []
         for index, manual in enumerate(sorted(root.rglob("*说明.docx"), key=lambda path: path.as_posix().casefold()), 1):
@@ -456,12 +514,15 @@ def _scan_title_body_qualification(
                 legacy = manual_content_stage.assess_body_relevance(name, paragraphs)
             except Exception as exc:
                 legacy = {"status": "unknown", "reason": f"无法读取正文：{type(exc).__name__}: {exc}"}
+            local_source = local_inputs.get(manual.relative_to(root).as_posix(), {})
+            name_audit = _source_name_audit(local_source, config, check_names)
             item = {
                 "name": name,
                 "relative_path": manual.relative_to(root).as_posix(),
                 "status": "NOT_RUN",
                 "semantic_status": "NOT_RUN",
                 "classification_method": "legacy_lexical",
+                "name_consistency": name_audit,
                 "legacy_status": str(legacy.get("status", "unknown")),
                 "legacy_similarity_score": legacy.get("similarity_score"),
                 "reason": str(legacy.get("reason", "")),
@@ -482,6 +543,8 @@ def _scan_title_body_qualification(
             "config_path": str(config_path), "config_error": config.get("config_error"),
             "scanned_count": len(projects), "cache_hit_count": 0, "model_request_count": 0,
             "failure_count": 0, "failures": [], "projects": projects,
+            "name_warning_count": sum(item["name_consistency"]["warning_count"] for item in projects),
+            "name_warning_names": [item["name"] for item in projects if item["name_consistency"]["warning_count"]],
             "disqualified_projects": [], "legacy_conflict_projects": legacy_mismatches,
             "_inputs_by_relative_path": {},
         }
@@ -601,6 +664,7 @@ def _scan_title_body_qualification(
         name = str(source_item.get("title") or Path(relative_path).stem.removesuffix("说明"))
         diagnostic = str(result.get("diagnostic_code") or "")
         associated_files = list(source_item.get("associated_files", []))
+        source_item["name_consistency"] = _source_name_audit(source_item, config, check_names)
         if mode != "off" and not associated_files and relative_path:
             associated_files = [relative_path]
         item = {
@@ -621,6 +685,7 @@ def _scan_title_body_qualification(
             "cache_warning": source_item.get("cache_warning"),
             "diagnostic_code": diagnostic or result.get("diagnostic_code"),
             "result": result,
+            "name_consistency": source_item["name_consistency"],
             "action": "CONTINUE_WITH_REVIEW",
         }
         if relative_path:
@@ -663,6 +728,8 @@ def _scan_title_body_qualification(
         ),
         "failure_count": len(failures),
         "failures": failures,
+        "name_warning_count": sum(item["name_consistency"]["warning_count"] for item in projects),
+        "name_warning_names": [item["name"] for item in projects if item["name_consistency"]["warning_count"]],
         "projects": projects,
         "disqualified_projects": mismatches,
         "_inputs_by_relative_path": inputs_by_relative_path,
@@ -782,28 +849,18 @@ def _run_code_stage(
                 "docx": discovered.get("docx", ""), "pdf": discovered.get("pdf", ""),
                 "status": "FAILED", "deletions": 0, "error": str(exc), "findings": [],
             }
+        if row.get("page_60_lines") is not None and int(row["page_60_lines"]) < 51:
+            row["page_match"] = False
         if row.get("page_match") is False:
             target_pages = row.get("target_pages")
             actual_pages = row.get("actual_pages")
-            try:
-                page_deviation = int(actual_pages) - int(target_pages)
-            except (TypeError, ValueError):
-                page_deviation = None
-            within_page_tolerance = page_deviation is not None and abs(page_deviation) <= 1
-            row["page_tolerance_match"] = within_page_tolerance
-            if within_page_tolerance:
-                row["page_deviation_pages"] = page_deviation
-                row["page_deviation_note"] = (
-                    f"页数偏差在允许范围内：目标 {target_pages} 页，实际 {actual_pages} 页，"
-                    f"相差 {page_deviation:+d} 页（允许 ±1 页）"
-                )
-            else:
-                row["acceptance_error"] = (
-                    f"页数偏差超过允许范围：目标 {target_pages} 页，实际 {actual_pages} 页；"
-                    f"拟合过程已移除 {int(row.get('removed_translated_comments', 0))} 条译文注释"
-                )
-                if row.get("status") == "CLEANED":
-                    row["status"] = "CLEANED_PAGE_MISMATCH"
+            row["page_tolerance_match"] = False
+            row["acceptance_error"] = (
+                f"页数不足：至少 {target_pages} 页，实际 {actual_pages} 页；"
+                f"第 60 页需至少 51 行，实际 {row.get('page_60_lines', '未读取')} 行"
+            )
+            if row.get("status") == "CLEANED":
+                row["status"] = "CLEANED_PAGE_MISMATCH"
         item_failed = (
             row.get("status") not in {"READY", "CLEANED", "SKIPPED_TOPIC_MISMATCH"}
             or row.get("page_tolerance_match") is False
@@ -1003,9 +1060,10 @@ def _build_manual_cover_plan(
 
         actions: list[str] = []
         if "manual_cover" in selected:
-            # Static OOXML checks cannot know Word's actual pagination. Every
-            # selected manual therefore goes through the live Word/PDF audit.
-            actions.extend(["ENSURE_COVER_FIRST_PAGE", "AUDIT_ALL_PAGES", "NORMALIZE_COVER_STYLE", "EXPORT_PDF"])
+            # Word pagination details are deferred to a targeted repair only
+            # when the exported PDF screen finds a page anomaly. The PDF screen
+            # scans all pages without asking Word COM to map every paragraph.
+            actions.extend(["ENSURE_COVER_FIRST_PAGE", "AUDIT_PDF_ALL_PAGES", "NORMALIZE_COVER_STYLE", "EXPORT_PDF"])
             if audit.get("duplicate_cover_blocks") or audit.get("residual_manual_labels"):
                 actions.append("REMOVE_DUPLICATE_COVER_TEXT")
             if audit.get("cover_title_has_version"):
@@ -1199,6 +1257,65 @@ def _year_image_comparisons(path: Path, report: dict[str, Any]) -> str:
         return '<p>没有可展示的图片年份修改对比。</p>'
     return (f"<p>以下 {len(cards)} 张图片从原稿与处理后 DOCX 提取，确认存在像素变化。"
             "自动检测结果尚需逐张核验，不能仅据此认定年份改写正确。</p>" + "".join(cards))
+
+
+def _company_ocr_alerts(manual_report: dict[str, Any], effective_stages: list[str]) -> dict[str, Any]:
+    """Find a literal company marker in OCR text already produced for sampled images."""
+    if not {"match_manual_ocr", "match_manual_vision"}.intersection(effective_stages):
+        return {"status": "NOT_SELECTED", "scanned_image_count": 0, "warning_count": 0, "matches": []}
+    matches: list[dict[str, Any]] = []
+    scanned = 0
+    for project in manual_report.get("projects", []):
+        if not isinstance(project, dict):
+            continue
+        for sample in project.get("samples", []):
+            if not isinstance(sample, dict):
+                continue
+            scanned += 1
+            text = str(sample.get("ocr_text") or "")
+            count = text.count("公司")
+            if not count:
+                continue
+            lines = [line.strip() for line in text.splitlines() if "公司" in line]
+            matches.append({
+                "project": str(project.get("title") or Path(str(project.get("relative_path", ""))).stem.removesuffix("说明")),
+                "relative_path": str(project.get("relative_path") or ""),
+                "image": str(sample.get("image") or ""),
+                "sample_number": int(sample.get("index", -1)) + 1,
+                "occurrence_count": count,
+                "matched_lines": lines[:8],
+            })
+    return {
+        "status": "FOUND" if matches else "CLEAR",
+        "scanned_image_count": scanned,
+        "warning_count": sum(item["occurrence_count"] for item in matches),
+        "matching_image_count": len(matches),
+        "matches": matches,
+    }
+
+
+def _company_ocr_alert_html(alert: dict[str, Any]) -> str:
+    if alert.get("status") == "NOT_SELECTED":
+        return "<section><h2>图片 OCR 公司字样检查</h2><p>本次未选择截图 OCR 检查，未执行此项判断。</p></section>"
+    if alert.get("status") != "FOUND":
+        return (
+            '<section><h2>图片 OCR 公司字样检查</h2><p>已检查 {} 张抽样图片，OCR 文字中未发现“公司”。'
+            '此项只检查当前 OCR 抽样结果。</p></section>'
+        ).format(int(alert.get("scanned_image_count", 0)))
+    rows = []
+    for item in alert.get("matches", []):
+        evidence = "<br>".join(html.escape(line) for line in item.get("matched_lines", [])) or "OCR 识别到“公司”"
+        rows.append("<tr><td>{}</td><td>第 {} 张（{}）</td><td>{}</td><td>{}</td></tr>".format(
+            html.escape(item.get("project", "")), int(item.get("sample_number", 0)),
+            html.escape(item.get("image", "")), int(item.get("occurrence_count", 0)), evidence,
+        ))
+    return (
+        '<section class="company-word-alert"><h2>⚠ OCR 图片红色警告：发现“公司”字样</h2>'
+        '<p>在 {} 张抽样图片的 OCR 结果中命中 {} 次，涉及 {} 张图片。请核对截图是否包含公司名称或标识。</p>'
+        '<table><thead><tr><th>项目</th><th>图片</th><th>命中次数</th><th>OCR 原文</th></tr></thead><tbody>{}</tbody></table>'
+        '<p>这是人工复核提示，不会自动跳过或修改材料。</p></section>'
+    ).format(int(alert.get("scanned_image_count", 0)), int(alert.get("warning_count", 0)),
+             int(alert.get("matching_image_count", 0)), "".join(rows))
 
 
 def _write_report(path: Path, report: dict[str, Any]) -> None:
@@ -1464,12 +1581,16 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
     if not isinstance(qualification_metrics, dict):
         qualification_metrics = {}
     semantic_projects = qualification_metrics.get("projects", [])
+    name_warnings_html = render_name_warnings(semantic_projects if isinstance(semantic_projects, list) else [])
+    company_ocr_alert_html = _company_ocr_alert_html(report.get("company_ocr_alerts", {}))
     not_evaluated_count = sum(
         str(item.get("semantic_status", item.get("status", "NOT_EVALUATED"))).upper() == "NOT_EVALUATED"
         for item in semantic_projects if isinstance(item, dict)
     ) if isinstance(semantic_projects, list) else 0
     qualification_summary = (
         f"Provider {qualification_metrics.get('provider') or '未选择'}；模型 {qualification_metrics.get('model_id') or '未启动'}；"
+        f"MATCH 纳入 {int(qualification_metrics.get('qualified_project_count', 0) or 0)}/"
+        f"{int(qualification_metrics.get('input_project_count', 0) or 0)} 件；"
         f"缓存命中 {int(qualification_metrics.get('cache_hit_count', 0) or 0)}；"
         f"生成请求 {int(qualification_metrics.get('model_request_count', 0) or 0)}；"
         f"故障 {int(qualification_metrics.get('failure_count', 0) or 0)}；"
@@ -1514,16 +1635,28 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
         mismatch_clipboard_html += (
             "<pre class=note>" + html.escape(str(mismatch_clipboard["text"])) + "</pre>"
         )
+    hollow_line_alerts = report.get("ai_hollow_line_alerts", [])
+    hollow_line_check_selected = "manual_ai_hollow_lines" in report.get("effective_stages", [])
+    hollow_line_alert_html = (
+        '<section class="name-alert"><h2>空心线检测报告</h2><p>发现参考图所示的横向空心线，请将以下说明书发给其他人：</p><ul>'
+        + "".join(f"<li><b>{html.escape(str(item.get('name', '')))}</b>：{html.escape(str(item.get('message', '')))}</li>" for item in hollow_line_alerts)
+        + "</ul></section>"
+        if hollow_line_alerts else (
+            "<section><h2>空心线检测报告</h2><p>未发现参考图所示的横向空心线。</p></section>"
+            if hollow_line_check_selected else "<section><h2>空心线检测报告</h2><p>本次未选择此项检测。</p></section>"
+        )
+    )
     document = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>材料统一处理报告</title>
-<style>body{{font:15px/1.6 'Microsoft YaHei',sans-serif;max-width:1100px;margin:30px auto;color:#17202a}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #d9e2ec;padding:9px;text-align:left}}th{{background:#eef4ff}}section{{margin:24px 0}}.note,.review{{background:#fff7e6;padding:12px}}.comparison{{border:1px solid #d9e2ec;padding:14px;margin:18px 0}}.comparison h3{{overflow-wrap:anywhere}}.pair{{display:flex;gap:16px;flex-wrap:wrap}}figure{{margin:0;flex:1 1 300px;min-width:0}}figure img{{max-width:100%;max-height:460px;object-fit:contain;border:1px solid #ddd}}figcaption{{font-weight:bold}}</style></head><body>
+<style>body{{font:15px/1.6 'Microsoft YaHei',sans-serif;max-width:1100px;margin:30px auto;color:#17202a}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #d9e2ec;padding:9px;text-align:left}}th{{background:#eef4ff}}section{{margin:24px 0}}.note,.review{{background:#fff7e6;padding:12px}}.name-alert{{background:#fff0f0;color:#a31515;border:2px solid #c62828;padding:12px}}.company-word-alert{{background:#ffe5e5;color:#8c1010;border:4px solid #c00000;padding:16px;box-shadow:0 0 0 3px #f4b4b4}}.company-word-alert h2{{margin-top:0}}.comparison{{border:1px solid #d9e2ec;padding:14px;margin:18px 0}}.comparison h3{{overflow-wrap:anywhere}}.pair{{display:flex;gap:16px;flex-wrap:wrap}}figure{{margin:0;flex:1 1 300px;min-width:0}}figure img{{max-width:100%;max-height:460px;object-fit:contain;border:1px solid #ddd}}figcaption{{font-weight:bold}}</style></head><body>
 <h1>材料统一处理{'执行结果' if report['applied'] else '执行前预览'}</h1>
 <p class="note">本次选择：{html.escape(selected_names)}。执行顺序：{html.escape(execution_order)}。未选步骤跳过；必要依赖和未同步导出提醒见下方。</p>
 <p><b>自动依赖：</b>{html.escape(dependency_rows)}<br><b>一致性提醒：</b>{html.escape(warning_rows)}</p>
-<p>状态：{html.escape(report['status'])}；失败/待处理项：{report['failures']}；输出目录：{html.escape(str(report.get('output') or '预览未创建'))}</p>
+<p>状态：{html.escape(report['status'])}；失败/待处理项：{report['failures']}；输出目录：{html.escape(str(report.get('output') or '预览未创建'))}；输出名称：{html.escape(str(report.get('planned_output_label') or '未生成'))}（后接“_已处理_时间戳”）</p>
 <table><thead><tr><th>阶段</th><th>状态</th><th>失败/待处理</th></tr></thead><tbody>{''.join(stage_rows)}</tbody></table>
-<section><h2>标题与正文语义资格（全部项目）</h2><p>资格模式：{html.escape(str(qualification_metrics.get('mode', 'unknown')))}；Jev 成功返回 Score 后按唯一配置阈值二分为 MATCH/MISMATCH，置信度只用于监控。API、输入或配对故障显示为 NOT_EVALUATED。Jev 的有序等级分数归一为 0–100，阈值初值尚未校准。{html.escape(qualification_summary)}</p>{mismatch_clipboard_html}<table><thead><tr><th>项目名称</th><th>Jev匹配分与置信度</th><th>检测结果</th><th>流程决定</th><th>理由、概率、token、耗时</th></tr></thead><tbody>{''.join(similarity_rows) or '<tr><td colspan="5">未扫描说明书</td></tr>'}</tbody></table></section>
-<section><h2>不匹配项目</h2><p>仅 enforced 模式可按配置跳过；shadow 模式只记录结果并继续处理。跳过或 hold 只影响后续处理，原件保留在输出目录。</p><table><thead><tr><th>项目名称</th><th>流程决定</th><th>理由与正文证据</th></tr></thead><tbody>{''.join(disqualified_rows) or '<tr><td colspan="3">无</td></tr>'}</tbody></table></section>
-<section><h2>说明书相关性、正文年份与图片年份</h2><p>标题正文资格使用配对 TXT 文件名与说明书正文证据；视觉复核仅提供人工审核证据，不参与现有 OCR 拦截及批量熔断。</p><p>{vision_details}</p><table><thead><tr><th>说明书</th><th>处理状态</th><th>标题正文资格</th><th>抽样图片 OCR</th><th>视觉复核</th><th>正文年份</th><th>图片年份</th></tr></thead><tbody>{''.join(manual_rows)}</tbody></table>{''.join(visual_rows)}</section>
+<section><h2>软件名称一致性检查</h2>{name_warnings_html}</section>
+<section><h2>标题与正文语义资格（全部项目）</h2><p>资格模式：{html.escape(str(qualification_metrics.get('mode', 'unknown')))}；Jev 成功返回 Score 后按唯一配置阈值二分为 MATCH/MISMATCH，置信度只用于监控。API、输入或配对故障显示为 NOT_EVALUATED。只有 MATCH 项目进入本次处理副本；MISMATCH 与 NOT_EVALUATED 留在原输入。Jev 的有序等级分数归一为 0–100，阈值初值尚未校准。{html.escape(qualification_summary)}</p>{mismatch_clipboard_html}<table><thead><tr><th>项目名称</th><th>Jev匹配分与置信度</th><th>检测结果</th><th>流程决定</th><th>理由、概率、token、耗时</th></tr></thead><tbody>{''.join(similarity_rows) or '<tr><td colspan="5">未扫描说明书</td></tr>'}</tbody></table></section>
+<section><h2>未纳入项目</h2><p>MISMATCH 与 NOT_EVALUATED 项目不会复制到处理后文件夹，也不会进入后续修改；原始输入保持完整。</p><table><thead><tr><th>项目名称</th><th>流程决定</th><th>理由与正文证据</th></tr></thead><tbody>{''.join(disqualified_rows) or '<tr><td colspan="3">无</td></tr>'}</tbody></table></section>
+{hollow_line_alert_html}{company_ocr_alert_html}<section><h2>说明书相关性、正文年份与图片年份</h2><p>标题正文资格使用配对 TXT 文件名与说明书正文证据；视觉复核仅提供人工审核证据，不参与现有 OCR 拦截及批量熔断。</p><p>{vision_details}</p><table><thead><tr><th>说明书</th><th>处理状态</th><th>标题正文资格</th><th>抽样图片 OCR</th><th>视觉复核</th><th>正文年份</th><th>图片年份</th></tr></thead><tbody>{''.join(manual_rows)}</tbody></table>{''.join(visual_rows)}</section>
 <section><h2>TXT 明细（逐件）</h2><p>自动修改仅限主要功能字段；编码、字段名、功能字段以外的文字均保留。</p><table><thead><tr><th>文件</th><th>原编码</th><th>处理结果</th><th>检查结果</th><th>主要功能修改前后</th></tr></thead><tbody>{''.join(txt_rows) or '<tr><td colspan="5">未处理 TXT</td></tr>'}</tbody></table></section>
 <section><h2>图片变化前后对比（待核验）</h2>{year_comparisons}</section>
 <section><h2>封面、页眉、页码与说明书 PDF</h2><p>逐本显示名称来源、名称冲突、Word/PDF 页数、全书疑似空白页复核、修复尝试及项目快照回退情况。点击异常页截图可查看原尺寸。</p><table><thead><tr><th>项目与验收</th><th>计划动作</th><th>实际动作</th><th>仍需处理</th></tr></thead><tbody>{''.join(cover_rows) or '<tr><td colspan="4">未选择页面整理或 PDF 导出</td></tr>'}</tbody></table><div class="pair">{''.join(cover_evidence)}</div></section>
@@ -1545,6 +1678,199 @@ def _unique_output(source: Path, label: str) -> Path:
     return output
 
 
+def _output_customer_label(label: str, qualified_count: int, total_count: int) -> str:
+    """Add the qualified/total project counts while preserving the customer name."""
+    customer = re.sub(r"\d+\s*件$", "", label).rstrip(" _-")
+    if not customer:
+        customer = label.rstrip(" _-")
+    return f"{customer}{qualified_count}件（共{total_count}件）"
+
+
+def _relative_material_path(root: Path, value: Any) -> Path | None:
+    raw = str(value or "").strip().replace("\\", "/")
+    if not raw:
+        return None
+    posix = PurePosixPath(raw)
+    if posix.is_absolute() or any(part in {"..", ""} for part in posix.parts):
+        return None
+    relative = Path(*posix.parts)
+    try:
+        (root / relative).resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    return relative
+
+
+def _qualified_material_plan(
+    source_root: Path,
+    projects: list[dict[str, Any]],
+) -> tuple[list[Path], set[str], set[str], int, int]:
+    """Plan a safe MATCH-only copy, retaining complete isolated project folders."""
+    rows: list[tuple[dict[str, Any], str, Path | None]] = []
+    for item in projects:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("semantic_status", item.get("status", "NOT_EVALUATED"))).upper()
+        relative = _relative_material_path(source_root, item.get("relative_path"))
+        rows.append((item, status, relative))
+
+    matched = [row for row in rows if row[1] == "MATCH"]
+    excluded_files: set[str] = set()
+    matched_files: set[str] = set()
+    for item, status, _ in rows:
+        raw_files = item.get("associated_files")
+        if not isinstance(raw_files, (list, tuple)) or not raw_files:
+            raw_files = [item.get("relative_path")]
+        target = matched_files if status == "MATCH" else excluded_files
+        for raw in raw_files:
+            relative = _relative_material_path(source_root, raw)
+            if relative is not None:
+                target.add(relative.as_posix())
+
+    # A project directory is a safe copy unit only when every evaluated manual
+    # beneath it passed. Shared/flat directories fall back to the exact paired
+    # file set so neighboring rejected projects cannot leak into the output.
+    candidate_dirs: set[Path] = set()
+    for _item, status, relative in matched:
+        if status != "MATCH" or relative is None or relative.parent == Path("."):
+            continue
+        project_dir = relative.parent
+        descendants = [
+            other for other in rows
+            if other[2] is not None and other[2].is_relative_to(project_dir)
+        ]
+        if descendants and all(other[1] == "MATCH" for other in descendants):
+            candidate_dirs.add(project_dir)
+
+    copy_dirs: list[Path] = []
+    for directory in sorted(candidate_dirs, key=lambda path: (len(path.parts), path.as_posix().casefold())):
+        if not any(parent == directory or parent in directory.parents for parent in copy_dirs):
+            copy_dirs.append(directory)
+
+    qualified_count = 0
+    for item, status, manual_path in matched:
+        raw_files = item.get("associated_files")
+        if not isinstance(raw_files, (list, tuple)) or not raw_files:
+            raw_files = [item.get("relative_path")]
+        candidates = [manual_path] if manual_path is not None else []
+        candidates.extend(
+            relative for raw in raw_files
+            if (relative := _relative_material_path(source_root, raw)) is not None
+        )
+        if any(
+            relative.as_posix() not in excluded_files
+            and (
+                relative.as_posix() in matched_files
+                or any(relative.is_relative_to(directory) for directory in copy_dirs)
+            )
+            and (source_root / relative).is_file()
+            for relative in candidates
+        ):
+            qualified_count += 1
+
+    return copy_dirs, matched_files, excluded_files, qualified_count, len(rows)
+
+
+def _path_is_qualified(
+    path: Path,
+    source_root: Path,
+    copy_dirs: list[Path],
+    matched_files: set[str],
+    excluded_files: set[str],
+) -> bool:
+    try:
+        relative = path.resolve().relative_to(source_root.resolve())
+    except (OSError, ValueError):
+        return False
+    relative_name = relative.as_posix()
+    if relative_name in excluded_files:
+        return False
+    return relative_name in matched_files or any(relative.is_relative_to(directory) for directory in copy_dirs)
+
+
+def _copy_qualified_materials(
+    source_root: Path,
+    output_root: Path,
+    plan: tuple[list[Path], set[str], set[str], int, int],
+) -> list[str]:
+    """Copy only the files selected by a validated MATCH-only project plan."""
+    copy_dirs, matched_files, excluded_files, _qualified_count, _total_count = plan
+
+    output_root.mkdir(parents=True, exist_ok=False)
+    copied: set[str] = set()
+    for relative_dir in copy_dirs:
+        source_dir = (source_root / relative_dir).resolve()
+        try:
+            source_dir.relative_to(source_root.resolve())
+        except ValueError:
+            continue
+        if not source_dir.is_dir():
+            continue
+
+        def ignore_excluded(directory: str, names: list[str]) -> list[str]:
+            ignored = []
+            base = Path(directory)
+            for name in names:
+                candidate = base / name
+                if candidate.is_file():
+                    relative = candidate.relative_to(source_root).as_posix()
+                    if relative in excluded_files:
+                        ignored.append(name)
+                    else:
+                        copied.add(relative)
+            return ignored
+
+        destination_dir = output_root / relative_dir
+        destination_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source_dir, destination_dir, dirs_exist_ok=True, ignore=ignore_excluded)
+
+    for raw in sorted(matched_files - excluded_files):
+        if any(Path(raw).is_relative_to(directory) for directory in copy_dirs):
+            continue
+        relative = Path(raw)
+        source_file = (source_root / relative).resolve()
+        try:
+            source_file.relative_to(source_root.resolve())
+        except ValueError:
+            continue
+        if not source_file.is_file():
+            continue
+        destination_file = output_root / relative
+        destination_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, destination_file)
+        copied.add(relative.as_posix())
+    return sorted(copied)
+
+
+def _recover_processed_outputs(
+    source_path: Path,
+    legacy_label: str,
+    customer_label: str,
+    total_count: int,
+) -> list[dict[str, Any]]:
+    """Recover pending cover writes in both legacy and counted output folders."""
+    from validation_isolation import require_validation_path
+
+    output_prefixes = {f"{legacy_label}_已处理_"}
+    output_prefixes.update(
+        f"{customer_label}{count}件（共{total_count}件）_已处理_"
+        for count in range(max(0, total_count) + 1)
+    )
+    recovered = process_batch.recover_pending_cover_transactions(source_path)
+    if not source_path.parent.is_dir():
+        return recovered
+    for sibling in source_path.parent.iterdir():
+        if (
+            not sibling.is_dir()
+            or not any(sibling.name.startswith(prefix) for prefix in output_prefixes)
+            or not (sibling / process_batch.COVER_TRANSACTION_FILENAME).is_file()
+        ):
+            continue
+        checked = require_validation_path(sibling, kind="material", same_run_as=source_path)
+        recovered.extend(process_batch.recover_pending_cover_transactions(checked))
+    return recovered
+
+
 def run(
     source: str | Path,
     work: str | Path,
@@ -1555,6 +1881,7 @@ def run(
     manual_options: dict[str, Any] | None = None,
     document_stages: str | list[str] | tuple[str, ...] | None = None,
     skip_topic_mismatch: bool = True,
+    expand_order_downloads: bool = False,
     clipboard_writer: Any = None,
 ) -> dict[str, Any]:
     from validation_isolation import require_validation_path
@@ -1571,11 +1898,12 @@ def run(
     if "manual_cover" in effective and "manual_pdf" not in effective:
         effective.add("manual_pdf")
         auto_dependencies.append({"option": "manual_pdf", "reason": "封面修复需要导出并逐页验收与 DOCX 同步的 PDF"})
-    if skip_topic_mismatch and "match_title_body" not in effective:
+    needs_qualification_gate = skip_topic_mismatch and bool(effective - {"match_software_name"})
+    if needs_qualification_gate and "match_title_body" not in effective:
         effective.add("match_title_body")
         auto_dependencies.append({"option": "match_title_body", "reason": "默认资格门禁需要筛出标题正文主题冲突项目"})
     selected_stages = tuple(option for option in WORKFLOW_OPTION_ORDER if option in effective)
-    manual_content_options = {"match_title_body", "match_manual_ocr", "match_manual_vision", "manual_body_years", "manual_image_dates"}
+    manual_content_options = {"match_title_body", "match_manual_ocr", "match_manual_vision", "manual_body_years", "manual_image_dates", "manual_ai_hollow_lines"}
     manual_format_options = {"manual_cover", "manual_header", "manual_page_numbers", "manual_pdf"}
     code_options = {"match_code", "code_cleanup", "code_pdf"}
     txt_options = {"match_txt", "txt_repair"}
@@ -1590,18 +1918,14 @@ def run(
     source_path = require_validation_path(source, kind="material")
     require_validation_path(work_path, kind="workspace")
     work_path.mkdir(parents=True, exist_ok=True)
-    material_root, label = _material_root(source_path, work_path, app_root_path)
-    planned_output = _unique_output(source_path, label) if apply else None
-    if planned_output is not None:
-        require_validation_path(planned_output, kind="material", same_run_as=source_path)
-    recovered_cover_transactions = process_batch.recover_pending_cover_transactions(
-        source_path, output_prefix=f"{label}_已处理_",
-    )
-
+    material_root, label = _material_root(source_path, work_path, app_root_path, expand_order_downloads=expand_order_downloads)
     all_manuals = list(material_root.rglob("*说明.docx"))
-    qualification_requested = "match_title_body" in effective or skip_topic_mismatch
-    manual_count = len(all_manuals) if manual_selected or qualification_requested else 0
-    qualification_count = manual_count if qualification_requested else 0
+    qualification_requested = "match_title_body" in effective or needs_qualification_gate
+    name_check_requested = "match_software_name" in effective
+    scan_requested = qualification_requested or name_check_requested
+    source_manual_count = len(all_manuals)
+    manual_count = source_manual_count if manual_selected or scan_requested else 0
+    qualification_count = source_manual_count if scan_requested else 0
     code_count = len(_code_inventory(material_root, inspect=False)) if code_selected else 0
     txt_count = sum(path.is_file() and path.suffix.casefold() == ".txt" for path in material_root.rglob("*")) if txt_selected else 0
     total = manual_count + code_count + (max(1, txt_count) if txt_selected else 0)
@@ -1615,15 +1939,16 @@ def run(
     excluded_projects: list[dict[str, Any]] = []
     title_body_inputs: dict[str, dict[str, Any]] = {}
     title_body_path, title_body_config = _title_body_config(app_root_path)
-    title_body_mode = str(title_body_config.get("mode", "shadow")).casefold()
-    skip_mismatch_requested = bool(title_body_config.get("skip_mismatch_requested", False)) and bool(skip_topic_mismatch)
+    title_body_mode = str(title_body_config.get("mode", "enforced")).casefold()
+    skip_mismatch_requested = bool(title_body_config.get("skip_mismatch_requested", True)) and bool(skip_topic_mismatch)
     not_evaluated_action = str(title_body_config.get("not_evaluated_action", "hold_changes")).casefold()
     qualification_report: dict[str, Any] = {
         "status": "NOT_RUN", "mode": title_body_mode, "scanned_count": 0,
         "failure_count": 0, "failures": [], "disqualified_projects": [],
         "cache_hit_count": 0, "model_request_count": 0,
     }
-    if qualification_requested:
+    output_copy_plan: tuple[list[Path], set[str], set[str], int, int] | None = None
+    if scan_requested:
         qualification_report = _scan_title_body_qualification(
             material_root,
             progress=progress if not manual_content_selected else None,
@@ -1631,14 +1956,40 @@ def run(
             app_root=app_root_path,
             config_path=title_body_path,
             progress_current=0 if manual_content_selected else None,
+            check_names=name_check_requested,
+            local_only=not qualification_requested,
         )
         title_body_inputs = qualification_report.pop("_inputs_by_relative_path", {})
         qualification_report["skip_mismatch_requested"] = skip_mismatch_requested
-        qualification_report["skip_mismatch_effective"] = title_body_mode == "enforced" and skip_mismatch_requested
         qualification_report["not_evaluated_action"] = not_evaluated_action
+        projects = qualification_report.get("projects", [])
+        if not isinstance(projects, list):
+            projects = []
+            qualification_report["projects"] = projects
+        match_only_output = qualification_requested and bool(skip_topic_mismatch)
+        if match_only_output:
+            output_copy_plan = _qualified_material_plan(material_root, projects)
+            qualified_count = output_copy_plan[3]
+            total_project_count = output_copy_plan[4]
+        else:
+            qualified_count = sum(
+                str(item.get("semantic_status", item.get("status", "NOT_EVALUATED"))).upper() == "MATCH"
+                for item in projects if isinstance(item, dict)
+            )
+            total_project_count = len([item for item in projects if isinstance(item, dict)])
+        qualification_report["qualified_project_count"] = qualified_count
+        qualification_report["input_project_count"] = total_project_count
+        qualification_report["output_selection"] = "MATCH_ONLY" if match_only_output else "ALL_BY_REQUEST"
+        qualification_report["skip_mismatch_effective"] = match_only_output
         for item in qualification_report.get("projects", []):
+            if not qualification_requested:
+                continue
             semantic_status = str(item.get("semantic_status", item.get("status", "NOT_EVALUATED"))).upper()
-            if title_body_mode == "off":
+            if match_only_output and semantic_status == "MISMATCH":
+                action = "SKIP_TITLE_BODY_MISMATCH"
+            elif match_only_output and semantic_status != "MATCH":
+                action = "HOLD_NOT_EVALUATED"
+            elif title_body_mode == "off":
                 action = "SKIP_TITLE_BODY_MISMATCH" if item.get("legacy_status") == "review_topic_mismatch" and skip_topic_mismatch else "CONTINUE_WITH_REVIEW"
             elif title_body_mode == "enforced" and semantic_status == "MISMATCH" and skip_mismatch_requested:
                 action = "SKIP_TITLE_BODY_MISMATCH"
@@ -1662,6 +2013,46 @@ def run(
                 item for item in qualification_report.get("projects", [])
                 if item.get("semantic_status", item.get("status")) == "MISMATCH"
             ]
+        all_selected_code_rows = _code_inventory(material_root, inspect=False) if code_selected else []
+        if output_copy_plan is not None:
+            copy_dirs, matched_files, excluded_files, _qualified_count, _total_count = output_copy_plan
+            manual_count = qualified_count if manual_selected or qualification_requested else 0
+            code_count = sum(
+                _path_is_qualified(
+                    Path(str(row.get("docx") or row.get("pdf") or "")), material_root,
+                    copy_dirs, matched_files, excluded_files,
+                )
+                for row in all_selected_code_rows
+                if row.get("docx") or row.get("pdf")
+            )
+            txt_count = sum(
+                path.is_file() and path.suffix.casefold() == ".txt"
+                and _path_is_qualified(path, material_root, copy_dirs, matched_files, excluded_files)
+                for path in material_root.rglob("*")
+            ) if txt_selected else 0
+            total = qualification_count + (code_count if code_selected else 0) + (max(1, txt_count) if txt_selected else 0)
+            if progress is not None and hasattr(progress, "set_total"):
+                progress.set_total(total)
+        else:
+            total_project_count = source_manual_count
+            qualified_count = source_manual_count
+            manual_count = source_manual_count if manual_selected or scan_requested else 0
+            total = manual_count + code_count + (max(1, txt_count) if txt_selected else 0)
+            if progress is not None and hasattr(progress, "set_total"):
+                progress.set_total(total)
+
+    else:
+        total_project_count = source_manual_count
+        qualified_count = source_manual_count
+
+    output_label = _output_customer_label(label, qualified_count, total_project_count)
+    customer_label = re.sub(r"\d+\s*件$", "", label).rstrip(" _-") or label.rstrip(" _-")
+    recovered_cover_transactions = _recover_processed_outputs(
+        source_path, label, customer_label, total_project_count,
+    )
+    planned_output = _unique_output(source_path, output_label) if apply else None
+    if planned_output is not None:
+        require_validation_path(planned_output, kind="material", same_run_as=source_path)
 
     mismatch_names = _mismatch_names(qualification_report.get("projects", []))
     mismatch_clipboard = _copy_mismatch_summary(
@@ -1670,12 +2061,15 @@ def run(
     qualification_report["mismatch_names"] = mismatch_names
     qualification_report["mismatch_clipboard"] = mismatch_clipboard
     progress_name = mismatch_clipboard["text"] or "未发现 MISMATCH 项目"
+    name_warning_names = qualification_report.get("name_warning_names", [])
+    if name_warning_names:
+        progress_name += "\n软件名称不一致，请复核：\n" + "\n".join(dict.fromkeys(name_warning_names))
     if mismatch_names and not apply:
         progress_name = f"预览（未复制剪贴板）：\n{progress_name}"
-    if qualification_requested:
+    if scan_requested:
         _publish_progress(
             progress,
-            "标题正文资格预检完成",
+            "标题正文资格预检完成" if qualification_requested else "软件名称一致性检查完成",
             qualification_count,
             progress_name,
             failures=int(qualification_report.get("failure_count", 0) or 0),
@@ -1688,7 +2082,10 @@ def run(
     if apply:
         output = planned_output
         assert output is not None
-        shutil.copytree(material_root, output)
+        if output_copy_plan is not None:
+            _copy_qualified_materials(material_root, output, output_copy_plan)
+        else:
+            shutil.copytree(material_root, output)
         processing_root = output
 
     if manual_content_selected:
@@ -1701,6 +2098,7 @@ def run(
         options["check_image_vision"] = "match_manual_vision" in effective
         options["rewrite_body_years"] = "manual_body_years" in effective
         options["rewrite_image_dates"] = "manual_image_dates" in effective
+        options["check_ai_hollow_lines"] = "manual_ai_hollow_lines" in effective
         options["title_body_inputs_by_relative_path"] = title_body_inputs if qualification_requested else None
         options["title_body_mode"] = title_body_mode
         options["skip_mismatch"] = skip_mismatch_requested
@@ -1708,7 +2106,7 @@ def run(
         manual_report_path = work_path / ("combined_manual_result.json" if apply else "combined_manual_preview.json")
         manual_report = manual_content_stage.run_manual_content_stage(
             processing_root, processing_root, manual_report_path,
-            progress=_StageProgress(progress, 0), apply=apply, **options,
+            progress=_StageProgress(progress, 0, floor_current=qualification_count), apply=apply, **options,
         )
         for project in manual_report.get("projects", []):
             if project.get("qualification_action") in {"SKIP_MISMATCH", "HOLD_NOT_EVALUATED"}:
@@ -1772,6 +2170,7 @@ def run(
         txt_stage["options"] = [key for key in selected_stages if key in txt_options]
     failures = manual_failures + code_failures + int(txt_stage.get("failures", 0))
     status = PREVIEW_STATUS if not apply else ("DOCUMENT_PROCESSING_PARTIAL" if failures else "DOCUMENT_PROCESSING_OK")
+    company_ocr_alerts = _company_ocr_alerts(manual_stage, selected_stages)
     report = {
         "version": VERSION,
         "created_at": datetime.now().astimezone().isoformat(),
@@ -1781,6 +2180,12 @@ def run(
         "applied": apply,
         "status": status,
         "output": str(output) if output else None,
+        "planned_output_label": output_label,
+        "output_counts": {
+            "qualified_projects": qualified_count,
+            "total_projects": total_project_count,
+            "selection": qualification_report.get("output_selection", "ALL_BY_REQUEST"),
+        },
         "failures": failures,
         "stage_order": ["标题与说明书匹配资格预检", "说明书内容检测及所选修改", "说明书封面/页眉/页码整理及 PDF 导出", "代码检测/注释清理及 PDF 导出", "TXT 检查与修复", "统一报告"],
         "selected_stages": list(requested_options),
@@ -1797,6 +2202,11 @@ def run(
             "held_count": sum(item.get("action") == "HOLD_NOT_EVALUATED" for item in excluded_projects),
             **qualification_report,
         },
+        "company_ocr_alerts": company_ocr_alerts,
+        "ai_hollow_line_alerts": [
+            {"name": project.get("title") or Path(str(project.get("relative_path", "")).replace("\\", "/")).stem.removesuffix("说明"), "relative_path": project.get("relative_path"), "message": project.get("ai_hollow_line_alert")}
+            for project in manual_stage.get("projects", []) if project.get("ai_hollow_line_findings")
+        ],
         "stages": {"manual": manual_stage, "code": code_stage, "txt": txt_stage},
     }
     report_path = work_path / ("combined_document_result.json" if apply else "combined_document_preview.json")
@@ -1805,6 +2215,7 @@ def run(
         progress,
         "材料统一处理完成" if apply else "材料统一预检完成",
         total,
+        "软件名称不一致，请复核：" + "、".join(name_warning_names) if name_warning_names else "",
         status="FAILED" if failures else "DONE",
         failures=failures,
         active=False,
@@ -1817,6 +2228,8 @@ def run(
         "outputs": [str(output)] if output else [],
         "failures": failures,
         "work_dir": str(work_path),
+        "name_warning_count": int(qualification_report.get("name_warning_count", 0)),
+        "name_warning_names": name_warning_names,
     }
 
 

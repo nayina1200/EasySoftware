@@ -47,7 +47,13 @@ For `MISSING_DEPENDENCIES`, `FAILED`, or any other status, report the exact retu
 - 默认 `provider=typesafe_jev`，使用标准库 HTTP 调用 `https://api.typesafe.ai/v1/systemone` 和固定模型 `jev-1.13.0`。从 `TYPESAFE_API_KEY` 环境变量读取凭据；不得把 key 写入配置、报告或缓存身份。便携 Python 不要求安装 TypeSafe SDK。明确选择 `provider=local_llama` 时可回滚旧 runtime。
 - 一次 Score 请求对 0–4 有序语义等级评分，再线性映射到 0–100。唯一可配置合格线产生 `MATCH` 或 `MISMATCH`；默认 70 尚未校准。confidence 和等级概率仅作监控指标，不参与二分结果。
 - 有效语义状态只有 `MATCH`、`MISMATCH`。API key 缺失、服务错误、无效响应、配对问题及完整输入超出限制均记 `NOT_EVALUATED`/失败；不可把 Score-only 结果包装成段落引文。超限时不裁剪正文。
-- 默认 `mode=shadow`、`enforce=false`；没有真实 key 和 13 件模型评估时，不宣称业务标签验收通过。
+- 默认 `mode=enforced`、`enforce=true`；仅 MATCH 项目会复制到处理后目录并继续处理，MISMATCH 和 NOT_EVALUATED 留在原输入。
+- 输出目录名为 `客户名{MATCH件数}件（共{识别项目总数}件）_已处理_{时间戳}`。总件数统计筛选前识别出的全部项目；既有目录不改名。
+- 默认评分线为 70，尚未用独立留出集校准；模型或输入故障记为 NOT_EVALUATED，不能当作 MATCH。不要据此宣称 13 件业务标签已完成独立验收。
+
+## 说明书 AI 空心线检测
+
+自定义流程“说明书页面整理”中的“检测空心线”可独立运行。它检查 DOCX 中横向细长的空心矩形，命中时在报告中单独列出说明书名称，并提示“需要将该说明书（说明书名称）发给其他人。”；只检测和报告，不修改材料。
 
 ## Complete programmatic scope
 

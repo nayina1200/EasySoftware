@@ -76,6 +76,8 @@ try {
         New-Item -ItemType Directory -Path $itemDir -Force | Out-Null
         $itemResult = Join-Path $itemDir "result.json"
         $pidPath = Join-Path $itemDir "word.pid"
+        $childStdout = Join-Path $itemDir "stdout.txt"
+        $childStderr = Join-Path $itemDir "stderr.txt"
         $itemStarted = [DateTime]::UtcNow
         $child = $null
         $wordPidsBefore = Get-WordProcessIds
@@ -92,7 +94,7 @@ try {
                 "-DocxPath", $docx.FullName, "-TemporaryPdfPath", $temporaryPdf,
                 "-ResultPath", $itemResult, "-PidPath", $pidPath
             ) | ForEach-Object { Quote-ProcessArgument ([string]$_) }) -join " "
-            $child = Start-Process -FilePath $shell -ArgumentList $arguments -PassThru -WindowStyle Hidden
+            $child = Start-Process -FilePath $shell -ArgumentList $arguments -PassThru -WindowStyle Hidden -RedirectStandardOutput $childStdout -RedirectStandardError $childStderr
             if (-not $child.WaitForExit($ItemTimeoutSeconds * 1000)) {
                 $message = "SINGLE_DOCUMENT_TIMEOUT"
                 $newWordPids = @(Get-WordProcessIds | Where-Object { $_ -notin $wordPidsBefore })
@@ -105,7 +107,18 @@ try {
                     Move-Item -LiteralPath $temporaryPdf -Destination $pdf -Force
                     $results += [pscustomobject]@{ name = $docx.BaseName; docx = $docx.FullName; pdf = $pdf; status = "OK"; seconds = [Math]::Round(([DateTime]::UtcNow - $itemStarted).TotalSeconds, 2) }
                 } else {
-                    $errorText = if ($null -ne $row) { [string]$row.error } else { "CHILD_PROCESS_NO_REPORT" }
+                    if ($null -ne $row) {
+                        $errorText = [string]$row.error
+                    } else {
+                        $details = @("CHILD_PROCESS_NO_REPORT", "exit=$($child.ExitCode)")
+                        foreach ($outputPath in @($childStderr, $childStdout)) {
+                            if (Test-Path -LiteralPath $outputPath -PathType Leaf) {
+                                $outputText = ([string](Get-Content -LiteralPath $outputPath -Raw -ErrorAction SilentlyContinue)).Trim()
+                                if ($outputText) { $details += $outputText.Substring(0, [Math]::Min(1200, $outputText.Length)); break }
+                            }
+                        }
+                        $errorText = $details -join ": "
+                    }
                     $results += [pscustomobject]@{ name = $docx.BaseName; docx = $docx.FullName; pdf = $pdf; status = "FAILED"; error = $errorText; seconds = [Math]::Round(([DateTime]::UtcNow - $itemStarted).TotalSeconds, 2) }
                 }
             }

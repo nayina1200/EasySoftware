@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -22,6 +23,67 @@ SPEC.loader.exec_module(WORKFLOW)
 
 
 class ProgressReportingTests(unittest.TestCase):
+    def test_progress_file_replace_retries_temporary_windows_access_denial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "progress.json"
+            real_replace = WORKFLOW.os.replace
+            attempts = 0
+
+            def temporarily_locked(source, destination):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError(5, "Access is denied", str(destination))
+                return real_replace(source, destination)
+
+            with mock.patch.object(WORKFLOW.os, "replace", side_effect=temporarily_locked), \
+                    mock.patch.object(WORKFLOW.time, "sleep"):
+                WORKFLOW.atomic_json(target, {"status": "RUNNING"})
+
+            self.assertEqual(attempts, 3)
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["status"], "RUNNING")
+
+    def test_document_failure_emits_json_even_if_progress_file_is_locked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            archive = base / "batch.rar"
+            work = base / "work"
+            archive.write_bytes(b"rar")
+            failing_module = types.SimpleNamespace(run=mock.Mock(side_effect=RuntimeError("processing failed")))
+            arguments = ["unified_workflow.py", str(archive), "--process-documents", "--work-dir", str(work)]
+            output = io.StringIO()
+            with mock.patch.dict(sys.modules, {"combined_document_workflow": failing_module}), \
+                    mock.patch.object(WORKFLOW, "activate_optimization_isolation", return_value=False), \
+                    mock.patch.object(WORKFLOW.ProgressReporter, "update", side_effect=PermissionError("progress locked")), \
+                    mock.patch.object(sys, "argv", arguments), contextlib.redirect_stdout(output):
+                exit_code = WORKFLOW.main()
+
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(json.loads(output.getvalue())["error"], "processing failed")
+
+    def test_document_processing_continues_when_progress_file_remains_locked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            archive = base / "batch.rar"
+            work = base / "work"
+            archive.write_bytes(b"rar")
+
+            def complete_processing(_input, _work, _root, **options):
+                options["progress"].update("预检完成", 1, "材料")
+                return {"version": WORKFLOW.VERSION, "status": "DOCUMENT_PROCESSING_OK"}
+
+            module = types.SimpleNamespace(run=complete_processing)
+            arguments = ["unified_workflow.py", str(archive), "--process-documents", "--work-dir", str(work)]
+            output = io.StringIO()
+            with mock.patch.dict(sys.modules, {"combined_document_workflow": module}), \
+                    mock.patch.object(WORKFLOW, "activate_optimization_isolation", return_value=False), \
+                    mock.patch.object(WORKFLOW, "atomic_json", side_effect=PermissionError("progress locked")), \
+                    mock.patch.object(sys, "argv", arguments), contextlib.redirect_stdout(output):
+                exit_code = WORKFLOW.main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(json.loads(output.getvalue())["status"], "DOCUMENT_PROCESSING_OK")
+
     def assert_failed_progress(self, reporter, expected_total=None):
         state = json.loads(reporter.path.read_text(encoding="utf-8"))
         self.assertEqual(state["status"], "FAILED")

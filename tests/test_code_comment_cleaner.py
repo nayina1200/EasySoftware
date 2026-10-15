@@ -190,20 +190,21 @@ class DocxTests(unittest.TestCase):
         self.assertEqual(len(root.xpath("//w:pPr/w:sectPr", namespaces=MODULE.NS)), 1)
         self.assertEqual(len(root.xpath("//w:tc/w:p", namespaces=MODULE.NS)), 1)
 
-    def test_page_fit_removes_translated_comments_until_target_is_reached(self):
+    def test_page_minimum_keeps_translated_comments_when_document_is_long(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             path = base / "代码.docx"
             make_docx(path, ["// 中文注释一", "// 中文注释二", "run();"])
             translated = ["first complete translation", "second complete translation"]
-            with mock.patch.object(MODULE.local_comment_translation, "translate_comment", side_effect=translated), mock.patch.object(MODULE, "word_page_count", side_effect=[3, 2]):
-                result = MODULE.translate_and_fit_docx(path, ROOT, base / "work", target_pages=2)
+            with mock.patch.object(MODULE.local_comment_translation, "translate_comment", side_effect=translated), \
+                    mock.patch.object(MODULE, "ensure_code_page_minimum", return_value={"pages": 61, "page_60_lines": 51, "supplemented_lines": 0}):
+                result = MODULE.translate_and_fit_docx(path, ROOT, base / "work", target_pages=60)
 
-            self.assertEqual(read_lines(path), ["run();"])
+            self.assertEqual(read_lines(path), ["// first complete translation", "// second complete translation", "run();"])
             self.assertTrue(result["page_match"])
-            self.assertEqual(result["actual_pages"], 2)
-            self.assertEqual(result["target_pages"], 2)
-            self.assertEqual(result["removed_translated_comments"], 2)
+            self.assertEqual(result["actual_pages"], 61)
+            self.assertEqual(result["target_pages"], 60)
+            self.assertEqual(result["removed_translated_comments"], 0)
 
     def test_matching_page_count_keeps_all_translated_comment_text(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -211,8 +212,9 @@ class DocxTests(unittest.TestCase):
             path = base / "代码.docx"
             make_docx(path, ["// 中文注释一", "// 中文注释二", "run();"])
             translated = ["first complete translation", "second complete translation"]
-            with mock.patch.object(MODULE.local_comment_translation, "translate_comment", side_effect=translated), mock.patch.object(MODULE, "word_page_count", return_value=2):
-                result = MODULE.translate_and_fit_docx(path, ROOT, base / "work", target_pages=2)
+            with mock.patch.object(MODULE.local_comment_translation, "translate_comment", side_effect=translated), \
+                    mock.patch.object(MODULE, "ensure_code_page_minimum", return_value={"pages": 60, "page_60_lines": 51, "supplemented_lines": 0}):
+                result = MODULE.translate_and_fit_docx(path, ROOT, base / "work", target_pages=60)
 
             self.assertEqual(read_lines(path), [
                 "// first complete translation",
@@ -220,7 +222,7 @@ class DocxTests(unittest.TestCase):
                 "run();",
             ])
             self.assertTrue(result["page_match"])
-            self.assertEqual(result["actual_pages"], 2)
+            self.assertEqual(result["actual_pages"], 60)
             self.assertEqual(result["removed_translated_comments"], 0)
 
 

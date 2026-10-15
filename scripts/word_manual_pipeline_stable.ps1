@@ -155,7 +155,7 @@ function Write-WorkflowProgress([int]$Current, [string]$Title, [bool]$CurrentPro
     $elapsed = ([DateTime]::UtcNow - $ProgressStartedAt).TotalSeconds
     $estimate = if ($Current -gt 0) { ($elapsed / $Current) * [Math]::Max(0, $total - $Current) } else { $null }
     $state = [ordered]@{
-        version = "3.4.26"; status = "RUNNING"; phase = $ProgressPhase
+        version = "3.4.28"; status = "RUNNING"; phase = $ProgressPhase
         current = $Current; total = $total; project_name = $Title
         elapsed_seconds = [Math]::Round($elapsed, 1)
         completed_projects = $Current; remaining_projects = [Math]::Max(0, $total - $Current)
@@ -437,13 +437,15 @@ function Get-ManualTextChanges($Document, [bool]$RemoveQuotes, [bool]$ReplaceYea
 }
 
 function Get-FrontParagraphs($Document, [int]$MaxPage = 5) {
-    $items = @()
-    for ($i = 1; $i -le $Document.Paragraphs.Count; $i++) {
-        $paragraph = $Document.Paragraphs.Item($i)
+    $items = New-Object 'System.Collections.Generic.List[object]'
+    $paragraphs = $Document.Paragraphs
+    $paragraphCount = [int]$paragraphs.Count
+    for ($i = 1; $i -le $paragraphCount; $i++) {
+        $paragraph = $paragraphs.Item($i)
         $range = $paragraph.Range
         $page = [int]$range.Information($wdActiveEndPageNumber)
         if ($page -gt $MaxPage) { break }
-        $items += [pscustomobject]@{
+        $items.Add([pscustomobject]@{
             Index = $i
             Page = $page
             Start = [int]$range.Start
@@ -451,25 +453,60 @@ function Get-FrontParagraphs($Document, [int]$MaxPage = 5) {
             Text = Clean-Text $range.Text
             InTable = [bool]$range.Information($wdWithInTable)
             Style = [string]$range.Style
-        }
+        })
     }
-    return $items
+    return $items.ToArray()
 }
 
 function Find-CoverBlock($Items, [string]$Title, [int]$MinimumPage, [int]$MaximumPage = 5, [bool]$IncludeLegacy = $false) {
     for ($i = 0; $i -lt $Items.Count; $i++) {
         $item = $Items[$i]
-        if ($item.Page -lt $MinimumPage -or $item.Page -gt $MaximumPage -or $item.Style -match '(?i)TOC|目录' -or -not (Test-CoverTitle $item.Text $Title)) { continue }
+        if ($item.Page -lt $MinimumPage -or $item.Page -gt $MaximumPage -or $item.InTable -or $item.Style -match '(?i)TOC|目录' -or -not (Test-CoverTitle $item.Text $Title)) { continue }
         $limit = [Math]::Min($Items.Count - 1, $i + 6)
         for ($j = $i + 1; $j -le $limit; $j++) {
             if ($Items[$j].Page -ne $item.Page) { break }
             if ($Items[$j].Text -eq "") { continue }
-            if ($Items[$j].Style -notmatch '(?i)TOC|目录' -and ((Test-ManualLabel $Items[$j].Text) -or ($IncludeLegacy -and (Test-LegacyManualLabel $Items[$j].Text)))) {
+            if (-not $Items[$j].InTable -and $Items[$j].Style -notmatch '(?i)TOC|目录' -and ((Test-ManualLabel $Items[$j].Text) -or ($IncludeLegacy -and (Test-LegacyManualLabel $Items[$j].Text)))) {
                 return [pscustomobject]@{ TitleIndex = $i; LabelIndex = $j; Page = $item.Page }
             }
             # A body heading or paragraph means this is no longer a cover
             # candidate. Never scan past it to delete a later label.
             break
+        }
+    }
+    return $null
+}
+
+function Find-LeadingTableCover($Document, $Items, [string]$Title) {
+    # A supplied cover may be a table. Recognize only a first-page table whose
+    # first visible paragraph is the exact software title and whose same table
+    # also contains a manual label. This prevents Add-Cover from inserting at
+    # Range(0, 0), which Word treats as the first cell when the document starts
+    # with a table.
+    $firstIndex = -1
+    for ($index = 0; $index -lt $Items.Count; $index++) {
+        if ($Items[$index].Page -eq 1 -and $Items[$index].Text -ne "") {
+            $firstIndex = $index
+            break
+        }
+    }
+    if ($firstIndex -lt 0) { return $null }
+    $firstItem = $Items[$firstIndex]
+    if (-not $firstItem.InTable -or $firstItem.Style -match '(?i)TOC|目录' -or -not (Test-CoverTitle $firstItem.Text $Title)) { return $null }
+
+    try {
+        $tableRange = $Document.Tables.Item(1).Range
+        $tableStart = [int]$tableRange.Start
+        $tableEnd = [int]$tableRange.End
+    } catch { return $null }
+    if ([int]$firstItem.Start -lt $tableStart -or [int]$firstItem.End -gt $tableEnd) { return $null }
+
+    for ($index = $firstIndex + 1; $index -lt $Items.Count; $index++) {
+        $item = $Items[$index]
+        if ($item.Page -gt 1) { break }
+        if (-not $item.InTable -or [int]$item.Start -lt $tableStart -or [int]$item.End -gt $tableEnd) { continue }
+        if ($item.Style -notmatch '(?i)TOC|目录' -and (Test-LegacyManualLabel $item.Text)) {
+            return [pscustomobject]@{ TitleIndex = $firstIndex; LabelIndex = $index; Page = 1; TableStart = $tableStart; TableEnd = $tableEnd }
         }
     }
     return $null
@@ -568,13 +605,16 @@ function Test-FirstPageCover($Document, [string]$Title) {
     $items = @(Get-FrontParagraphs $Document 1)
     # Existing covers may say "说明书" or another legacy manual name. They
     # are still valid supplied covers and must not cause a duplicate insertion.
-    return $null -ne (Find-CoverBlock $items $Title 1 1 $true)
+    return ($null -ne (Find-CoverBlock $items $Title 1 1 $true) -or $null -ne (Find-LeadingTableCover $Document $items $Title))
 }
 
 function Ensure-FirstPageCover($Document, [string]$Title) {
     $items = @(Get-FrontParagraphs $Document 1)
     $block = Find-CoverBlock $items $Title 1 1 $true
     if ($null -ne $block) { return [pscustomobject]@{ Changed = $false; Result = "EXISTING_COVER" } }
+    if ($null -ne (Find-LeadingTableCover $Document $items $Title)) {
+        return [pscustomobject]@{ Changed = $false; Result = "EXISTING_COVER" }
+    }
 
     $firstText = $items | Where-Object { $_.Page -eq 1 -and $_.Text -ne "" } | Select-Object -First 1
     $titleItem = $items | Where-Object { $_.Page -eq 1 -and (Test-CoverTitle $_.Text $Title) } | Select-Object -First 1
@@ -833,9 +873,15 @@ function Repair-WordBlankPages($Document, [int[]]$TargetPages = @()) {
     $changes = @()
     $diagnostics = @()
     $pageAudit = @(Get-WordPageAudit $Document)
+    $auditCount = 1
+    $auditDirty = $false
     $maxRounds = [Math]::Max(1, $pageAudit.Count)
     for ($round = 0; $round -lt $maxRounds; $round++) {
-        if ($round -gt 0) { $pageAudit = @(Get-WordPageAudit $Document) }
+        if ($auditDirty) {
+            $pageAudit = @(Get-WordPageAudit $Document)
+            $auditCount++
+            $auditDirty = $false
+        }
         $emptyPages = @($pageAudit | Where-Object { -not $_.has_body_content } | ForEach-Object { [int]$_.page })
         if ($TargetPages.Count -gt 0) { $emptyPages = @($emptyPages | Where-Object { $_ -in $TargetPages }) }
         if ($emptyPages.Count -eq 0) { break }
@@ -848,6 +894,7 @@ function Repair-WordBlankPages($Document, [int[]]$TargetPages = @()) {
                     $startPage = [int]$Document.Range($sectionStart, [Math]::Min($sectionStart + 1, [int]$Document.Content.End)).Information($wdActiveEndPageNumber)
                     $sectionKind = [int]$section.PageSetup.SectionStart
                     if ($startPage -eq $nextPage -and ($sectionKind -eq 3 -or $sectionKind -eq 4)) {
+                        $auditDirty = $true
                         $section.PageSetup.SectionStart = 2
                         $changes += [pscustomobject]@{ page = $emptyPage; cause = if ($sectionKind -eq 4) { "奇数页分节" } else { "偶数页分节" }; action = "改为下一页分节" }
                         $changed = $true
@@ -858,65 +905,78 @@ function Repair-WordBlankPages($Document, [int[]]$TargetPages = @()) {
         }
         if (-not $changed) {
             foreach ($emptyPage in $emptyPages) {
-                $manualBreakRemoved = $false
-                $breakCandidates = @()
+                $blankPageAudit = $pageAudit | Where-Object { [int]$_.page -eq $emptyPage } | Select-Object -First 1
+                $sectionStarts = @($blankPageAudit.section_starts)
+                if ($null -eq $blankPageAudit -or $blankPageAudit.has_body_content -or
+                    [int]$blankPageAudit.page_breaks -ne 1 -or [int]$blankPageAudit.section_breaks -ne 1 -or
+                    [int]$blankPageAudit.page_break_before -ne 0 -or $sectionStarts.Count -ne 1 -or
+                    $sectionStarts[0] -ne "new_page" -or @($blankPageAudit.visible_text).Count -ne 0 -or
+                    [int]$blankPageAudit.tables -ne 0 -or [int]$blankPageAudit.inline_images -ne 0 -or
+                    [int]$blankPageAudit.floating_shapes -ne 0) { continue }
+
+                $sectionStartsOnPage = @()
+                foreach ($section in @($Document.Sections)) {
+                    try {
+                        if ([int]$section.PageSetup.SectionStart -ne 2) { continue }
+                        $sectionStart = [int]$section.Range.Start
+                        $sectionStartPage = [int]$Document.Range(
+                            $sectionStart,
+                            [Math]::Min($sectionStart + 1, [int]$Document.Content.End)
+                        ).Information($wdActiveEndPageNumber)
+                        if ($sectionStartPage -eq $emptyPage) {
+                            $sectionStartsOnPage += [pscustomobject]@{ Start = $sectionStart; Section = $section }
+                        }
+                    } catch {}
+                }
+                if ($sectionStartsOnPage.Count -ne 1) { continue }
+                $sectionStart = [int]$sectionStartsOnPage[0].Start
+                $eligibleBreaks = @()
                 for ($index = 1; $index -le $Document.Paragraphs.Count; $index++) {
                     try {
                         $paragraph = $Document.Paragraphs.Item($index)
                         $paragraphRange = $paragraph.Range
-                        if ([bool]$paragraphRange.Information($wdWithInTable)) { continue }
-                        $breakParagraphText = [string]$paragraphRange.Text
-                        $breakOffset = $breakParagraphText.IndexOf([char]12)
-                        if ($breakOffset -lt 0) { continue }
-                        $breakRange = $Document.Range(
-                            [int]$paragraphRange.Start + $breakOffset,
-                            [int]$paragraphRange.Start + $breakOffset + 1
-                        )
-                        $breakPage = [int]$breakRange.Information($wdActiveEndPageNumber)
-                        $paragraphPage = [int]$paragraphRange.Information($wdActiveEndPageNumber)
-                        if ($paragraphPage -notin @($emptyPage, ($emptyPage - 1))) { continue }
-                        $withoutBreaks = $breakParagraphText -replace '\x0C', ''
-                        $standalone = $withoutBreaks -match '^\s*$'
-                        $protected = Test-RangeHasProtectedContent $Document $paragraphRange $true $true $true
-                        $diagnostics += [pscustomobject]@{
-                            target_page = $emptyPage; paragraph_page = $paragraphPage; break_page = $breakPage
-                            start = [int]$paragraphRange.Start; end = [int]$paragraphRange.End
-                            raw_codes = @(([string]$paragraphRange.Text).ToCharArray() | ForEach-Object { [int][char]$_ })
-                            standalone_break_only = [bool]$standalone; protected = [bool]$protected
-                        }
-                        # A paragraph with visible text or protected content is
-                        # never eligible, even if its form-feed is near the page.
-                        if (-not $standalone -or $protected -or
-                            $breakPage -notin @($emptyPage, ($emptyPage - 1))) { continue }
-                        $breakCandidates += [pscustomobject]@{
-                            break_page = $breakPage; range = $breakRange; paragraph_page = $paragraphPage
-                        }
+                        if ([int]$paragraphRange.Start -ne $sectionStart -or
+                            [int]$paragraphRange.End -ne ($sectionStart + 2) -or
+                            [int]$paragraphRange.Information($wdActiveEndPageNumber) -ne $emptyPage -or
+                            [bool]$paragraphRange.Information($wdWithInTable) -or
+                            [bool]$paragraphRange.ParagraphFormat.PageBreakBefore) { continue }
+
+                        $paragraphCodes = @(([string]$paragraphRange.Text).ToCharArray() | ForEach-Object { [int][char]$_ })
+                        if ($paragraphCodes.Count -ne 2 -or $paragraphCodes[0] -ne 12 -or $paragraphCodes[1] -ne 13 -or
+                            (Test-RangeHasProtectedContent $Document $paragraphRange $true $true $true)) { continue }
+
+                        $breakRange = $Document.Range($sectionStart, $sectionStart + 1)
+                        if ([int]$breakRange.Start -ne $sectionStart -or [int]$breakRange.End -ne ($sectionStart + 1) -or
+                            [string]$breakRange.Text -cne [string][char]12 -or
+                            [int]$breakRange.Information($wdActiveEndPageNumber) -ne $emptyPage -or
+                            [bool]$breakRange.Information($wdWithInTable)) { continue }
+
+                        $eligibleBreaks += [pscustomobject]@{ Range = $breakRange }
                     } catch {}
                 }
-                # Prefer the break mapped to the blank page, then the standalone
-                # break mapped to the immediately preceding page.
-                foreach ($preferredBreakPage in @($emptyPage, ($emptyPage - 1))) {
-                    $candidate = $breakCandidates | Where-Object { $_.break_page -eq $preferredBreakPage } | Select-Object -First 1
-                    if ($null -eq $candidate) { continue }
-                    # Delete only the form-feed character. Word can store a
-                    # section boundary on the paragraph mark beside it.
-                    $candidate.range.Delete() | Out-Null
-                    $changes += [pscustomobject]@{
-                        page = $emptyPage
-                        cause = if ($candidate.break_page -eq $emptyPage) { "显式分页符" } else { "显式分页符（空白页前边界）" }
-                        action = "删除空白页独立分页符字符"
-                    }
-                    $changed = $true
-                    $manualBreakRemoved = $true
-                    break
+                if ($eligibleBreaks.Count -ne 1) { continue }
+
+                # Remove only the duplicate form-feed at the exact start of a
+                # next-page section. Keep its paragraph mark and section break.
+                $auditDirty = $true
+                $eligibleBreaks[0].Range.Delete() | Out-Null
+                $changes += [pscustomobject]@{
+                    page = $emptyPage
+                    cause = "下一页分节起始页重复显式分页符"
+                    action = "删除分节起点分页符字符并保留段落标记和分节"
                 }
-                if ($manualBreakRemoved) { break }
+                $changed = $true
+                break
             }
         }
         if (-not $changed) { break }
         $Document.Repaginate()
     }
-    $beforeTerminalAudit = @(Get-WordPageAudit $Document)
+    if ($auditDirty) {
+        $pageAudit = @(Get-WordPageAudit $Document)
+        $auditCount++
+    }
+    $beforeTerminalAudit = $pageAudit
     $terminalPage = if ($beforeTerminalAudit.Count -gt 0) { [int]$beforeTerminalAudit[-1].page } else { 0 }
     $terminalRepair = if ($TargetPages.Count -eq 0 -or $terminalPage -in $TargetPages) {
         Repair-TerminalBlankParagraph $Document $beforeTerminalAudit
@@ -925,11 +985,17 @@ function Repair-WordBlankPages($Document, [int[]]$TargetPages = @()) {
     }
     if ($null -ne $terminalRepair.Diagnostic) { $diagnostics += $terminalRepair.Diagnostic }
     if ($terminalRepair.Changed) { $changes += $terminalRepair.Change }
-    $finalPages = @(Get-WordPageAudit $Document)
+    # A failed compaction still mutates and restores Word layout. Re-audit it.
+    $terminalMutated = $terminalRepair.Changed -or ($null -ne $terminalRepair.Diagnostic -and
+        $terminalRepair.Diagnostic.outcome -in @('REPAIRED', 'RESTORED'))
+    $finalPages = if ($terminalMutated) {
+        $auditCount++
+        @(Get-WordPageAudit $Document)
+    } else { $beforeTerminalAudit }
     $unresolvedPages = @($finalPages | Where-Object { -not $_.has_body_content } | ForEach-Object {
         [pscustomobject]@{ page = [int]$_.page; cause = "无法安全识别或修复空白页成因" }
     })
-    return [pscustomobject]@{ Changed = ($changes.Count -gt 0); Changes = $changes; Pages = $finalPages; UnresolvedPages = $unresolvedPages; Diagnostics = $diagnostics }
+    return [pscustomobject]@{ Changed = ($changes.Count -gt 0); Changes = $changes; Pages = $finalPages; UnresolvedPages = $unresolvedPages; Diagnostics = $diagnostics; AuditCount = $auditCount }
 }
 
 function Test-CoverNeedsReplacement($Document, [string]$Title) {
@@ -991,6 +1057,11 @@ function Remove-InvalidCoverFragments($Document, [string]$Title) {
 }
 
 function Add-Cover($Document, [string]$Title) {
+    $items = @(Get-FrontParagraphs $Document 1)
+    $firstItem = $items | Where-Object { $_.Page -eq 1 } | Select-Object -First 1
+    if ($null -ne $firstItem -and $firstItem.InTable -and $null -eq (Find-LeadingTableCover $Document $items $Title)) {
+        throw "文档以普通表格开头，无法安全插入封面，请人工处理"
+    }
     $coverText = $Title + "`r`r`r使用说明书`r"
     $Document.Range(0, 0).InsertBefore($coverText)
     # A section break at document position zero fails for several supplied
@@ -1215,18 +1286,58 @@ function Test-DuplicateCoverBlock($Document, [string]$Title) {
     return $false
 }
 
-function Get-CoverLastLineUnitCount($Range) {
-    $lastLine = -1
+function Get-CoverLastLineUnitCount($Range, $Workload = $null) {
+    $characters = $Range.Characters
+    $characterCount = [int]$characters.Count
     $lastLineText = ""
-    foreach ($character in @($Range.Characters)) {
-        $text = Clean-Text ([string]$character.Text)
-        if ($text -eq "") { continue }
-        try { $line = [int]$character.Information($wdFirstCharacterLineNumber) } catch { continue }
-        if ($line -gt $lastLine) {
-            $lastLine = $line
-            $lastLineText = $text
-        } elseif ($line -eq $lastLine) {
-            $lastLineText += $text
+    $fastPath = $false
+    try {
+        if ($characterCount -eq 0) { return 0 }
+        $first = if ($characters -is [array]) { $characters[0] } else { $characters.Item(1) }
+        $last = if ($characters -is [array]) { $characters[-1] } else { $characters.Item($characterCount) }
+        if ($null -ne $Workload) { $Workload.page_information_calls++ }
+        $firstPage = [int]$first.Information($wdActiveEndPageNumber)
+        if ($null -ne $Workload) { $Workload.page_information_calls++ }
+        $lastPage = [int]$last.Information($wdActiveEndPageNumber)
+        # Word line numbers restart on a new page. Only a single-page range
+        # has the monotonic line numbers needed to stop the reverse scan.
+        if ($firstPage -gt 0 -and $firstPage -eq $lastPage) {
+            $lastLine = -1
+            $parts = New-Object 'System.Collections.Generic.List[string]'
+            for ($index = $characterCount; $index -ge 1; $index--) {
+                $character = if ($characters -is [array]) { $characters[$index - 1] } else { $characters.Item($index) }
+                $text = Clean-Text ([string]$character.Text)
+                if ($text -eq "") { continue }
+                if ($null -ne $Workload) { $Workload.line_information_calls++ }
+                $line = [int]$character.Information($wdFirstCharacterLineNumber)
+                if ($line -le 0) { throw 'Word line information unavailable' }
+                if ($lastLine -lt 0) { $lastLine = $line }
+                if ($line -lt $lastLine) { break }
+                if ($line -gt $lastLine) { throw 'Word line information is not monotonic' }
+                $parts.Add($text)
+            }
+            $parts.Reverse()
+            $lastLineText = $parts -join ''
+            $fastPath = $true
+        }
+    } catch { $fastPath = $false }
+    if (-not $fastPath) {
+        if ($null -ne $Workload) { $Workload.full_scan_fallbacks++ }
+        $lastLine = -1
+        $lastLineText = ""
+        foreach ($character in @($Range.Characters)) {
+            $text = Clean-Text ([string]$character.Text)
+            if ($text -eq "") { continue }
+            try {
+                if ($null -ne $Workload) { $Workload.line_information_calls++ }
+                $line = [int]$character.Information($wdFirstCharacterLineNumber)
+            } catch { continue }
+            if ($line -gt $lastLine) {
+                $lastLine = $line
+                $lastLineText = $text
+            } elseif ($line -eq $lastLine) {
+                $lastLineText += $text
+            }
         }
     }
     if ($lastLineText -eq "") { return 0 }
@@ -1236,11 +1347,14 @@ function Get-CoverLastLineUnitCount($Range) {
 
 function Set-CoverTypography($Document, [string]$Title) {
     $items = @(Get-FrontParagraphs $Document 1)
-    $titleItem = $items | Where-Object { Test-CoverTitle $_.Text $Title } | Select-Object -First 1
-    $labelItem = $items | Where-Object { Test-LegacyManualLabel $_.Text } | Select-Object -First 1
+    $titleItem = $items | Where-Object {
+        $_.Page -eq 1 -and -not $_.InTable -and $_.Style -notmatch '(?i)TOC|目录' -and (Test-CoverTitle $_.Text $Title)
+    } | Select-Object -First 1
     if ($null -eq $titleItem) {
-        return [pscustomobject]@{ Found = $false; Size = 0; Lines = 0; Label = "" }
+        return [pscustomobject]@{ Found = $false; Size = 0; Lines = 0; Label = ""; LabelLayoutFailed = $false }
     }
+    $block = Find-CoverBlock $items $Title 1 1 $true
+    $labelItem = if ($null -ne $block) { $items[$block.LabelIndex] } else { $null }
 
     # Replace stacks of empty paragraphs between the existing title and label
     # with one deterministic spacing value. This keeps supplied wording intact
@@ -1256,68 +1370,132 @@ function Set-CoverTypography($Document, [string]$Title) {
                 }
             }
             $items = @(Get-FrontParagraphs $Document 1)
-            $titleItem = $items | Where-Object { Test-CoverTitle $_.Text $Title } | Select-Object -First 1
-            $labelItem = $items | Where-Object { Test-LegacyManualLabel $_.Text } | Select-Object -First 1
+            $titleItem = $items | Where-Object {
+                $_.Page -eq 1 -and -not $_.InTable -and $_.Style -notmatch '(?i)TOC|目录' -and (Test-CoverTitle $_.Text $Title)
+            } | Select-Object -First 1
+            if ($null -eq $titleItem) { return [pscustomobject]@{ Found = $false; Size = 0; Lines = 0; Label = ""; LabelLayoutFailed = $false } }
+            $block = Find-CoverBlock $items $Title 1 1 $true
+            $labelItem = if ($null -ne $block) { $items[$block.LabelIndex] } else { $null }
         }
     }
 
     $titleRange = $Document.Range($titleItem.Start, $titleItem.End)
-    $labelRange = if ($null -ne $labelItem) { $Document.Range($labelItem.Start, $labelItem.End) } else { $null }
-    try {
-        $coverSection = [int]$titleRange.Information($wdActiveEndSectionNumber)
-        $Document.Sections.Item($coverSection).PageSetup.VerticalAlignment = $wdVerticalCenter
-    } catch {}
-    foreach ($range in @($titleRange, $labelRange) | Where-Object { $null -ne $_ }) {
-        foreach ($paragraph in $range.Paragraphs) {
+    $labelRange = $null
+    $formatLabelRange = {
+        param($Range)
+        foreach ($paragraph in $Range.Paragraphs) {
             try { $paragraph.Range.ListFormat.RemoveNumbers($wdNumberAllNumbers) } catch {}
             try { $paragraph.Range.Style = $Document.Styles.Item($wdStyleNormal) } catch {}
             try { $paragraph.Range.ParagraphFormat.OutlineLevel = $wdOutlineLevelBodyText } catch {}
         }
-        $range.ParagraphFormat.Alignment = $wdAlignParagraphCenter
-        $range.ParagraphFormat.LeftIndent = [double]0
-        $range.ParagraphFormat.RightIndent = [double]0
-        $range.ParagraphFormat.FirstLineIndent = [double]0
-        $range.Font.Name = "宋体"
-        $range.Font.NameFarEast = "宋体"
-        $range.Font.NameAscii = "SimSun"
-        $range.Font.NameOther = "SimSun"
-        $range.Font.Bold = -1
+        $Range.ParagraphFormat.Alignment = $wdAlignParagraphCenter
+        $Range.ParagraphFormat.LeftIndent = [double]0
+        $Range.ParagraphFormat.RightIndent = [double]0
+        $Range.ParagraphFormat.FirstLineIndent = [double]0
+        $Range.Font.Name = "宋体"
+        $Range.Font.NameFarEast = "宋体"
+        $Range.Font.NameAscii = "SimSun"
+        $Range.Font.NameOther = "SimSun"
+        $Range.Font.Bold = -1
+        $Range.ParagraphFormat.SpaceBefore = [double]48
+        $Range.ParagraphFormat.SpaceAfter = [double]0
     }
+    # An initially safe title/label block can be formatted before the size loop;
+    # each subsequent size pass then needs only one repagination.
+    if ($null -ne $labelItem) {
+        $labelRange = $Document.Range($labelItem.Start, $labelItem.End)
+        & $formatLabelRange $labelRange
+    }
+    try {
+        $coverSection = [int]$titleRange.Information($wdActiveEndSectionNumber)
+        $Document.Sections.Item($coverSection).PageSetup.VerticalAlignment = $wdVerticalCenter
+    } catch {}
+    foreach ($paragraph in $titleRange.Paragraphs) {
+        try { $paragraph.Range.ListFormat.RemoveNumbers($wdNumberAllNumbers) } catch {}
+        try { $paragraph.Range.Style = $Document.Styles.Item($wdStyleNormal) } catch {}
+        try { $paragraph.Range.ParagraphFormat.OutlineLevel = $wdOutlineLevelBodyText } catch {}
+    }
+    $titleRange.ParagraphFormat.Alignment = $wdAlignParagraphCenter
+    $titleRange.ParagraphFormat.LeftIndent = [double]0
+    $titleRange.ParagraphFormat.RightIndent = [double]0
+    $titleRange.ParagraphFormat.FirstLineIndent = [double]0
+    $titleRange.Font.Name = "宋体"
+    $titleRange.Font.NameFarEast = "宋体"
+    $titleRange.Font.NameAscii = "SimSun"
+    $titleRange.Font.NameOther = "SimSun"
+    $titleRange.Font.Bold = -1
     $titleRange.ParagraphFormat.SpaceBefore = [double]0
     $titleRange.ParagraphFormat.SpaceAfter = [double]0
-    if ($null -ne $labelRange) {
-        $labelRange.ParagraphFormat.SpaceBefore = [double]48
-        $labelRange.ParagraphFormat.SpaceAfter = [double]0
-    }
 
+    $workload = [ordered]@{ pagination_attempts = 0; line_information_calls = 0; page_information_calls = 0; full_scan_fallbacks = 0 }
     $size = 26
     $lines = 99
     $orphanedLastLine = $false
+    $labelWasSafe = ($null -ne $labelItem)
+    $labelLayoutFailed = $false
     while ($size -ge 14) {
         $titleRange.Font.Size = [double]$size
         if ($null -ne $labelRange) { $labelRange.Font.Size = [double]$size }
+        $workload.pagination_attempts++
         $Document.Repaginate()
+
+        # A label can initially spill onto page two. Consider formatting it
+        # only after this title-size pass has repaginated it into a safe block
+        # on page one, with no body paragraph between title and label.
+        $items = @(Get-FrontParagraphs $Document 2)
+        $block = Find-CoverBlock $items $Title 1 1 $true
+        $labelItem = if ($null -ne $block) { $items[$block.LabelIndex] } else { $null }
+        if ($null -ne $labelItem) {
+            $labelWasSafe = $true
+            $labelLayoutFailed = $false
+            if ($null -eq $labelRange) {
+                $labelRange = $Document.Range($labelItem.Start, $labelItem.End)
+                & $formatLabelRange $labelRange
+                $labelRange.Font.Size = [double]$size
+                # A label that returned from page two is formatted only after
+                # the title pass confirmed a safe block. Recheck once because
+                # its new spacing/font can change pagination.
+                $workload.pagination_attempts++
+                $Document.Repaginate()
+                $items = @(Get-FrontParagraphs $Document 2)
+                $block = Find-CoverBlock $items $Title 1 1 $true
+                if ($null -ne $block) {
+                    $labelItem = $items[$block.LabelIndex]
+                } else {
+                    $labelItem = $null
+                    $labelLayoutFailed = $true
+                }
+            }
+        } elseif ($labelWasSafe) {
+            # Keep the formatted range available for the next smaller-size
+            # pass, but never report success while it remains off page one.
+            $labelLayoutFailed = $true
+        }
+
         $lines = [int]$titleRange.ComputeStatistics($wdStatisticLines)
-        $orphanedLastLine = ($lines -eq 2 -and (Get-CoverLastLineUnitCount $titleRange) -le 2)
-        if ($lines -le 2 -and -not $orphanedLastLine) { break }
+        $orphanedLastLine = ($lines -eq 2 -and (Get-CoverLastLineUnitCount $titleRange $workload) -le 2)
+        if ($lines -le 2 -and -not $orphanedLastLine -and -not $labelLayoutFailed) { break }
         if ($size -eq 14) { break }
         $size--
     }
-    return [pscustomobject]@{ Found = $true; Size = $size; Lines = $lines; OrphanedLastLine = $orphanedLastLine; Label = if ($null -ne $labelItem) { $labelItem.Text } else { "" }; LabelPresent = ($null -ne $labelItem) }
+    return [pscustomobject]@{ Found = $true; Size = $size; Lines = $lines; OrphanedLastLine = $orphanedLastLine; Label = if ($null -ne $labelItem) { $labelItem.Text } else { "" }; LabelPresent = ($null -ne $labelItem); LabelLayoutFailed = $labelLayoutFailed; Workload = [pscustomobject]$workload }
 }
 
 function Remove-CoverVersion($Document, [string]$Title) {
     $items = @(Get-FrontParagraphs $Document 1)
+    if ($null -ne (Find-LeadingTableCover $Document $items $Title)) {
+        return [pscustomobject]@{ Found = $true; Changed = $false; ProtectedTable = $true }
+    }
     $titleItem = $items | Where-Object { Test-CoverTitle $_.Text $Title } | Select-Object -First 1
-    if ($null -eq $titleItem) { return [pscustomobject]@{ Found = $false; Changed = $false } }
+    if ($null -eq $titleItem) { return [pscustomobject]@{ Found = $false; Changed = $false; ProtectedTable = $false } }
     # Exclude the trailing paragraph mark so replacing the text keeps the
     # paragraph break and does not merge the title line with the label line.
     $titleRange = $Document.Range($titleItem.Start, [Math]::Max($titleItem.Start, $titleItem.End - 1))
     if ((Compact-Text $titleRange.Text) -eq (Compact-Text $Title)) {
-        return [pscustomobject]@{ Found = $true; Changed = $false }
+        return [pscustomobject]@{ Found = $true; Changed = $false; ProtectedTable = $false }
     }
     $titleRange.Text = $Title
-    return [pscustomobject]@{ Found = $true; Changed = $true }
+    return [pscustomobject]@{ Found = $true; Changed = $true; ProtectedTable = $false }
 }
 
 function Ensure-CoverPageBoundary($Document, [string]$Title) {
@@ -1325,13 +1503,19 @@ function Ensure-CoverPageBoundary($Document, [string]$Title) {
     # an image, or a table, insert one page break after the label. Preserve all
     # following content and the document's existing page setup.
     $items = @(Get-FrontParagraphs $Document 1)
+    # A table-based cover is already protected as a unit. Inserting a break at
+    # a cell paragraph's end would split or otherwise rewrite the source table.
+    $firstPageItem = $items | Where-Object { $_.Page -eq 1 } | Select-Object -First 1
+    $leadingTableCover = Find-LeadingTableCover $Document $items $Title
+    if ($null -ne $firstPageItem -and $firstPageItem.InTable -and $null -eq $leadingTableCover) { return $false }
+    if ($null -ne $leadingTableCover) { return $false }
     $block = Find-CoverBlock $items $Title 1 1 $true
     if ($null -eq $block) {
         # Some supplied covers put the title and manual label in separate
         # paragraphs or apply Word list numbering. Find the first title and
         # the nearest manual label on page one without requiring adjacency.
-        $titleItem = $items | Where-Object { (Compact-Text $_.Text) -eq (Compact-Text $Title) } | Select-Object -First 1
-        $labelItem = $items | Where-Object { $_.Page -eq 1 -and (Test-ManualLabel $_.Text) } | Select-Object -First 1
+        $titleItem = $items | Where-Object { -not $_.InTable -and (Compact-Text $_.Text) -eq (Compact-Text $Title) } | Select-Object -First 1
+        $labelItem = $items | Where-Object { $_.Page -eq 1 -and -not $_.InTable -and (Test-ManualLabel $_.Text) } | Select-Object -First 1
         if ($null -eq $titleItem -or $null -eq $labelItem) { return $false }
         $block = [pscustomobject]@{ LabelIndex = [array]::IndexOf($items, $labelItem) }
     }
@@ -1725,7 +1909,13 @@ function Audit-EffectiveCover($Document, [string]$Title) {
     $items = @(Get-FrontParagraphs $Document 1)
     $block = Find-CoverBlock $items $Title 1 1 $true
     if ($null -eq $block) {
-        return [pscustomobject]@{ Found = $false; LabelPresent = $false; Label = ""; Font = ""; LabelFont = ""; Bold = $false; Size = 0; LabelSize = 0; Lines = 0; OrphanedLastLine = $false; ExtraText = @(); TitleYRatio = -1; LabelYRatio = -1; GapPoints = -1 }
+        $tableBlock = Find-LeadingTableCover $Document $items $Title
+        if ($null -ne $tableBlock) {
+            # The supplied table is protected as a unit, so acknowledge the
+            # title/label without demanding typography edits inside its cells.
+            return [pscustomobject]@{ Found = $true; ProtectedTable = $true; LabelPresent = $true; Label = $items[$tableBlock.LabelIndex].Text; Font = ""; LabelFont = ""; Bold = $false; Size = 0; LabelSize = 0; Lines = 0; OrphanedLastLine = $false; ExtraText = @(); TitleYRatio = -1; LabelYRatio = -1; GapPoints = -1; TitleNumbered = $false; LabelNumbered = $false }
+        }
+        return [pscustomobject]@{ Found = $false; ProtectedTable = $false; LabelPresent = $false; Label = ""; Font = ""; LabelFont = ""; Bold = $false; Size = 0; LabelSize = 0; Lines = 0; OrphanedLastLine = $false; ExtraText = @(); TitleYRatio = -1; LabelYRatio = -1; GapPoints = -1 }
     }
     $titleItem = $items[$block.TitleIndex]
     $labelItem = $items[$block.LabelIndex]
@@ -1747,6 +1937,7 @@ function Audit-EffectiveCover($Document, [string]$Title) {
     $titleLines = [int]$titleRange.ComputeStatistics($wdStatisticLines)
     return [pscustomobject]@{
         Found = $true
+        ProtectedTable = $false
         LabelPresent = ($null -ne $labelRange)
         Label = $labelItem.Text
         Font = [string]$titleRange.Font.NameFarEast
@@ -1849,8 +2040,11 @@ try {
             [IO.Path]::ChangeExtension($docx, ".pdf")
         }
         $actions = @($item.actions)
-        $coverActionNames = @("ADD_COVER", "ENSURE_COVER_FIRST_PAGE", "AUDIT_ALL_PAGES", "REPAIR_BLANK_PAGES", "REMOVE_DUPLICATE_COVER_TEXT", "REMOVE_COVER_VERSION", "NORMALIZE_COVER_STYLE", "REPLACE_INVALID_COVER")
+        $coverActionNames = @("ADD_COVER", "ENSURE_COVER_FIRST_PAGE", "AUDIT_ALL_PAGES", "AUDIT_PDF_ALL_PAGES", "REPAIR_BLANK_PAGES", "REMOVE_DUPLICATE_COVER_TEXT", "REMOVE_COVER_VERSION", "NORMALIZE_COVER_STYLE", "REPLACE_INVALID_COVER")
         $doCover = @($actions | Where-Object { $coverActionNames -contains $_ }).Count -gt 0
+        # Word page mapping is the escalation path. Routine cover work uses the
+        # exported PDF screen and does not map every paragraph through COM.
+        $fullPageAudit = (Test-Action $actions "AUDIT_ALL_PAGES") -or (Test-Action $actions "REPAIR_BLANK_PAGES")
         $doHeader = Test-Action $actions "NORMALIZE_HEADER"
         $doPageNumbers = Test-Action $actions "NORMALIZE_PAGE_NUMBERS"
         $backupFolder = Join-Path $backupRoot (Safe-Name $title)
@@ -1867,6 +2061,7 @@ try {
         $removed = 0
         $brokenBookmarkFieldsUnlinked = @()
         $failures = @()
+        $blankRepair = $null
         try {
             Trace-Step $title "open"
             $doc = $word.Documents.Open($docx, $false, $false)
@@ -1875,10 +2070,11 @@ try {
             $originalCoverTextConflicts = @($originalFrontPageText | Where-Object {
                 -not (Test-CoverTitle $_ $title) -and -not (Test-LegacyManualLabel $_)
             })
+            $tableCoverPreserved = $doCover -and ($null -ne (Find-LeadingTableCover $doc @(Get-FrontParagraphs $doc 1) $title))
 
             $coverAdded = $false
             Trace-Step $title "cover-check"
-            $replaceInvalidCover = if ($doCover) { Test-CoverNeedsReplacement $doc $title } else { $false }
+            $replaceInvalidCover = if ($doCover -and -not $tableCoverPreserved) { Test-CoverNeedsReplacement $doc $title } else { $false }
             if (Test-Action $actions "ADD_COVER") {
                 # ADD_COVER is emitted only after the programmatic PDF audit has
                 # determined that page 1 is not a clean, independent cover.
@@ -1917,12 +2113,13 @@ try {
             if (Test-Action $actions "REMOVE_COVER_VERSION") {
                 Trace-Step $title "cover-remove-version"
                 $versionFix = Remove-CoverVersion $doc $title
-                if ($versionFix.Found -and $versionFix.Changed) { $applied += "REMOVE_COVER_VERSION" }
+                if ($versionFix.ProtectedTable) { $failures += "封面位于受保护表格中，无法安全去掉版本号，请人工处理" }
+                elseif ($versionFix.Found -and $versionFix.Changed) { $applied += "REMOVE_COVER_VERSION" }
                 elseif (-not $versionFix.Found) { $failures += "未找到封面标题，无法去掉版本号" }
             }
 
             $style = $null
-            if ((Test-Action $actions "NORMALIZE_COVER_STYLE") -or $coverAdded) {
+            if (((Test-Action $actions "NORMALIZE_COVER_STYLE") -or $coverAdded) -and -not $tableCoverPreserved) {
                 if (-not $coverAdded -and $replaceInvalidCover) {
                     [void](Remove-InvalidCoverFragments $doc $title)
                     Add-Cover $doc $title
@@ -1932,9 +2129,13 @@ try {
                 Trace-Step $title "cover-style"
                 $style = Set-CoverTypography $doc $title
                 Trace-Step $title "cover-styled"
+                if ($null -ne $style.Workload) {
+                    Trace-Step $title ("cover-workload=" + ($style.Workload | ConvertTo-Json -Compress))
+                }
                 Trace-DuplicateTitlePositions $doc $title "after-style"
                 if (-not $style.Found) { $failures += "第一页未找到可排版的封面标题块" }
                 else { $applied += "NORMALIZE_COVER_STYLE" }
+                if ($style.LabelLayoutFailed) { $failures += "封面说明书标签格式化后无法与标题保持在第一页" }
             }
 
             if ($doCover) {
@@ -1952,8 +2153,8 @@ try {
                 # Page breaks and section boundaries can repaginate a supplied
                 # duplicate cover onto page 2 after the initial pass. Run the
                 # exact-match cleanup again after the cover/body boundary is
-                # established, then let blank-page repair remove any empty page
-                # left behind.
+                # established. Routine blank-page screening runs on the PDF;
+                # Word repair is reserved for explicit or anomaly-triggered work.
                 Trace-Step $title "cover-late-duplicate-cleanup"
                 $lateDuplicateRemoved = Remove-DuplicateCoverBlocks $doc $title
                 if ($lateDuplicateRemoved -gt 0) {
@@ -1966,15 +2167,17 @@ try {
                 $bodyBlanks = Remove-BodyLeadingBlankParagraphs $doc $title
                 Trace-Step $title "body-leading-blanks-done"
                 if ($bodyBlanks -gt 0) { $applied += "TRIM_BODY_LEADING_BLANKS" }
-                Trace-Step $title "blank-page-audit"
-                $blankRepair = if (Test-Action $actions "REPAIR_BLANK_PAGES") {
-                    Repair-WordBlankPages -Document $doc -TargetPages @($item.retry_blank_pages)
-                } else {
-                    Repair-WordBlankPages $doc
+                if ($fullPageAudit) {
+                    Trace-Step $title "blank-page-audit"
+                    $blankRepair = if (Test-Action $actions "REPAIR_BLANK_PAGES") {
+                        Repair-WordBlankPages -Document $doc -TargetPages @($item.retry_blank_pages)
+                    } else {
+                        Repair-WordBlankPages $doc
+                    }
+                    Trace-Step $title "blank-page-audit-done"
+                    if ($blankRepair.Changed) { $applied += "REPAIR_WORD_BLANK_PAGES" }
                 }
-                Trace-Step $title "blank-page-audit-done"
                 Trace-DuplicateTitlePositions $doc $title "after-blank-repair"
-                if ($blankRepair.Changed) { $applied += "REPAIR_WORD_BLANK_PAGES" }
             }
 
             $bodyTextStyle = $null
@@ -2033,7 +2236,7 @@ try {
             }
             Trace-Step $title "save"
             $doc.Save()
-            $wordPageAudit = if ($doCover) { @(Get-WordPageAudit $doc) } else { @() }
+            $wordPageAudit = if ($doCover -and $fullPageAudit) { @(Get-WordPageAudit $doc) } else { @() }
             if (Test-Action $actions "EXPORT_PDF") {
                 Trace-Step $title "export"
                 $doc.ExportAsFixedFormat($pdf, $wdExportFormatPDF)
@@ -2048,21 +2251,21 @@ try {
             $unresolvedBlankPages = if ($null -ne $blankRepair) {
                 @($blankRepair.UnresolvedPages | ForEach-Object { [int]$_.page })
             } else {
-                @($wordPageAudit | Where-Object { -not $_.has_body_content } | ForEach-Object { [int]$_.page })
+                @()
             }
             if ($doCover -and $unresolvedBlankPages.Count -gt 0) { $failures += "全书仍存在无法安全修复的空白页: $($unresolvedBlankPages -join ',')" }
             if ($doCover -and -not $coverAudit.Found) { $failures += "第一页缺少有效封面标题块" }
-            if ($doCover -and @($coverAudit.ExtraText).Count -gt 0) { $failures += "封面页仍混有目录或正文文字" }
+            if ($doCover -and -not $coverAudit.ProtectedTable -and @($coverAudit.ExtraText).Count -gt 0) { $failures += "封面页仍混有目录或正文文字" }
             if ($doCover -and $coverAudit.Lines -gt 2) { $failures += "软件名称超过两行" }
             if ($doCover -and $coverAudit.OrphanedLastLine) { $failures += "软件名称第二行仅剩一至两个词" }
-            if ($doCover -and -not $coverAudit.Bold) { $failures += "封面两行未同时加粗" }
-            if ($doCover -and $coverAudit.LabelPresent -and $coverAudit.Size -ne $coverAudit.LabelSize) { $failures += "封面两行字号不一致" }
-            if ($doCover -and ($coverAudit.Font -notmatch '宋体|SimSun' -or ($coverAudit.LabelPresent -and $coverAudit.LabelFont -notmatch '宋体|SimSun'))) { $failures += "封面标题或说明书行未使用宋体" }
-            if ($doCover -and $coverAudit.TitleYRatio -ge 0 -and ($coverAudit.TitleYRatio -lt 0.30 -or $coverAudit.TitleYRatio -gt 0.56)) { $failures += "软件名称未位于封面中段偏上" }
-            if ($doCover -and $coverAudit.LabelPresent -and $coverAudit.LabelYRatio -ge 0 -and ($coverAudit.LabelYRatio -lt 0.48 -or $coverAudit.LabelYRatio -gt 0.72)) { $failures += "用户手册/使用说明书未位于封面中部附近" }
-            if ($doCover -and $coverAudit.LabelPresent -and $coverAudit.GapPoints -ge 0 -and $coverAudit.GapPoints -lt 48) { $failures += "软件名称与用户手册/使用说明书之间留白不足" }
-            if ($doCover -and $coverAudit.TitleNumbered) { $failures += "封面标题仍带自动编号" }
-            if ($doCover -and $coverAudit.LabelPresent -and $coverAudit.LabelNumbered) { $failures += "封面说明书行仍带自动编号" }
+            if ($doCover -and -not $coverAudit.ProtectedTable -and -not $coverAudit.Bold) { $failures += "封面两行未同时加粗" }
+            if ($doCover -and -not $coverAudit.ProtectedTable -and $coverAudit.LabelPresent -and $coverAudit.Size -ne $coverAudit.LabelSize) { $failures += "封面两行字号不一致" }
+            if ($doCover -and -not $coverAudit.ProtectedTable -and ($coverAudit.Font -notmatch '宋体|SimSun' -or ($coverAudit.LabelPresent -and $coverAudit.LabelFont -notmatch '宋体|SimSun'))) { $failures += "封面标题或说明书行未使用宋体" }
+            if ($doCover -and -not $coverAudit.ProtectedTable -and $coverAudit.TitleYRatio -ge 0 -and ($coverAudit.TitleYRatio -lt 0.30 -or $coverAudit.TitleYRatio -gt 0.56)) { $failures += "软件名称未位于封面中段偏上" }
+            if ($doCover -and -not $coverAudit.ProtectedTable -and $coverAudit.LabelPresent -and $coverAudit.LabelYRatio -ge 0 -and ($coverAudit.LabelYRatio -lt 0.48 -or $coverAudit.LabelYRatio -gt 0.72)) { $failures += "用户手册/使用说明书未位于封面中部附近" }
+            if ($doCover -and -not $coverAudit.ProtectedTable -and $coverAudit.LabelPresent -and $coverAudit.GapPoints -ge 0 -and $coverAudit.GapPoints -lt 48) { $failures += "软件名称与用户手册/使用说明书之间留白不足" }
+            if ($doCover -and -not $coverAudit.ProtectedTable -and $coverAudit.TitleNumbered) { $failures += "封面标题仍带自动编号" }
+            if ($doCover -and -not $coverAudit.ProtectedTable -and $coverAudit.LabelPresent -and $coverAudit.LabelNumbered) { $failures += "封面说明书行仍带自动编号" }
             if ($doHeader -and -not $headerAudit.Header) { $failures += "页眉缺失" }
             if ($doPageNumbers -and -not $headerAudit.Page) { $failures += "动态PAGE字段缺失或重复" }
             if ((Test-Action $actions "REMOVE_TITLE_DOUBLE_QUOTES") -and (Get-TitleDoubleQuoteCount $doc $title) -gt 0) { $failures += "全文仍存在外带双引号的软件名称" }
@@ -2096,6 +2299,7 @@ try {
                 body_text_reference_size = if ($null -ne $bodyTextStyle) { $bodyTextStyle.ReferenceSize } else { 0 }
                 first_post_cover_heading_normalized = if ($null -ne $firstPostCoverHeading) { $firstPostCoverHeading.Changed } else { $false }
                 first_post_cover_heading_text = if ($null -ne $firstPostCoverHeading) { $firstPostCoverHeading.Text } else { "" }
+                cover_typography_workload = if ($null -ne $style) { $style.Workload } else { $null }
                 font_size = if ($doCover) { $coverAudit.Size } else { 0 }
                 title_lines = if ($doCover) { $coverAudit.Lines } else { 0 }
                 title_y_ratio = if ($doCover) { $coverAudit.TitleYRatio } else { -1 }
@@ -2103,18 +2307,21 @@ try {
                 title_label_gap_points = if ($doCover) { $coverAudit.GapPoints } else { -1 }
                 cover_label_present = if ($doCover) { $coverAudit.LabelPresent } else { $false }
                 cover_label = if ($doCover) { $coverAudit.Label } else { "" }
+                cover_label_layout_failed = if ($null -ne $style) { [bool]$style.LabelLayoutFailed } else { $false }
                 cover_extra_text = if ($doCover) { @($coverAudit.ExtraText) } else { @() }
                 original_cover_text = @($originalFrontPageText)
                 cover_text_conflicts = @($originalCoverTextConflicts)
                 front_page_text = if ($doCover) { @((Get-FrontParagraphs $doc 1 | Where-Object { $_.Text -ne "" } | ForEach-Object { $_.Text })) } else { @() }
                 word_pages = [int]$doc.ComputeStatistics($wdStatisticPages)
+                page_audit_mode = if ($fullPageAudit) { "full_word_com" } elseif ($doCover) { "deferred_to_pdf_screening" } else { "not_requested" }
                 page_audit = $wordPageAudit
                 word_blank_page_candidates = if ($doCover) { @($wordPageAudit | Where-Object { -not $_.has_body_content }) } else { @() }
                 blank_page_repairs = if ($null -ne $blankRepair) { @($blankRepair.Changes) } else { @() }
                 unresolved_blank_pages = if ($null -ne $blankRepair) { @($blankRepair.UnresolvedPages | ForEach-Object { [int]$_.page }) } else { @() }
                 unresolved_blank_page_details = if ($null -ne $blankRepair) { @($blankRepair.UnresolvedPages) } else { @() }
+                word_blank_page_audit_count = if ($null -ne $blankRepair) { $blankRepair.AuditCount } else { $null }
                 word_blank_page_diagnostics = if ($null -ne $blankRepair) { @($blankRepair.Diagnostics) } else { @() }
-                attempts = @([pscustomobject]@{ attempt = 1; phase = "Word修复、导出和页面映射"; status = if ($failures.Count -eq 0) { "PASSED" } else { "FAILED" }; failures = @($failures) })
+                attempts = @([pscustomobject]@{ attempt = 1; phase = if ($fullPageAudit) { "Word处理、导出和完整页面映射" } else { "Word封面处理、保存和导出；页面筛查转交PDF" }; status = if ($failures.Count -eq 0) { "PASSED" } else { "FAILED" }; failures = @($failures) })
                 failures = $failures
                 seconds = [Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 3)
             }
@@ -2171,7 +2378,7 @@ try {
 }
 
 $report = [ordered]@{
-        version = "3.4.26"
+        version = "3.4.28"
     created_at = [DateTime]::Now.ToString("o")
     base = $base
     packages = $results

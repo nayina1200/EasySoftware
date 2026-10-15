@@ -1,9 +1,9 @@
 {
   "enabled": true,
-  "mode": "shadow",
-  "enforce": false,
+  "mode": "enforced",
+  "enforce": true,
   "not_evaluated_action": "hold_changes",
-  "skip_mismatch_requested": false,
+  "skip_mismatch_requested": true,
   "provider": "typesafe_jev",
   "prompt_version": "title-body-jev-domain-fit-score-v3",
   "policy_version": "title-body-jev-threshold-policy-v1",
@@ -16,6 +16,7 @@
   "typesafe_jev": {
     "model_id": "jev-1.13.0",
     "request_timeout_seconds": 20,
+    "request_deadline_seconds": 45,
     "max_retries": 2,
     "max_retry_after_seconds": 5,
     "max_request_characters": 28000

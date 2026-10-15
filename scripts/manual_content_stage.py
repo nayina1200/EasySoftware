@@ -650,6 +650,63 @@ def read_docx_paragraphs(path: str | Path) -> list[tuple[str, str]]:
     return texts
 
 
+def _is_ai_hollow_rectangle(width: float, height: float) -> bool:
+    if width <= 0 or height <= 0:
+        return False
+    return width >= 5_000_000 and height <= 220_000 and width / height >= 24
+
+
+def find_ai_hollow_lines(path: str | Path) -> list[dict[str, Any]]:
+    """Find long, thin outlined rectangles that resemble generated AI divider artifacts."""
+    findings: list[dict[str, Any]] = []
+    namespaces = {
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "wps": "http://schemas.microsoft.com/office/word/2010/wordprocessingShape",
+        "w": WORD_NS,
+    }
+    with zipfile.ZipFile(path) as archive:
+        for part_name in archive.namelist():
+            if not re.fullmatch(r"word/(document|header[0-9]*|footer[0-9]*|footnotes|endnotes)\.xml", part_name, re.IGNORECASE):
+                continue
+            try:
+                document = etree.fromstring(archive.read(part_name))
+            except etree.XMLSyntaxError:
+                continue
+            for shape in document.xpath(".//wps:sp", namespaces=namespaces):
+                geometry = shape.find(".//{%s}prstGeom" % namespaces["a"])
+                if geometry is None or geometry.get("prst") not in {"rect", "roundRect"}:
+                    continue
+                extent = shape.find(".//{%s}xfrm/{%s}ext" % (namespaces["a"], namespaces["a"]))
+                if extent is None:
+                    continue
+                try:
+                    width, height = float(extent.get("cx", "0")), float(extent.get("cy", "0"))
+                except (TypeError, ValueError):
+                    continue
+                if not _is_ai_hollow_rectangle(width, height):
+                    continue
+                shape_properties = shape.find("{%s}spPr" % namespaces["wps"])
+                has_outline = shape_properties is not None and shape_properties.find(".//{%s}ln" % namespaces["a"]) is not None
+                no_fill = shape_properties is not None and shape_properties.find(".//{%s}noFill" % namespaces["a"]) is not None
+                fill = shape_properties.find(".//{%s}solidFill" % namespaces["a"]) if shape_properties is not None else None
+                def is_white_fill(color: Any) -> bool:
+                    if color.tag.endswith("srgbClr"):
+                        return color.get("val", "").upper() == "FFFFFF"
+                    if color.tag.endswith("sysClr"):
+                        return color.get("lastClr", "").upper() == "FFFFFF"
+                    return color.get("val", "").casefold() in {"bg1", "lt1"}
+
+                white_fill = fill is not None and any(is_white_fill(color) for color in fill)
+                if not has_outline or not (no_fill or white_fill):
+                    continue
+                paragraph = shape
+                while paragraph is not None and paragraph.tag != "{%s}p" % namespaces["w"]:
+                    paragraph = paragraph.getparent()
+                context = "".join(paragraph.xpath(".//w:t/text()", namespaces=namespaces)).strip() if paragraph is not None else ""
+                findings.append({"part": part_name, "width_emu": int(width), "height_emu": int(height), "context": context})
+    return findings
+
+
 def _docx_parts(path: Path) -> tuple[list[tuple[str, bytes]], list[tuple[str, str]]]:
     images: list[tuple[str, bytes]] = []
     with zipfile.ZipFile(path) as archive:
@@ -951,6 +1008,7 @@ def run_manual_content_stage(
     check_image_vision: bool = True,
     rewrite_body_years: bool = True,
     rewrite_image_dates: bool = True,
+    check_ai_hollow_lines: bool = False,
 ) -> dict[str, Any]:
     """Preflight every manual, then copy and mutate only after batch gating completes."""
     perf_trace = os.getenv("EASYSOFTWARE_PERF_TRACE") == "1"
@@ -1066,6 +1124,8 @@ def run_manual_content_stage(
             pending_review = False
             changes_held = bool(skip_topic_mismatch and topic_mismatch)
         image_names = _docx_image_names(manual)
+        hollow_line_findings = find_ai_hollow_lines(manual) if check_ai_hollow_lines else []
+        manual_title = title or Path(relative_path).stem.removesuffix("说明")
         base_project = {
             "source": str(manual),
             "relative_path": relative_path,
@@ -1085,6 +1145,8 @@ def run_manual_content_stage(
             "skip_requested": skip_requested,
             "skip_effective": qualification_action == "SKIP_MISMATCH" if use_title_body_inputs else (skip_topic_mismatch and topic_mismatch),
             "image_count": len(image_names),
+            "ai_hollow_line_findings": hollow_line_findings,
+            "ai_hollow_line_alert": f"需要将该说明书（{manual_title}）发给其他人。" if hollow_line_findings else None,
         }
         if changes_held:
             hold_status = "SKIPPED_TOPIC_MISMATCH" if qualification_action == "SKIP_MISMATCH" else "HELD_QUALIFICATION_NOT_EVALUATED"
@@ -1378,6 +1440,7 @@ def run_manual_content_stage(
             "check_image_vision": check_image_vision,
             "rewrite_body_years": rewrite_body_years,
             "rewrite_image_dates": rewrite_image_dates,
+            "check_ai_hollow_lines": check_ai_hollow_lines,
         },
         "disqualified_project_count": len(disqualified),
         "skipped_project_count": sum(project.get("qualification_action") == "SKIP_MISMATCH" for project in projects),

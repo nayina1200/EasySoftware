@@ -54,23 +54,71 @@ class Reporter:
 
 
 class CombinedDocumentWorkflowTests(unittest.TestCase):
-    def test_code_page_count_allows_one_page_deviation_and_rejects_two(self):
-        for actual_pages, expected_failures in ((61, 0), (59, 0), (62, 1), (58, 1)):
-            with self.subTest(actual_pages=actual_pages), tempfile.TemporaryDirectory() as directory:
+    def test_space_separated_gui_stage_argument_is_accepted(self) -> None:
+        gui_value = " ".join(MODULE.WORKFLOW_OPTION_ORDER)
+        self.assertEqual(MODULE._selected_stages(gui_value), MODULE.WORKFLOW_OPTION_ORDER)
+
+    def test_order_download_directory_expands_validated_zip_before_scanning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            batch = root / "订单批量"
+            order = batch / "item-01" / "客户_1件"
+            order.mkdir(parents=True)
+            downloaded_zip = order / "客户_1件.zip"
+            with zipfile.ZipFile(downloaded_zip, "w") as archive:
+                archive.writestr("软件说明.docx", b"fixture")
+            work = root / "work"
+            work.mkdir()
+
+            plain_root, _ = MODULE._material_root(batch, work, ROOT)
+            self.assertEqual(list(plain_root.rglob("*说明.docx")), [])
+
+            material_root, _ = MODULE._material_root(batch, work, ROOT, expand_order_downloads=True)
+            self.assertEqual(len(list(material_root.rglob("*说明.docx"))), 1)
+            self.assertTrue(downloaded_zip.is_file())
+            # Reopening the same download batch reuses the recorded extraction.
+            MODULE._material_root(batch, work, ROOT, expand_order_downloads=True)
+            self.assertEqual(len(list(material_root.rglob("*说明.docx"))), 1)
+
+    @staticmethod
+    def matching_qualification(material_root: Path, **_kwargs) -> dict:
+        manuals = sorted(material_root.rglob("*说明.docx"))
+        projects = []
+        for manual in manuals:
+            relative = manual.relative_to(material_root).as_posix()
+            projects.append({
+                "name": manual.stem.removesuffix("说明"),
+                "status": "MATCH",
+                "semantic_status": "MATCH",
+                "relative_path": relative,
+                "associated_files": [
+                    path.relative_to(material_root).as_posix()
+                    for path in material_root.rglob("*") if path.is_file()
+                ],
+            })
+        return {
+            "status": "COMPLETED", "mode": "enforced", "provider": "fixture",
+            "scanned_count": len(projects), "failure_count": 0, "failures": [],
+            "cache_hit_count": 0, "model_request_count": 0,
+            "projects": projects, "disqualified_projects": [],
+            "_inputs_by_relative_path": {},
+        }
+
+    def test_code_page_count_requires_at_least_sixty_pages(self):
+        for actual_pages, page_lines, expected_failures in ((61, 51, 0), (60, 50, 1), (59, 0, 1), (62, 51, 0)):
+            with self.subTest(actual_pages=actual_pages, page_lines=page_lines), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 docx = root / "代码.docx"
                 pdf = root / "代码.pdf"
                 discovered = {"docx": str(docx), "pdf": str(pdf), "status": "READY"}
                 translated = {
                     "docx": str(docx), "status": "CLEANED", "deletions": 0, "findings": [],
-                    "target_pages": 60, "actual_pages": actual_pages, "page_match": False,
+                    "target_pages": 60, "actual_pages": actual_pages, "page_match": actual_pages >= 60,
+                    "page_60_lines": page_lines,
                     "removed_translated_comments": 0,
                 }
                 exported = expected_failures == 0
-                export_detail = (
-                    f"目标 60 页，实际 {actual_pages} 页（偏差 1 页）"
-                    if exported else f"页数偏差超过 1 页：原 PDF 60 页，翻译后 {actual_pages} 页；已保留原 PDF"
-                )
+                export_detail = f"至少 60 页，实际 {actual_pages} 页" if exported else "页数不足；已保留原 PDF"
                 with mock.patch.object(MODULE, "_code_inventory", return_value=[discovered]), \
                         mock.patch.object(MODULE.code_comment_cleaner, "inspect_docx", return_value={}), \
                         mock.patch.object(MODULE.code_comment_cleaner, "pdf_page_count", return_value=60), \
@@ -91,16 +139,13 @@ class CombinedDocumentWorkflowTests(unittest.TestCase):
                 if expected_failures:
                     self.assertEqual(row["status"], "CLEANED_PDF_FAILED")
                     self.assertFalse(row["page_tolerance_match"])
-                    self.assertIn(f"目标 60 页，实际 {actual_pages} 页", row["acceptance_error"])
+                    self.assertIn(f"至少 60 页，实际 {actual_pages} 页", row["acceptance_error"])
                     self.assertIn("已保留原 PDF", row["pdf_detail"])
-                    self.assertIn("拟合过程已移除 0 条译文注释", row["acceptance_error"])
+                    self.assertIn("第 60 页需至少 51 行", row["acceptance_error"])
                 else:
-                    deviation = actual_pages - 60
                     self.assertEqual(row["status"], "CLEANED")
-                    self.assertFalse(row["page_match"])  # 精确相等结果仍如实保留
-                    self.assertTrue(row["page_tolerance_match"])
-                    self.assertEqual(row["page_deviation_pages"], deviation)
-                    self.assertIn(f"相差 {deviation:+d} 页（允许 ±1 页）", row["page_deviation_note"])
+                    self.assertTrue(row["page_match"])
+                    self.assertNotIn("page_tolerance_match", row)
 
     def test_code_exact_page_match_does_not_add_deviation_note(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -224,7 +269,7 @@ class CombinedDocumentWorkflowTests(unittest.TestCase):
             self.assertEqual(next_docx.read_bytes(), b"translated "+next_docx.name.encode())
             self.assertEqual(next_pdf.read_bytes(), b"replacement pdf")
 
-    def test_manual_cover_plan_uses_unique_txt_name_and_always_schedules_full_audit(self):
+    def test_manual_cover_plan_uses_unique_txt_name_and_schedules_pdf_screen(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project = root / "文件夹中的旧名称"
@@ -239,7 +284,8 @@ class CombinedDocumentWorkflowTests(unittest.TestCase):
         self.assertEqual(package["name_source"], "unique_txt_filename")
         self.assertEqual(package["docx_title"], "DOCX中的旧名称")
         self.assertIn("ENSURE_COVER_FIRST_PAGE", package["actions"])
-        self.assertIn("AUDIT_ALL_PAGES", package["actions"])
+        self.assertIn("AUDIT_PDF_ALL_PAGES", package["actions"])
+        self.assertNotIn("AUDIT_ALL_PAGES", package["actions"])
         self.assertIn("EXPORT_PDF", package["actions"])
         self.assertEqual(plan["unchanged"], [])
 
@@ -536,7 +582,7 @@ class CombinedDocumentWorkflowTests(unittest.TestCase):
             word_lock.assert_called_once()
             self.assertIs(invoke_word_pipeline.call_args.kwargs.get("progress"), reporter)
             self.assertEqual(result["outputs"], [str(output)])
-            self.assertEqual(len(list(base.glob("材料_已处理_*"))), 1)
+            self.assertEqual(len(list(base.glob("材料1件（共1件）_已处理_*"))), 1)
             self.assertEqual((output / "项目.txt").read_text(encoding="utf-8"), "软件名称：项目")
             report = json.loads(Path(result["report_json"]).read_text(encoding="utf-8"))
             self.assertEqual(report["status"], "DOCUMENT_PROCESSING_OK")
@@ -559,6 +605,7 @@ class CombinedDocumentWorkflowTests(unittest.TestCase):
                 with mock.patch.object(MODULE.manual_content_stage, "run_manual_content_stage", wraps=MODULE.manual_content_stage.run_manual_content_stage) as manual, \
                         mock.patch.object(MODULE, "_build_manual_cover_plan", wraps=MODULE._build_manual_cover_plan) as cover, \
                         mock.patch.object(MODULE.code_comment_cleaner, "_code_files", wraps=MODULE.code_comment_cleaner._code_files) as code_files, \
+                        mock.patch.object(MODULE, "_scan_title_body_qualification", side_effect=self.matching_qualification), \
                         mock.patch.object(MODULE, "_run_txt_stage", wraps=MODULE._run_txt_stage) as txt:
                     result = MODULE.preview(material, base / "work", ROOT, reporter,
                                             manual_options=self.manual_options(), document_stages=selected)
@@ -570,6 +617,24 @@ class CombinedDocumentWorkflowTests(unittest.TestCase):
                     self.assertEqual(called, key in active, key)
                     self.assertEqual(report["stages"][key]["status"] == "SKIPPED", key not in active)
                 self.assertEqual(cover.called, "manual" in active)
+
+    def test_hollow_line_stage_runs_scanner_and_reports_manual(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            material = self.make_materials(base)
+            finding = {"part": "word/document.xml", "width_emu": 6_000_000, "height_emu": 100_000}
+            with mock.patch.object(MODULE.manual_content_stage, "find_ai_hollow_lines", return_value=[finding]) as scanner:
+                result = MODULE.preview(
+                    material, base / "work", ROOT,
+                    manual_options=self.manual_options(),
+                    document_stages=("manual_ai_hollow_lines",),
+                    skip_topic_mismatch=False,
+                )
+            scanner.assert_called_once_with(material / "项目说明.docx")
+            report = json.loads(Path(result["report_json"]).read_text(encoding="utf-8"))
+            self.assertIn("manual_ai_hollow_lines", report["stages"]["manual"]["options"])
+            self.assertEqual(report["ai_hollow_line_alerts"][0]["name"], "项目")
+            self.assertEqual(report["stages"]["manual"]["projects"][0]["ai_hollow_line_findings"], [finding])
 
     def test_invalid_stage_selection_rejected_before_reading_materials(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -588,6 +653,7 @@ class CombinedDocumentWorkflowTests(unittest.TestCase):
             with mock.patch.object(MODULE.manual_content_stage, "run_manual_content_stage") as manual, \
                     mock.patch.object(MODULE, "_build_manual_cover_plan") as cover, \
                     mock.patch.object(MODULE, "_run_txt_stage") as txt, \
+                    mock.patch.object(MODULE, "_scan_title_body_qualification", side_effect=self.matching_qualification), \
                     mock.patch.object(MODULE.code_comment_cleaner, "pdf_page_count", return_value=1), \
                     mock.patch.object(MODULE.code_comment_cleaner, "translate_and_fit_docx", return_value={
                         "docx": str(material / "项目代码.docx"), "status": "CLEANED", "deletions": 0,

@@ -76,9 +76,16 @@ class FakeRuntime:
 
 class CombinedTitleBodyTests(unittest.TestCase):
     def test_default_config_loads_template_from_scripts_directory(self):
-        path, config = MODULE._title_body_config(ROOT)
-        self.assertEqual(path, ROOT / "scripts" / "title_body_config.example.json")
-        self.assertEqual(config["mode"], "shadow")
+        with tempfile.TemporaryDirectory() as directory:
+            app_root = Path(directory)
+            scripts = app_root / "scripts"
+            scripts.mkdir()
+            template = scripts / "title_body_config.example.json"
+            template.write_bytes((ROOT / "scripts" / template.name).read_bytes())
+            path, config = MODULE._title_body_config(app_root)
+        self.assertEqual(path, template)
+        self.assertEqual(config["mode"], "enforced")
+        self.assertTrue(config["skip_mismatch_requested"])
         self.assertEqual(config["prompt_version"], "title-body-jev-domain-fit-score-v3")
 
     def test_scan_starts_local_runtime_and_uses_unique_txt_title_and_exact_evidence(self):
@@ -337,6 +344,110 @@ class CombinedTitleBodyTests(unittest.TestCase):
             html_report = Path(result["report"]).read_text(encoding="utf-8")
             self.assertIn("项目甲", html_report)
             self.assertIn("剪贴板复制失败，处理继续", html_report)
+
+    def test_apply_copies_only_match_projects_and_names_qualified_and_total_counts(self):
+        import re
+        import validation_isolation
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "客户甲10件"
+            app_root = base / "app"
+            work = base / "work"
+            app_root.mkdir()
+            states = (("甲", "MATCH"), ("乙", "MISMATCH"), ("丙", "NOT_EVALUATED"))
+            projects = []
+            originals = {}
+            for name, status in states:
+                project_root = source / name
+                project_root.mkdir(parents=True)
+                project_files = {
+                    f"{name}.txt": f"{name} title\n".encode(),
+                    f"{name}说明.docx": f"{name} manual".encode(),
+                    f"{name}说明.pdf": f"{name} manual pdf".encode(),
+                    f"{name}代码.docx": f"{name} code".encode(),
+                    f"{name}代码.pdf": f"{name} code pdf".encode(),
+                }
+                for filename, content in project_files.items():
+                    path = project_root / filename
+                    path.write_bytes(content)
+                    originals[path] = content
+                relative_files = [f"{name}/{filename}" for filename in project_files]
+                projects.append({
+                    "name": name,
+                    "status": status,
+                    "semantic_status": status,
+                    "relative_path": f"{name}/{name}说明.docx",
+                    "associated_files": relative_files,
+                    "reason": "synthetic result",
+                })
+            config = app_root / "title_body_config.json"
+            config.write_text(json.dumps({
+                "mode": "enforced", "enforce": True, "skip_mismatch_requested": True,
+                "not_evaluated_action": "hold_changes", "provider": "local_llama",
+            }), encoding="utf-8")
+            qualification = {
+                "status": "COMPLETED", "mode": "enforced", "provider": "local_llama",
+                "model_id": "fixture", "scanned_count": 3, "failure_count": 0,
+                "failures": [], "cache_hit_count": 0, "model_request_count": 3,
+                "projects": projects, "disqualified_projects": [projects[1]],
+                "_inputs_by_relative_path": {},
+            }
+            with (
+                mock.patch.object(validation_isolation, "require_validation_path", side_effect=lambda path, **_kwargs: Path(path)),
+                mock.patch.object(MODULE.process_batch, "recover_pending_cover_transactions", return_value=[]),
+                mock.patch.object(MODULE, "_scan_title_body_qualification", return_value=qualification),
+            ):
+                result = MODULE.run(
+                    source, work, app_root, apply=True,
+                    document_stages=("match_title_body",),
+                    clipboard_writer=lambda _text: None,
+                )
+
+            output = Path(result["output"])
+            self.assertRegex(
+                output.name,
+                re.compile(r"^客户甲1件（共3件）_已处理_\d{8}_\d{6}$"),
+            )
+            self.assertTrue((output / "甲" / "甲说明.docx").is_file())
+            self.assertTrue((output / "甲" / "甲代码.docx").is_file())
+            self.assertFalse((output / "乙").exists())
+            self.assertFalse((output / "丙").exists())
+            self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+            report = json.loads(Path(result["report_json"]).read_text(encoding="utf-8"))
+            self.assertEqual(report["output_counts"], {
+                "qualified_projects": 1, "total_projects": 3, "selection": "MATCH_ONLY",
+            })
+            self.assertEqual(report["qualification"]["qualified_project_count"], 1)
+            self.assertEqual(report["qualification"]["input_project_count"], 3)
+            self.assertEqual(report["qualification"]["projects"][1]["action"], "SKIP_TITLE_BODY_MISMATCH")
+            self.assertEqual(report["qualification"]["projects"][2]["action"], "HOLD_NOT_EVALUATED")
+            html_report = Path(result["report"]).read_text(encoding="utf-8")
+            self.assertIn("客户甲1件（共3件）", html_report)
+            self.assertIn("MATCH 纳入 1/3 件", html_report)
+
+    def test_output_qualified_count_excludes_match_records_without_copyable_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            (source / "甲说明.docx").write_bytes(b"manual")
+            projects = [
+                {
+                    "semantic_status": "MATCH", "relative_path": "甲说明.docx",
+                    "associated_files": ["甲说明.docx"],
+                },
+                {
+                    "semantic_status": "MATCH", "relative_path": "missing/乙说明.docx",
+                    "associated_files": ["missing/乙说明.docx"],
+                },
+                {
+                    "semantic_status": "NOT_EVALUATED", "relative_path": "丙说明.docx",
+                    "associated_files": ["丙说明.docx"],
+                },
+            ]
+
+            plan = MODULE._qualified_material_plan(source, projects)
+
+            self.assertEqual(plan[3:], (1, 3))
 
 
 if __name__ == "__main__":

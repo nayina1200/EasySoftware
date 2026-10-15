@@ -1,7 +1,8 @@
-﻿param([switch]$SelfTest, [string]$InputPath = "", [switch]$AutoStart)
+﻿param([switch]$SelfTest, [string]$InputPath = "", [switch]$AutoStart, [string]$DocumentStages = "", [switch]$IncludeTopicMismatch, [switch]$OrderDownloads)
 
 $ErrorActionPreference = "Stop"
 $projectRoot = $PSScriptRoot
+$launchDocumentStages = $DocumentStages
 $entry = Join-Path $projectRoot "scripts\unified_workflow.py"
 $env:PYTHONIOENCODING = "utf-8"
 
@@ -362,8 +363,8 @@ $form.Controls.Add($exportButton)
 
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Text = "Ready"
-$statusLabel.Location = New-Object System.Drawing.Point(750, 177)
-$statusLabel.Size = New-Object System.Drawing.Size(190, 26)
+$statusLabel.Location = New-Object System.Drawing.Point(800, 177)
+$statusLabel.Size = New-Object System.Drawing.Size(160, 26)
 $statusLabel.Anchor = "Top,Left,Right"
 $form.Controls.Add($statusLabel)
 
@@ -413,16 +414,35 @@ $form.Controls.Add($workflowOptionsButton)
 $stageSelectionHint = New-Object System.Windows.Forms.Label
 $stageSelectionHint.Text = "完整处理"
 $stageSelectionHint.ForeColor = [System.Drawing.Color]::DimGray
-$stageSelectionHint.Location = New-Object System.Drawing.Point(327, 180)
-$stageSelectionHint.Size = New-Object System.Drawing.Size(370, 24)
+$stageSelectionHint.Location = New-Object System.Drawing.Point(327, 200)
+$stageSelectionHint.Size = New-Object System.Drawing.Size(610, 18)
 $stageSelectionHint.Anchor = "Top,Left,Right"
 $stageSelectionHint.AutoSize = $false
 $stageSelectionHint.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 8.5)
 $form.Controls.Add($stageSelectionHint)
 
+$oneClickProcessingCheck = New-Object System.Windows.Forms.CheckBox
+$oneClickProcessingCheck.Text = "一键处理（跳过预览直接生成结果）"
+$oneClickProcessingCheck.Location = New-Object System.Drawing.Point(327, 176)
+$oneClickProcessingCheck.Size = New-Object System.Drawing.Size(210, 27)
+$oneClickProcessingCheck.Checked = $false
+$oneClickProcessingCheck.Anchor = "Top,Left"
+$oneClickProcessingCheck.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 8.5)
+$oneClickProcessingCheck.Add_CheckedChanged({
+    $toolTip = if ($oneClickProcessingCheck.Checked) {
+        "点击处理说明和代码后直接正式处理并生成结果，中间不打开预览。"
+    } else {
+        "先生成预览；确认后点击确认处理并生成结果。"
+    }
+    $documentWorkflowTips.SetToolTip($oneClickProcessingCheck, $toolTip)
+})
+$documentWorkflowTips = New-Object System.Windows.Forms.ToolTip
+$documentWorkflowTips.SetToolTip($oneClickProcessingCheck, "先生成预览；确认后点击确认处理并生成结果。")
+$form.Controls.Add($oneClickProcessingCheck)
+
 $skipTopicMismatchCheck = New-Object System.Windows.Forms.CheckBox
 $skipTopicMismatchCheck.Text = "跳过标题正文不匹配项目（默认）"
-$skipTopicMismatchCheck.Location = New-Object System.Drawing.Point(720, 176)
+$skipTopicMismatchCheck.Location = New-Object System.Drawing.Point(540, 176)
 $skipTopicMismatchCheck.Size = New-Object System.Drawing.Size(250, 27)
 $skipTopicMismatchCheck.Checked = $true
 $skipTopicMismatchCheck.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 8.5)
@@ -433,14 +453,14 @@ $workflowGuide = New-Object System.Windows.Forms.Label
 $workflowGuide.Text = "工作流：1 选择材料  >  2 首轮看图并微调 Word  >  3 二次处理  >  4 终审  >  5 导出 PDF  >  6 压缩交付"
 $workflowGuide.ForeColor = [System.Drawing.Color]::FromArgb(49, 82, 138)
 $workflowGuide.BackColor = [System.Drawing.Color]::FromArgb(238, 244, 255)
-$workflowGuide.Location = New-Object System.Drawing.Point(26, 216)
+$workflowGuide.Location = New-Object System.Drawing.Point(26, 220)
 $workflowGuide.Size = New-Object System.Drawing.Size(710, 18)
 $workflowGuide.Anchor = "Top,Left,Right"
 $workflowGuide.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 8.5)
 $form.Controls.Add($workflowGuide)
 
 $progress = New-Object System.Windows.Forms.ProgressBar
-$progress.Location = New-Object System.Drawing.Point(26, 238)
+$progress.Location = New-Object System.Drawing.Point(26, 242)
 $progress.Size = New-Object System.Drawing.Size(914, 22)
 $progress.Anchor = "Top,Left,Right"
 $progress.Style = "Continuous"
@@ -452,14 +472,14 @@ $form.Controls.Add($progress)
 $progressDetail = New-Object System.Windows.Forms.Label
 $progressDetail.Text = "等待开始"
 $progressDetail.ForeColor = [System.Drawing.Color]::DimGray
-$progressDetail.Location = New-Object System.Drawing.Point(26, 264)
+$progressDetail.Location = New-Object System.Drawing.Point(26, 268)
 $progressDetail.Size = New-Object System.Drawing.Size(914, 24)
 $progressDetail.Anchor = "Top,Left,Right"
 $form.Controls.Add($progressDetail)
 
 $logBox = New-Object System.Windows.Forms.TextBox
-$logBox.Location = New-Object System.Drawing.Point(26, 292)
-$logBox.Size = New-Object System.Drawing.Size(914, 283)
+$logBox.Location = New-Object System.Drawing.Point(26, 296)
+$logBox.Size = New-Object System.Drawing.Size(914, 279)
 $logBox.Anchor = "Top,Bottom,Left,Right"
 $logBox.Multiline = $true
 $logBox.ReadOnly = $true
@@ -519,12 +539,14 @@ $script:fromExtracted = $false
 $script:exportWorkDir = $null
 $script:workflowOptionMetadata = [ordered]@{
     match_title_body = @{ Group = "匹配度检测"; Label = "标题与说明书正文主题匹配"; Tip = "逐件输出 0–100 主题相似度与判定依据；默认资格筛选会运行。" }
+    match_software_name = @{ Group = "匹配度检测"; Label = "软件名称一致性检查（本地）"; Tip = "检查正文、表格和章节标题中的其他软件名称；本地运行，不调用模型，只提示人工复核。" }
     match_manual_ocr = @{ Group = "匹配度检测"; Label = "截图 OCR 与软件主题匹配"; Tip = "抽样识别说明书界面图并检查与项目主题的相关性。" }
     match_manual_vision = @{ Group = "匹配度检测"; Label = "视觉模型复核截图"; Tip = "只作为相关/不相关/无法判断的人工复核证据；自动依赖 OCR 候选筛选。" }
     match_code = @{ Group = "匹配度检测"; Label = "代码 DOCX/PDF 配套检查"; Tip = "检查同名配套文件和代码文档中的中文注释候选。" }
     match_txt = @{ Group = "匹配度检测"; Label = "TXT 名称、字段与主题检查"; Tip = "检查编码、字段、软件名称、主要功能及主题冲突。" }
     manual_body_years = @{ Group = "说明书内容处理"; Label = "检查/修正说明书正文年份"; Tip = "按既有规则处理高置信时效语境中的正文年份。" }
     manual_image_dates = @{ Group = "说明书内容处理"; Label = "检查/修正说明书图片日期"; Tip = "只更新早于目标年份的有效日期年份；自动运行 OCR 相关性预检。" }
+    manual_ai_hollow_lines = @{ Group = "说明书页面整理"; Label = "检测空心线"; Tip = "检查 DOCX 中参考图所示的横向细长空心矩形；报告会单列说明书名称，并提示将该说明书发给其他人。只检测、不修改文档。" }
     manual_cover = @{ Group = "说明书页面整理"; Label = "整理说明书封面"; Tip = "检查并整理封面及其与正文的分页边界。" }
     manual_header = @{ Group = "说明书页面整理"; Label = "整理说明书页眉"; Tip = "单独处理页眉内容，不自动补页码。" }
     manual_page_numbers = @{ Group = "说明书页面整理"; Label = "整理说明书页码"; Tip = "单独检查和补齐动态页码，不自动整理页眉。" }
@@ -534,16 +556,32 @@ $script:workflowOptionMetadata = [ordered]@{
     txt_repair = @{ Group = "TXT 处理"; Label = "修复 TXT 主要功能字段"; Tip = "保留原编码和其他字段，只清理主要功能字段中的既定格式问题。" }
 }
 $script:workflowOptionGroups = [ordered]@{
-    "匹配度检测" = @("match_title_body", "match_manual_ocr", "match_manual_vision", "match_code", "match_txt")
+    "匹配度检测" = @("match_title_body", "match_software_name", "match_manual_ocr", "match_manual_vision", "match_code", "match_txt")
     "说明书内容处理" = @("manual_body_years", "manual_image_dates")
-    "说明书页面整理" = @("manual_cover", "manual_header", "manual_page_numbers", "manual_pdf")
+    "说明书页面整理" = @("manual_ai_hollow_lines", "manual_cover", "manual_header", "manual_page_numbers", "manual_pdf")
     "代码处理" = @("code_cleanup", "code_pdf")
     "TXT 处理" = @("txt_repair")
 }
-$script:documentStages = @($script:workflowOptionMetadata.Keys)
+$script:allWorkflowStages = @()
+foreach ($stageId in $script:workflowOptionMetadata.Keys) {
+    $script:allWorkflowStages += [string]$stageId
+}
+$script:documentStages = @($script:allWorkflowStages)
+$script:hasUnsavedLaunchStages = -not [string]::IsNullOrWhiteSpace($launchDocumentStages)
+if (-not [string]::IsNullOrWhiteSpace($launchDocumentStages)) {
+    # 兼容旧启动窗口已传出的空格分隔参数；新窗口统一传逗号分隔列表。
+    $requestedStages = @($launchDocumentStages -split '[,\s]+' | Where-Object { $_ })
+    $unknownStages = @($requestedStages | Where-Object { -not $script:workflowOptionMetadata.Contains($_) })
+    if ($unknownStages.Count -gt 0) { throw "未知材料处理步骤：$($unknownStages -join ",")" }
+    $script:documentStages = @($script:allWorkflowStages | Where-Object { $requestedStages -contains $_ })
+}
+if ($AutoStart) {
+    $oneClickProcessingCheck.Checked = $true
+    if ($IncludeTopicMismatch) { $skipTopicMismatchCheck.Checked = $false }
+}
 
 function Get-SelectedDocumentStages {
-    return (@($script:documentStages) -join ",")
+    return [string]::Join(",", [string[]]$script:documentStages)
 }
 
 function Get-DocumentStageSummary($Stages) {
@@ -578,7 +616,80 @@ function New-WorkflowOptionCheckBox([System.Windows.Forms.Control]$Parent, [stri
     $Controls[$OptionId] = $check
 }
 
+function Read-JevSettings {
+    $configPath = Join-Path $projectRoot "title_body_config.json"
+    $sourcePath = $configPath
+    if (-not (Test-Path -LiteralPath $sourcePath)) {
+        $sourcePath = Join-Path $projectRoot "title_body_config.example.json"
+        if (-not (Test-Path -LiteralPath $sourcePath)) {
+            $sourcePath = Join-Path $projectRoot "scripts\title_body_config.example.json"
+        }
+    }
+    $config = Get-Content -LiteralPath $sourcePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($null -eq $config -or $config -isnot [System.Management.Automation.PSCustomObject]) {
+        throw "Jev 配置必须是 JSON 对象，请检查：$sourcePath"
+    }
+    $threshold = [decimal]70
+    if ($null -ne $config.PSObject.Properties["score_threshold"]) {
+        $rawThreshold = $config.score_threshold
+        $text = [Convert]::ToString($rawThreshold, [Globalization.CultureInfo]::InvariantCulture)
+        if ($rawThreshold -is [bool] -or -not [decimal]::TryParse($text, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$threshold) -or $threshold -lt 0 -or $threshold -gt 100) {
+            throw "Jev 通过线必须是 0～100 的数值，请检查：$sourcePath"
+        }
+    }
+    return [PSCustomObject]@{ Path = $configPath; Config = $config; Threshold = $threshold }
+}
+
+function Save-WorkflowSettings([decimal]$Threshold, [string[]]$Stages) {
+    if ($Threshold -lt 0 -or $Threshold -gt 100) { throw "Jev 通过线必须在 0～100 之间。" }
+    # 保存时重新读取配置，保留评分模式、请求参数及其他设置。
+    $settings = Read-JevSettings
+    $settings.Config | Add-Member -MemberType NoteProperty -Name score_threshold -Value ([double]$Threshold) -Force
+    $settings.Config | Add-Member -MemberType NoteProperty -Name document_stages -Value ([string[]]@($Stages)) -Force
+    $json = $settings.Config | ConvertTo-Json -Depth 100
+    $tempPath = $settings.Path + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
+    $backupPath = $settings.Path + "." + [Guid]::NewGuid().ToString("N") + ".bak"
+    try {
+        [IO.File]::WriteAllText($tempPath, $json + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+        if ([IO.File]::Exists($settings.Path)) {
+            [IO.File]::Replace($tempPath, $settings.Path, $backupPath)
+            try { [IO.File]::Delete($backupPath) } catch {}
+        } else {
+            [IO.File]::Move($tempPath, $settings.Path)
+        }
+    } finally {
+        if ([IO.File]::Exists($tempPath)) { [IO.File]::Delete($tempPath) }
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($launchDocumentStages)) {
+    try {
+        $savedStages = (Read-JevSettings).Config.PSObject.Properties["document_stages"]
+        if ($null -ne $savedStages -and $savedStages.Value -is [array]) {
+            $knownStages = @($script:allWorkflowStages | Where-Object { $savedStages.Value -contains $_ })
+            if ($knownStages.Count -gt 0) {
+                $script:documentStages = $knownStages
+            }
+        }
+    } catch {
+        # 配置错误由自定义流程弹窗提示；主窗口先沿用完整处理默认项。
+    }
+}
+
 function Show-DocumentWorkflowOptions {
+    try {
+        $jevSettings = Read-JevSettings
+    } catch {
+        [void][System.Windows.Forms.MessageBox]::Show($form, ("无法读取 Jev 通过线：" + $_.Exception.Message), "配置读取失败", "OK", "Error")
+        return
+    }
+    if (-not $script:hasUnsavedLaunchStages) {
+        $savedStages = $jevSettings.Config.PSObject.Properties["document_stages"]
+        if ($null -ne $savedStages -and $savedStages.Value -is [array]) {
+            $knownStages = @($script:allWorkflowStages | Where-Object { $savedStages.Value -contains $_ })
+            if ($knownStages.Count -gt 0) { $script:documentStages = [string[]]$knownStages }
+        }
+    }
     $dialog = New-Object System.Windows.Forms.Form
     $dialog.Text = "处理说明和代码 - 自定义流程"
     $dialog.StartPosition = "CenterParent"
@@ -614,6 +725,27 @@ function Show-DocumentWorkflowOptions {
         New-WorkflowOptionCheckBox $matchPanel $id $y $controls $tips
         $y += 42
     }
+
+    $thresholdLabel = New-Object System.Windows.Forms.Label
+    $thresholdLabel.Text = "Jev 通过线："
+    $thresholdLabel.Location = New-Object System.Drawing.Point(18, ($y + 8))
+    $thresholdLabel.Size = New-Object System.Drawing.Size(125, 26)
+    $matchPanel.Controls.Add($thresholdLabel)
+    $thresholdInput = New-Object System.Windows.Forms.NumericUpDown
+    $thresholdInput.Minimum = 0
+    $thresholdInput.Maximum = 100
+    $thresholdInput.DecimalPlaces = 2
+    $thresholdInput.Increment = 1
+    $thresholdInput.Value = $jevSettings.Threshold
+    $thresholdInput.Location = New-Object System.Drawing.Point(150, ($y + 6))
+    $thresholdInput.Size = New-Object System.Drawing.Size(100, 28)
+    $matchPanel.Controls.Add($thresholdInput)
+    $thresholdNote = New-Object System.Windows.Forms.Label
+    $thresholdNote.Text = "0～100 分；达到通过线即通过。保存后下次打开仍使用此值。"
+    $thresholdNote.Location = New-Object System.Drawing.Point(18, ($y + 42))
+    $thresholdNote.Size = New-Object System.Drawing.Size(615, 40)
+    $thresholdNote.Anchor = "Top,Left,Right"
+    $matchPanel.Controls.Add($thresholdNote)
 
     $manualTab = New-Object System.Windows.Forms.TabPage
     $manualTab.Text = "说明书"
@@ -685,7 +817,7 @@ function Show-DocumentWorkflowOptions {
     $txtButton.Size = New-Object System.Drawing.Size(75, 30)
     $dialog.Controls.Add($txtButton)
     $okButton = New-Object System.Windows.Forms.Button
-    $okButton.Text = "保存选择"
+    $okButton.Text = "保存设置"
     $okButton.Location = New-Object System.Drawing.Point(486, 552)
     $okButton.Size = New-Object System.Drawing.Size(95, 30)
     $dialog.Controls.Add($okButton)
@@ -695,21 +827,39 @@ function Show-DocumentWorkflowOptions {
     $cancelButton.Size = New-Object System.Drawing.Size(80, 30)
     $dialog.Controls.Add($cancelButton)
 
+    # GetNewClosure 的事件脚本块有独立的 script 作用域；先在此处固定步骤清单。
+    $allStages = [string[]]@($script:allWorkflowStages)
+    $checkStages = [string[]]@($allStages | Where-Object { $_ -like "match_*" })
+    $manualStages = [string[]]@($allStages | Where-Object { $_ -in @("match_title_body", "match_software_name", "match_manual_ocr", "match_manual_vision") -or $_ -like "manual_*" })
     $setPreset = {
         param([string[]]$Ids)
         foreach ($key in $controls.Keys) { $controls[$key].Checked = $Ids -contains $key }
     }
-    $completeButton.Add_Click(({ & $setPreset @($script:workflowOptionMetadata.Keys) }).GetNewClosure())
-    $checksButton.Add_Click(({ & $setPreset @($script:workflowOptionMetadata.Keys | Where-Object { $_ -like "match_*" }) }).GetNewClosure())
-    $manualButton.Add_Click(({ & $setPreset @($script:workflowOptionMetadata.Keys | Where-Object { $_ -in @("match_title_body", "match_manual_ocr", "match_manual_vision") -or $_ -like "manual_*" }) }).GetNewClosure())
+    $completeButton.Add_Click(({ & $setPreset $allStages }).GetNewClosure())
+    $checksButton.Add_Click(({ & $setPreset $checkStages }).GetNewClosure())
+    $manualButton.Add_Click(({ & $setPreset $manualStages }).GetNewClosure())
     $codeButton.Add_Click(({ & $setPreset @("match_code", "code_cleanup", "code_pdf") }).GetNewClosure())
     $txtButton.Add_Click(({ & $setPreset @("match_txt", "txt_repair") }).GetNewClosure())
-    $okButton.Add_Click(({ $dialog.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dialog.Close() }).GetNewClosure())
+    $okButton.Add_Click(({
+        try {
+            [void]$dialog.ValidateChildren()
+            $selectedStages = [string[]]@($allStages | Where-Object { $controls[$_].Checked })
+            if ($selectedStages.Count -eq 0) { throw "请至少勾选一个处理步骤。" }
+            Save-WorkflowSettings $thresholdInput.Value $selectedStages
+            $dialog.Tag = [string[]]$selectedStages
+        } catch {
+            [void][System.Windows.Forms.MessageBox]::Show($dialog, ("自定义流程未保存：" + $_.Exception.Message), "保存失败", "OK", "Error")
+            return
+        }
+        $dialog.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $dialog.Close()
+    }).GetNewClosure())
     $cancelButton.Add_Click(({ $dialog.DialogResult = [System.Windows.Forms.DialogResult]::Cancel; $dialog.Close() }).GetNewClosure())
     $dialog.AcceptButton = $okButton
     $dialog.CancelButton = $cancelButton
     if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
-        $script:documentStages = @($script:workflowOptionMetadata.Keys | Where-Object { $controls[$_].Checked })
+        $script:documentStages = [string[]]$dialog.Tag
+        $script:hasUnsavedLaunchStages = $false
         Update-DocumentWorkflowSummary
     }
     $tips.Dispose()
@@ -763,6 +913,7 @@ function Set-Busy([bool]$Busy, [string]$Status) {
     $refurbishButton.Enabled = -not $Busy
     $orderDownloadButton.Enabled = -not $Busy
     $codeCommentButton.Enabled = -not $Busy
+    $oneClickProcessingCheck.Enabled = -not $Busy
     $stageChecksEnabled = (-not $Busy) -and ($script:reviewStage -ne "documents")
     $workflowOptionsButton.Enabled = $stageChecksEnabled
     $skipTopicMismatchCheck.Enabled = (-not $Busy) -and ($script:reviewStage -ne "documents")
@@ -907,6 +1058,16 @@ function Start-Operation([string[]]$Arguments, [string]$Operation) {
     $timer.Start()
 }
 
+function Read-ProgressState([string]$Path) {
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    try {
+        $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true)
+        try { return ($reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop) }
+        finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
+}
+
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 750
 $timer.Add_Tick({
@@ -914,7 +1075,7 @@ $timer.Add_Tick({
         $progressPath = Join-Path $script:workDir "progress.json"
         if (Test-Path -LiteralPath $progressPath) {
             try {
-                $state = Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+                $state = Read-ProgressState $progressPath
                 $elapsed = [math]::Round([double]$state.elapsed_seconds, 0)
                 $project = [string]$state.project_name
                 if ($state.total -gt 0) {
@@ -975,6 +1136,7 @@ $timer.Add_Tick({
     $result = Read-Result ($output + "`n" + $errors)
     if ($null -eq $result) {
         Set-Busy $false "Failed: no readable status"
+        $orderDownloadButton.BringToFront()
         [System.Windows.Forms.MessageBox]::Show("The process did not return a readable status. See the log.", "EasySoftware", "OK", "Error") | Out-Null
         return
     }
@@ -990,6 +1152,7 @@ $timer.Add_Tick({
         $exportButton.Text = "修改版 Word 导出 PDF"
         $recheckButton.Enabled = $false
         $packageButton.Enabled = $true
+        $packageButton.BringToFront()
         Set-WorkflowGuide "images"
         Set-Busy $false "等待图片审核：只填不通过项目"
         if ($reviewButton.Enabled) { Start-Process -FilePath $script:reviewPath }
@@ -1003,6 +1166,7 @@ $timer.Add_Tick({
         $approvalBox.Text = ""
         $packageButton.Text = "确认并执行清理"
         $packageButton.Enabled = $true
+        $packageButton.BringToFront()
         Set-Busy $false ("预览完成：预计删除 " + [string]$result.deletions + " 处")
         if ($reviewButton.Enabled) { Start-Process -FilePath $script:reviewPath }
     } elseif ($result.status -eq "NEEDS_DOCUMENT_PROCESSING_REVIEW") {
@@ -1013,9 +1177,15 @@ $timer.Add_Tick({
         $approvalBox.Enabled = $false
         $approvalLabel.Text = "材料处理流程："
         $approvalBox.Text = ""
-        $packageButton.Text = "确认并开始处理"
+        $packageButton.Text = "确认处理并生成结果"
         $packageButton.Enabled = $true
-        Set-Busy $false ("预检完成：" + (Get-DocumentStageSummary $script:documentStages))
+        $packageButton.BringToFront()
+        $nameWarning = ""
+        if ($result.PSObject.Properties["name_warning_count"] -and [int]$result.name_warning_count -gt 0) {
+            $nameWarning = "；软件名称疑似不一致 " + [string]$result.name_warning_count + " 处，请复核报告"
+            Append-Log ("软件名称不一致，请复核：" + (@($result.name_warning_names) -join "、"))
+        }
+        Set-Busy $false ("预检完成：" + (Get-DocumentStageSummary $script:documentStages) + $nameWarning)
         if ($reviewButton.Enabled) { Start-Process -FilePath $script:reviewPath }
     } elseif ($result.status -in @("DOCUMENT_PROCESSING_OK", "DOCUMENT_PROCESSING_PARTIAL")) {
         $script:reviewPath = [string]$result.report
@@ -1023,8 +1193,14 @@ $timer.Add_Tick({
         $reviewButton.Text = "打开材料处理报告"
         $reviewButton.Enabled = Test-Path -LiteralPath $script:reviewPath
         $approvalBox.Enabled = $false
+        $orderDownloadButton.BringToFront()
         $caption = if ($result.status -eq "DOCUMENT_PROCESSING_OK") { "材料统一处理完成" } else { "材料处理部分完成，请复核异常" }
-        Set-Busy $false ($caption + "：失败/待处理 " + [string]$result.failures + " 项；" + (Get-DocumentStageSummary $script:documentStages))
+        $nameWarning = ""
+        if ($result.PSObject.Properties["name_warning_count"] -and [int]$result.name_warning_count -gt 0) {
+            $nameWarning = "；软件名称疑似不一致 " + [string]$result.name_warning_count + " 处，请复核报告"
+            Append-Log ("软件名称不一致，请复核：" + (@($result.name_warning_names) -join "、"))
+        }
+        Set-Busy $false ($caption + "：失败/待处理 " + [string]$result.failures + " 项；" + (Get-DocumentStageSummary $script:documentStages) + $nameWarning)
         $packageButton.Enabled = $false
         Append-Log ($caption + "；失败/待处理 " + [string]$result.failures + " 项")
         Append-Log ("输出目录：" + [string]$result.output)
@@ -1065,6 +1241,7 @@ $timer.Add_Tick({
         $packageButton.Text = "打包通过项目"
         Set-WorkflowGuide "final"
         $packageButton.Enabled = $true
+        $packageButton.BringToFront()
         Set-Busy $false "终审已生成：可重新验收修改版或直接导出 PDF"
         if ($reviewButton.Enabled) { Start-Process -FilePath $script:reviewPath }
     } elseif ($result.status -eq "NEEDS_ARCHIVE_FORMAT") {
@@ -1091,6 +1268,7 @@ $timer.Add_Tick({
         Set-Busy $false "修改版 Word 已导出并覆盖 PDF"
         [System.Windows.Forms.MessageBox]::Show(("已导出：{0} 个文件`n已跳过：{1} 个文件`n失败：{2} 个文件`n`n报告：{3}" -f $result.exported, $result.skipped, $result.failed, (Join-Path ([string]$result.work_dir) "modified_pdf_export_report.json")), "EasySoftware", "OK", "Information") | Out-Null
     } else {
+        $orderDownloadButton.BringToFront()
         Set-Busy $false ("Status: " + [string]$result.status)
         $message = [string]$result.status
         if ($null -ne $result.error) { $message += "`n`n" + [string]$result.error }
@@ -1139,6 +1317,17 @@ $visionSettingsButton.Add_Click({
     Start-Process -FilePath "notepad.exe" -ArgumentList (Quote-Argument $configPath)
 })
 
+function Test-OrderDownloadBatchPath([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    $batch = Get-Item -LiteralPath $Path
+    if (-not $batch.Name.StartsWith("订单批量_", [StringComparison]::Ordinal)) { return $false }
+    foreach ($item in Get-ChildItem -LiteralPath $batch.FullName -Directory) {
+        if ($item.Name -notmatch '^item-\d+$') { continue }
+        if (Get-ChildItem -LiteralPath $item.FullName -Recurse -File -Filter "*.zip" | Select-Object -First 1) { return $true }
+    }
+    return $false
+}
+
 $codeCommentButton.Add_Click({
     $value = $inputBox.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($value) -or -not (Test-Path -LiteralPath $value)) {
@@ -1167,9 +1356,19 @@ $codeCommentButton.Add_Click({
     $logBox.Clear()
     Append-Log ("材料统一处理预览：" + $script:batchRoot)
     Append-Log (Get-DocumentStageSummary $script:documentStages)
-    $arguments = @($script:batchRoot, "--work-dir", $script:workDir, "--process-documents", "--document-stages", $selectedStages)
-    if (-not $skipTopicMismatchCheck.Checked) { $arguments += "--include-topic-mismatch" }
-    Start-Operation -Arguments $arguments -Operation "正在预检所选材料流程..."
+    if ($oneClickProcessingCheck.Checked) {
+        $arguments = @($script:batchRoot, "--work-dir", $script:workDir, "--apply-document-processing", "--document-stages", $selectedStages)
+        if (-not $skipTopicMismatchCheck.Checked) { $arguments += "--include-topic-mismatch" }
+        if ($OrderDownloads -or (Test-OrderDownloadBatchPath $value)) { $arguments += "--expand-order-downloads" }
+        Append-Log "一键处理已启用：跳过预览，直接执行所选流程并生成结果。"
+        Set-WorkflowGuide "processing"
+        Start-Operation -Arguments $arguments -Operation "正在一键处理材料并生成结果..."
+    } else {
+        $arguments = @($script:batchRoot, "--work-dir", $script:workDir, "--process-documents", "--document-stages", $selectedStages)
+        if (-not $skipTopicMismatchCheck.Checked) { $arguments += "--include-topic-mismatch" }
+        if ($OrderDownloads -or (Test-OrderDownloadBatchPath $value)) { $arguments += "--expand-order-downloads" }
+        Start-Operation -Arguments $arguments -Operation "正在预检所选材料流程..."
+    }
 })
 
 $exportButton.Add_Click({
@@ -1365,7 +1564,14 @@ $orderDownloadButton.Add_Click({
         [System.Windows.Forms.MessageBox]::Show("订单资料下载助手文件不存在：$helper", "EasySoftware", "OK", "Error") | Out-Null
         return
     }
-    Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $helper) -WindowStyle Normal
+    $selectedStages = Get-SelectedDocumentStages
+    if ([string]::IsNullOrWhiteSpace($selectedStages)) {
+        [System.Windows.Forms.MessageBox]::Show("请先在自定义步骤中勾选至少一项。", "EasySoftware", "OK", "Warning") | Out-Null
+        return
+    }
+    $arguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Quote-Argument $helper), "-DocumentStages", (Quote-Argument $selectedStages))
+    if (-not $skipTopicMismatchCheck.Checked) { $arguments += "-IncludeTopicMismatch" }
+    Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -WindowStyle Normal
 })
 
 $recheckButton.Add_Click({
@@ -1380,6 +1586,7 @@ $recheckButton.Add_Click({
 $packageButton.Add_Click({
     if ($script:reviewStage -eq "documents") {
         $packageButton.Enabled = $false
+        $orderDownloadButton.BringToFront()
         Append-Log ("确认处理，" + (Get-DocumentStageSummary $script:documentStages))
         $arguments = @($script:batchRoot, "--work-dir", $script:workDir, "--apply-document-processing", "--document-stages", (Get-SelectedDocumentStages))
         if (-not $skipTopicMismatchCheck.Checked) { $arguments += "--include-topic-mismatch" }
@@ -1432,7 +1639,7 @@ if (-not [string]::IsNullOrWhiteSpace($InputPath)) {
             $inputBox.Text = $resolvedInputPath
             Update-ExportAvailability
             if ($AutoStart) {
-                if (Test-ArchivePath $resolvedInputPath) {
+                if ((Test-ArchivePath $resolvedInputPath) -or (Test-Path -LiteralPath $resolvedInputPath -PathType Container)) {
                     $script:autoStartAfterShown = $true
                     $statusLabel.Text = "订单资料已载入；窗口显示后将自动开始处理。"
                 }
@@ -1460,8 +1667,8 @@ $form.Add_Shown({
     $script:autoStartAfterShown = $false
     $form.BeginInvoke([System.Windows.Forms.MethodInvoker]{
         $candidatePath = $inputBox.Text.Trim()
-        if (-not [string]::IsNullOrWhiteSpace($candidatePath) -and (Test-ArchivePath $candidatePath)) {
-            $startButton.PerformClick()
+        if (-not [string]::IsNullOrWhiteSpace($candidatePath) -and (Test-Path -LiteralPath $candidatePath) -and ((Test-ArchivePath $candidatePath) -or (Test-Path -LiteralPath $candidatePath -PathType Container))) {
+            $codeCommentButton.PerformClick()
         }
     }) | Out-Null
 }.GetNewClosure())

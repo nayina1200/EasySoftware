@@ -1,13 +1,13 @@
-﻿param([switch]$SelfTest)
+﻿param([switch]$SelfTest, [string]$DocumentStages = "", [switch]$IncludeTopicMismatch)
 
 $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $PSScriptRoot
 $corePath = Join-Path $PSScriptRoot "order_download_core.py"
 $mainGuiPath = Join-Path $scriptRoot "启动EasySoftware.ps1"
 $targetUrl = "http://36.212.60.8:10000/material/batchRefurbish"
-$debugPort = 9222
+$debugPort = 9223
 $debugEndpoint = "http://127.0.0.1:$debugPort"
-$profilePath = Join-Path $env:LOCALAPPDATA "EasySoftware\OrderMaterialBrowser"
+$profilePath = Join-Path $env:LOCALAPPDATA "EasySoftware\OrderMaterialBrowser-9223"
 $settingsDirectory = Join-Path $env:LOCALAPPDATA "EasySoftware"
 $settingsPath = Join-Path $settingsDirectory "order-download-settings.json"
 $script:socket = $null
@@ -16,6 +16,14 @@ $script:cdpEvents = @()
 $script:python = $null
 $script:searchRows = @()
 $script:finalDownloadPath = $null
+$script:batchQueue = @()
+$script:batchQueueIndex = 0
+$script:batchRunRoot = $null
+$script:batchActive = $false
+$script:batchPaused = $false
+$script:batchResults = @()
+$script:currentBatchEntry = $null
+$script:currentDownloadFailed = $false
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -373,12 +381,12 @@ if ($SelfTest) {
         if (-not $rejected) { throw "只读搜索策略自检失败：接受了无效请求。" }
     }
 
-    $safeTarget = Assert-LoopbackWebSocketTarget "ws://127.0.0.1:9222/devtools/page/abc-123"
+    $safeTarget = Assert-LoopbackWebSocketTarget "ws://127.0.0.1:$debugPort/devtools/page/abc-123"
     foreach ($url in @(
-        "ws://192.0.2.1:9222/devtools/page/abc-123",
-        "ws://127.0.0.1:9333/devtools/page/abc-123",
-        "wss://127.0.0.1:9222/devtools/page/abc-123",
-        "ws://127.0.0.1:9222/devtools/browser/abc-123"
+        "ws://192.0.2.1:$debugPort/devtools/page/abc-123",
+        "ws://127.0.0.1:$($debugPort + 1)/devtools/page/abc-123",
+        "wss://127.0.0.1:$debugPort/devtools/page/abc-123",
+        "ws://127.0.0.1:$debugPort/devtools/browser/abc-123"
     )) {
         $rejected = $false
         try { [void](Assert-LoopbackWebSocketTarget $url) } catch { $rejected = $true }
@@ -512,27 +520,32 @@ $form.Controls.Add($searchKind)
 
 $queryBox = New-Object System.Windows.Forms.TextBox
 $queryBox.Location = New-Object System.Drawing.Point(196, 207)
-$queryBox.Size = New-Object System.Drawing.Size(500, 30)
-$queryBox.Add_KeyDown({ if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { $searchButton.PerformClick() } })
+$queryBox.Size = New-Object System.Drawing.Size(500, 62)
+$queryBox.Multiline = $true
+$queryBox.AcceptsReturn = $true
+$queryBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+$queryBox.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 $form.Controls.Add($queryBox)
 
 $searchButton = New-Object System.Windows.Forms.Button
 $searchButton.Text = "搜索并下载"
-$searchButton.Location = New-Object System.Drawing.Point(708, 204)
+$searchButton.Location = New-Object System.Drawing.Point(708, 216)
 $searchButton.Size = New-Object System.Drawing.Size(175, 36)
 $form.Controls.Add($searchButton)
 
 $batchList = New-Object System.Windows.Forms.ListView
-$batchList.Location = New-Object System.Drawing.Point(26, 254)
-$batchList.Size = New-Object System.Drawing.Size(858, 240)
+$batchList.Location = New-Object System.Drawing.Point(26, 282)
+$batchList.Size = New-Object System.Drawing.Size(858, 212)
 $batchList.View = [System.Windows.Forms.View]::Details
 $batchList.FullRowSelect = $true
 $batchList.GridLines = $true
 $batchList.MultiSelect = $false
-[void]$batchList.Columns.Add("批次号", 250)
-[void]$batchList.Columns.Add("客户", 240)
-[void]$batchList.Columns.Add("已完成 / 总数", 140)
-[void]$batchList.Columns.Add("可下载", 110)
+[void]$batchList.Columns.Add("输入订单", 220)
+[void]$batchList.Columns.Add("批次号", 180)
+[void]$batchList.Columns.Add("客户", 170)
+[void]$batchList.Columns.Add("完成 / 总数", 100)
+[void]$batchList.Columns.Add("文件数", 70)
+[void]$batchList.Columns.Add("处理结果", 110)
 $form.Controls.Add($batchList)
 
 $handoffButton = New-Object System.Windows.Forms.Button
@@ -556,7 +569,7 @@ $autoProcessCheck.Checked = $false
 $form.Controls.Add($autoProcessCheck)
 
 $footnote = New-Object System.Windows.Forms.Label
-$footnote.Text = "一次点击先搜索；只有完整结果唯一且行内控件可确认时才会打包一次。无结果、多结果或页面结构异常时停止。勾选后会启动原候选审查流程，仍按流程等待人工审核。"
+$footnote.Text = "每行输入一个订单，最多 50 项；统一使用所选搜索方式。只有唯一结果才会打包。仅 ZIP 下载校验失败会跳过；其他异常暂停当前项，可修正后重试。勾选后将成功项合并交给候选审查。"
 $footnote.ForeColor = [System.Drawing.Color]::DimGray
 $footnote.Location = New-Object System.Drawing.Point(28, 566)
 $footnote.Size = New-Object System.Drawing.Size(850, 48)
@@ -594,7 +607,7 @@ $openBrowserButton.Add_Click({
             if (-not [string]::IsNullOrWhiteSpace($base)) { $chromeCandidates += (Join-Path $base "Google\Chrome\Application\chrome.exe") }
         }
         $chrome = $chromeCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-        if (-not $chrome) { throw "找不到 Chrome。请安装 Chrome，或先用已配置的专用窗口启动调试端口 9222。" }
+        if (-not $chrome) { throw "找不到 Chrome。请安装 Chrome，或先用已配置的专用窗口启动调试端口 $debugPort。" }
         New-Item -ItemType Directory -Path $profilePath -Force | Out-Null
         Start-Process -FilePath $chrome -ArgumentList @("--remote-debugging-port=$debugPort", "--remote-debugging-address=127.0.0.1", "--user-data-dir=$(Quote-Argument $profilePath)", (Quote-Argument $targetUrl)) -WindowStyle Normal | Out-Null
         $statusLabel.Text = "已打开独立浏览器。请完成手动登录，再点击「连接 / 检查登录」。"
@@ -615,12 +628,105 @@ $connectButton.Add_Click({
     } catch { Show-Error $_.Exception.Message }
 })
 
+function Initialize-BatchDownloadRun {
+    $destination = $destinationBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($destination)) { throw "请先设置下载位置。" }
+    Save-Destination $destination
+    $queryEntries = @()
+    $sourceLine = 0
+    foreach ($line in $queryBox.Lines) {
+        $sourceLine++
+        $query = $line.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($query)) {
+            $queryEntries += [pscustomobject]@{ query = $query; sourceLine = $sourceLine }
+        }
+    }
+    if ($queryEntries.Count -eq 0) { throw "请每行输入一个订单名称、编号或批次号。" }
+    if ($queryEntries.Count -gt 50) { throw "每次最多输入 50 个订单；当前为 $($queryEntries.Count) 项。" }
+    $script:batchQueue = @()
+    $script:batchQueueIndex = 0
+    $script:batchPaused = $false
+    $script:batchResults = @()
+    $script:batchRunRoot = Join-Path $destination ("订单批量_" + (Get-Date -Format "yyyyMMdd_HHmmss") + "_" + [Guid]::NewGuid().ToString("N").Substring(0, 8))
+    New-Item -ItemType Directory -Path $script:batchRunRoot -Force | Out-Null
+    $batchList.Items.Clear()
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $hasDuplicates = $false
+    foreach ($queryEntry in $queryEntries) {
+        $query = [string]$queryEntry.query
+        $lineNo = [int]$queryEntry.sourceLine
+        $item = New-Object System.Windows.Forms.ListViewItem($query)
+        foreach ($value in @("", "", "", "", "等待")) { [void]$item.SubItems.Add($value) }
+        [void]$batchList.Items.Add($item)
+        if (-not $seen.Add($query)) {
+            $item.SubItems[5].Text = "重复待修正"
+            $hasDuplicates = $true
+            continue
+        }
+        $script:batchQueue += [pscustomobject]@{
+            query = $query
+            listItem = $item
+            sourceLine = $lineNo
+            destination = Join-Path $script:batchRunRoot ("item-{0:D2}" -f $lineNo)
+        }
+    }
+    $script:finalDownloadPath = $script:batchRunRoot
+    $script:batchActive = -not $hasDuplicates
+    $handoffButton.Enabled = $false
+    if ($hasDuplicates) {
+        $statusLabel.Text = "清单中有重复订单，已停止；请修正重复行后重新开始。"
+        [System.Windows.Forms.MessageBox]::Show("订单清单包含重复项。请修正后重新开始；未搜索或下载任何订单。", "订单清单需要修正", "OK", "Warning") | Out-Null
+        return $false
+    }
+    if ($script:batchQueue.Count -eq 0) {
+        $script:batchActive = $false
+        $statusLabel.Text = "清单没有可执行的唯一订单项。"
+        return $false
+    }
+    return $true
+}
+
 $searchButton.Add_Click({
     try {
         if (-not [string]::IsNullOrWhiteSpace([string]$script:pendingDownloadStaging)) {
             throw "上一笔打包的下载状态仍未确认。请先检查暂存目录中的下载是否完成：$script:pendingDownloadStaging。为避免串批，当前会话不会再次触发打包。"
         }
-        if ([string]::IsNullOrWhiteSpace($queryBox.Text)) { throw "请输入订单名称、编号或批次号。" }
+        if (-not $script:batchActive) {
+            if ($script:batchPaused) {
+                if ($script:batchQueueIndex -ge $script:batchQueue.Count) { throw "当前批量队列没有可重试项。" }
+                $lines = @($queryBox.Lines)
+                $seenResume = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+                for ($resumeIndex = 0; $resumeIndex -lt $script:batchQueue.Count; $resumeIndex++) {
+                    $entry = $script:batchQueue[$resumeIndex]
+                    $lineIndex = [int]$entry.sourceLine - 1
+                    if ($lineIndex -lt 0 -or $lineIndex -ge $lines.Count) { throw "订单清单行数已变化，请恢复原有行数后重试当前项。" }
+                    $lineQuery = ([string]$lines[$lineIndex]).Trim()
+                    if ([string]::IsNullOrWhiteSpace($lineQuery)) { throw "当前项对应的清单行为空，请补全后重试。" }
+                    if ($resumeIndex -eq $script:batchQueueIndex) { $updatedQuery = $lineQuery }
+                    elseif ($lineQuery -cne [string]$entry.query) { throw "请保持其他订单行及行序不变，只修正当前暂停项后重试。" }
+                    else { $updatedQuery = [string]$entry.query }
+                    if (-not $seenResume.Add($updatedQuery)) { throw "待处理订单中存在重复项，请修正清单后重试。" }
+                    if ($resumeIndex -eq $script:batchQueueIndex) {
+                        $entry.query = $updatedQuery
+                        $entry.listItem.Text = $updatedQuery
+                    }
+                }
+                $script:batchPaused = $false
+                $script:batchActive = $true
+                $searchButton.Text = "搜索并下载"
+            } else {
+                $script:currentBatchEntry = $null
+                $script:currentDownloadFailed = $false
+                if ($null -eq $script:socket -or $script:socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) { throw "请先连接并检查登录状态。" }
+                if ($null -eq $script:python) { throw "找不到可用的 Python 运行时，无法校验下载 ZIP。" }
+                Assert-ExpectedPage (Get-PageEvidence)
+                if (-not (Initialize-BatchDownloadRun)) { return }
+            }
+        }
+        if ($script:batchQueueIndex -ge $script:batchQueue.Count) { return }
+        $script:currentBatchEntry = $script:batchQueue[$script:batchQueueIndex]
+        $script:currentDownloadFailed = $false
+        $script:currentBatchEntry.listItem.SubItems[5].Text = "搜索中"
         if ($null -eq $script:socket -or $script:socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) { throw "请先连接并检查登录状态。" }
         if ($null -eq $script:python) { throw "找不到可用的 Python 运行时，无法校验下载 ZIP。" }
         $evidence = Get-PageEvidence
@@ -628,16 +734,28 @@ $searchButton.Add_Click({
         $readRows = @'
 (() => {
   const visible = e => !!(e && e.getClientRects().length && getComputedStyle(e).visibility !== "hidden");
-  const totals = [...document.body.innerText.matchAll(/共\s*(\d+)\s*条/g)].map(match => Number(match[1]));
   const headerRows = [...document.querySelectorAll(".el-table__header-wrapper tr")].filter(visible).map(row => {
     const cells = [...row.querySelectorAll(":scope > th")].filter(cell => !cell.classList.contains("gutter")).map(e => (e.innerText || "").trim());
-    return {row, cells};
+    return {row, cells, table: row.closest(".el-table")};
   }).filter(item => ["批次号", "客户", "总数", "已完成"].every(name => item.cells.includes(name)));
-  if (headerRows.length !== 1 || totals.length !== 1) return {known:false, rows:[], totalRows:null};
-  const headers = headerRows[0].cells;
-  const table = headerRows[0].row.closest(".el-table");
+  const matchingTables = [...new Set(headerRows.map(item => item.table).filter(Boolean))];
+  if (matchingTables.length !== 1) return {known:false, rows:[], totalRows:null, reason:`matchingHeaders=${headerRows.length}; matchingTables=${matchingTables.length}`};
+  const table = matchingTables[0];
+  const header = headerRows.find(item => !item.row.closest(".el-table__fixed, .el-table__fixed-right")) || headerRows[0];
+  const headers = header.cells;
   const bodyTable = table && table.querySelector(".el-table__body-wrapper table.el-table__body");
-  if (!bodyTable) return {known:false, rows:[], totalRows:null};
+  if (!bodyTable) return {known:false, rows:[], totalRows:null, reason:"matchingTableBody=0"};
+  let totalRows = null;
+  for (let scope = table.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+    const counts = [...scope.querySelectorAll(".el-pagination")].filter(visible)
+      .flatMap(pager => [...(pager.innerText || "").matchAll(/共\s*(\d+)\s*条/g)].map(match => Number(match[1])));
+    if (counts.length === 1) { totalRows = counts[0]; break; }
+  }
+  if (totalRows === null) {
+    const pageCounts = [...document.querySelectorAll(".el-pagination")].filter(visible)
+      .flatMap(pager => [...(pager.innerText || "").matchAll(/共\s*(\d+)\s*条/g)].map(match => Number(match[1])));
+    if (pageCounts.length === 1) totalRows = pageCounts[0];
+  }
   const indexes = Object.fromEntries(["批次号", "客户", "总数", "已完成"].map(name => [name, headers.indexOf(name)]));
   const dataRows = [...bodyTable.querySelectorAll("tbody > tr")].filter(row => visible(row) && row.closest(".el-table") === table);
   const actionRows = [...table.querySelectorAll(".el-table__fixed-right .el-table__fixed-body-wrapper table.el-table__body tbody > tr")].filter(visible);
@@ -657,30 +775,35 @@ $searchButton.Add_Click({
     const cells = [...row.querySelectorAll(":scope > td")].map(e => (e.innerText || "").trim());
     return cells.length === headers.length ? [cells] : [];
   });
-  return {known:true, rows, totalRows:totals[0], fingerprint:JSON.stringify({total:totals,rows:fingerprintRows})};
+  return {known:true, rows, totalRows, fingerprint:JSON.stringify({total:totalRows,rows:fingerprintRows})};
 })()
 '@
         $beforeSearch = Invoke-PageExpression $readRows
-        if (-not $beforeSearch.known) { throw "搜索前无法识别当前批次表格，未提交搜索。" }
+        if (-not $beforeSearch.known) { throw "搜索前无法识别当前批次表格（$($beforeSearch.reason)），未提交搜索。" }
         $beforeFingerprint = [string]$beforeSearch.fingerprint
         Set-Busy $true
         $script:finalDownloadPath = $null
         $handoffButton.Enabled = $false
-        $batchList.Items.Clear()
         $statusLabel.Text = "正在提交搜索条件…"
         $placeholder = if ($searchKind.SelectedIndex -eq 1) { "批次号" } else { "订单名/编号" }
         $queryField = if ($searchKind.SelectedIndex -eq 1) { "batchNo" } else { "orderName" }
-        $queryValue = $queryBox.Text.Trim()
-        $queryJson = ConvertTo-Json -InputObject $queryBox.Text.Trim() -Compress
+        $queryValue = [string]$script:currentBatchEntry.query
+        $queryJson = ConvertTo-Json -InputObject $queryValue -Compress
         $placeholderJson = ConvertTo-Json -InputObject $placeholder -Compress
         $expression = @"
 (() => {
   const visible = e => !!(e && e.getClientRects().length && getComputedStyle(e).visibility !== "hidden");
-  const fields = [...document.querySelectorAll("input")].filter(e => visible(e) && (e.getAttribute("placeholder") || "").trim() === $placeholderJson);
+  const orderFields = [...document.querySelectorAll("input")].filter(e => visible(e) && (e.getAttribute("placeholder") || "").trim() === "订单名/编号");
+  const batchFields = [...document.querySelectorAll("input")].filter(e => visible(e) && (e.getAttribute("placeholder") || "").trim() === "批次号");
   const buttons = [...document.querySelectorAll("button,a,[role=button]")].filter(e => visible(e) && (e.innerText || "").trim() === "搜索");
-  if (fields.length !== 1 || buttons.length !== 1) return {ok:false};
-  const field = fields[0];
+  if (orderFields.length !== 1 || batchFields.length !== 1 || buttons.length !== 1) return {ok:false};
+  const field = $placeholderJson === "批次号" ? batchFields[0] : orderFields[0];
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+  for (const staleField of [orderFields[0], batchFields[0]]) {
+    setter.call(staleField, "");
+    staleField.dispatchEvent(new Event("input", {bubbles:true}));
+    staleField.dispatchEvent(new Event("change", {bubbles:true}));
+  }
   setter.call(field, $queryJson);
   field.dispatchEvent(new Event("input", {bubbles:true}));
   field.dispatchEvent(new Event("change", {bubbles:true}));
@@ -697,33 +820,110 @@ $searchButton.Add_Click({
         $searchResponse = Wait-ForBatchListResponse $queryField $queryValue
         Start-Sleep -Milliseconds 1800
         $result = Invoke-PageExpression $readRows
-        if (-not $result.known) { throw "无法唯一识别结果表格结构，为避免误点已停止。" }
+        if (-not $result.known) { throw "无法唯一识别结果表格结构（$($result.reason)），为避免误点已停止。" }
         $script:searchRows = @($result.rows)
-        $batchList.Items.Clear()
-        foreach ($row in $script:searchRows) {
-            $item = New-Object System.Windows.Forms.ListViewItem([string]$row.batchNo)
-            [void]$item.SubItems.Add([string]$row.customer)
-            [void]$item.SubItems.Add("$($row.completed) / $($row.total)")
-            [void]$item.SubItems.Add($(if ($row.packs -eq 1) { "可打包" } else { "控件异常" }))
-            $item.Tag = $row
-            [void]$batchList.Items.Add($item)
-        }
-        if ([int]$result.totalRows -ne $batchList.Items.Count) {
-            $statusLabel.Text = "页面总记录数与当前可见行数不一致，未点击打包。请缩小搜索范围后重试。"
-            return
+        if ($null -eq $result.totalRows) { throw "无法从当前批次表格附近唯一读取结果总数，未点击打包。" }
+        if ([int]$result.totalRows -ne [int]$result.rows.Count) {
+            $script:currentBatchEntry.listItem.SubItems[5].Text = "结构异常"
+            throw "页面总记录数与当前可见行数不一致，未点击打包。"
         }
         if ([int]$result.totalRows -eq 0) {
-            $statusLabel.Text = "搜索结果为零，没有执行任何打包操作。"
+            $script:currentBatchEntry.listItem.SubItems[5].Text = "待复核"
+            $script:batchActive = $false
+            $script:batchPaused = $true
+            $searchButton.Text = "重试当前项"
+            $statusLabel.Text = "当前项没有搜索结果，队列已暂停；可修正清单中的这一行后重试。未点击打包。"
             return
         }
-        if ([int]$result.totalRows -ne 1 -or $batchList.Items.Count -ne 1) {
-            $statusLabel.Text = "搜索命中 $($result.totalRows) 条；为避免批次歧义，没有执行打包。请缩小搜索范围后重试。"
+        foreach ($row in $script:searchRows) {
+            $script:currentBatchEntry.listItem.SubItems[1].Text = [string]$row.batchNo
+            $script:currentBatchEntry.listItem.SubItems[2].Text = [string]$row.customer
+            $script:currentBatchEntry.listItem.SubItems[3].Text = "$($row.completed) / $($row.total)"
+        }
+        if ([int]$result.totalRows -ne 1 -or [int]$result.rows.Count -ne 1) {
+            $script:currentBatchEntry.listItem.SubItems[1].Text = "$($result.totalRows) 条结果"
+            $script:currentBatchEntry.listItem.SubItems[2].Text = ""
+            $script:currentBatchEntry.listItem.SubItems[3].Text = ""
+            $script:currentBatchEntry.listItem.SubItems[5].Text = "待复核"
+            $script:batchActive = $false
+            $script:batchPaused = $true
+            $searchButton.Text = "重试当前项"
+            $statusLabel.Text = "当前项命中 $($result.totalRows) 条，队列已暂停；请确认或修改搜索词后重试。未点击打包。"
             return
         }
         $selectedRow = Get-UniqueBatchCandidate ([int]$result.totalRows) @($script:searchRows) ([string]$result.fingerprint) $beforeFingerprint $queryField $queryValue
+        $script:currentBatchEntry.listItem.SubItems[5].Text = "下载中"
         Invoke-SelectedBatchDownload $selectedRow
-    } catch { Show-Error $_.Exception.Message }
-    finally { Set-Busy $false }
+    } catch {
+        $message = $_.Exception.Message
+        $downloadFailed = ($null -ne $script:currentBatchEntry -and $script:currentDownloadFailed)
+        if ($null -ne $script:currentBatchEntry) {
+            if ($downloadFailed) {
+                $script:currentBatchEntry.listItem.SubItems[5].Text = "下载失败"
+                $script:batchResults += [pscustomobject]@{ query = [string]$script:currentBatchEntry.query; status = "下载失败"; detail = $message }
+            } elseif (-not [string]::IsNullOrWhiteSpace([string]$script:pendingDownloadStaging)) {
+                $script:currentBatchEntry.listItem.SubItems[5].Text = "下载状态不明"
+            } else {
+                $script:currentBatchEntry.listItem.SubItems[5].Text = "待复核"
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$script:pendingDownloadStaging)) {
+            $script:batchActive = $false
+            $script:batchPaused = $false
+            $statusLabel.Text = "下载状态不明，队列已暂停并保留暂存区。"
+            [System.Windows.Forms.MessageBox]::Show($message, "批量下载已暂停", "OK", "Warning") | Out-Null
+        } elseif ($downloadFailed) {
+            $statusLabel.Text = "ZIP 下载校验失败，已跳过当前项并继续：$message"
+        } elseif ($null -ne $script:currentBatchEntry) {
+            $script:batchActive = $false
+            $script:batchPaused = $true
+            $searchButton.Text = "重试当前项"
+            $statusLabel.Text = "当前项无法确认，队列已暂停；修正页面或清单后可重试。未点击打包。"
+            [System.Windows.Forms.MessageBox]::Show(($message + [Environment]::NewLine + [Environment]::NewLine + "当前项未跳过。请修正页面或清单后点击「重试当前项」。"), "批量下载已暂停", "OK", "Warning") | Out-Null
+        } else {
+            Show-Error $message
+        }
+    }
+    finally {
+        if ($script:batchActive -and [string]::IsNullOrWhiteSpace([string]$script:pendingDownloadStaging)) {
+            $script:batchQueueIndex++
+            if ($script:batchQueueIndex -lt $script:batchQueue.Count) {
+                Set-Busy $true
+                $statusLabel.Text = "正在处理第 $($script:batchQueueIndex + 1) / $($script:batchQueue.Count) 项。"
+                [void]$form.BeginInvoke([Action]{ $searchButton.Enabled = $true; $searchButton.PerformClick() })
+            } else {
+                $script:batchActive = $false
+                $successes = @($batchList.Items | Where-Object { $_.SubItems[5].Text -eq "下载完成" }).Count
+                $failures = @($script:batchResults | Where-Object { $_.status -ne "下载完成" })
+                $script:finalDownloadPath = if ($successes -gt 0) { $script:batchRunRoot } else { $null }
+                $handoffButton.Enabled = ($successes -gt 0)
+                $statusLabel.Text = "批量下载结束：成功 $successes 项，异常 $($failures.Count) 项。"
+                Set-Busy $false
+                if ($successes -gt 0 -and $autoProcessCheck.Checked) {
+                    try { Invoke-CandidateReviewHandoff -AutoStart } catch { Show-Error $_.Exception.Message }
+                } elseif ($successes -gt 0) {
+                    $statusLabel.Text += " 可点击「交给候选审查」处理本次成功项。"
+                }
+                if ($failures.Count -gt 0) {
+                    $failureText = ($failures | ForEach-Object { "• $($_.query)：$($_.status) $($_.detail)" }) -join [Environment]::NewLine
+                    [System.Windows.Forms.MessageBox]::Show(("成功 $successes 项，异常 $($failures.Count) 项。" + [Environment]::NewLine + [Environment]::NewLine + $failureText), "批量下载结果", "OK", "Information") | Out-Null
+                }
+            }
+        } else {
+            Set-Busy $false
+            if (-not [string]::IsNullOrWhiteSpace([string]$script:pendingDownloadStaging)) {
+                $successes = @($batchList.Items | Where-Object { $_.SubItems[5].Text -eq "下载完成" }).Count
+                $script:finalDownloadPath = if ($successes -gt 0) { $script:batchRunRoot } else { $null }
+                $handoffButton.Enabled = ($successes -gt 0)
+                if ($successes -gt 0) { $statusLabel.Text += " 已完成的 $successes 项可单独交给候选审查。" }
+            } elseif ($script:batchPaused) {
+                $searchButton.Text = "重试当前项"
+                $successes = @($batchList.Items | Where-Object { $_.SubItems[5].Text -eq "下载完成" }).Count
+                $script:finalDownloadPath = if ($successes -gt 0) { $script:batchRunRoot } else { $null }
+                $handoffButton.Enabled = ($successes -gt 0)
+            }
+        }
+    }
 })
 
 function Invoke-SelectedBatchDownload($selectedRow) {
@@ -732,9 +932,9 @@ function Invoke-SelectedBatchDownload($selectedRow) {
     $downloadFinalized = $false
     $preserveStaging = $false
     try {
-        $destination = $destinationBox.Text.Trim()
-        if ([string]::IsNullOrWhiteSpace($destination)) { throw "请先设置下载位置。" }
-        Save-Destination $destination
+        $destination = [string]$script:currentBatchEntry.destination
+        if ([string]::IsNullOrWhiteSpace($destination)) { throw "当前订单的归档目录无效。" }
+        New-Item -ItemType Directory -Path $destination -Force | Out-Null
         $evidence = Get-PageEvidence
         Assert-ExpectedPage $evidence
         $staging = Join-Path ([IO.Path]::GetTempPath()) ("EasySoftware-OrderDownload-" + [Guid]::NewGuid().ToString("N"))
@@ -750,14 +950,27 @@ function Invoke-SelectedBatchDownload($selectedRow) {
 (() => {
   const expected = $rowJson;
   const visible = e => !!(e && e.getClientRects().length && getComputedStyle(e).visibility !== "hidden");
-  const totals = [...document.body.innerText.matchAll(/共\s*(\d+)\s*条/g)].map(match => Number(match[1]));
-  const headerRows = [...document.querySelectorAll(".el-table__header-wrapper tr")].filter(visible).map(row => ({row,cells:[...row.querySelectorAll(":scope > th")].filter(cell => !cell.classList.contains("gutter")).map(e => (e.innerText || "").trim())}))
+  const headerRows = [...document.querySelectorAll(".el-table__header-wrapper tr")].filter(visible).map(row => ({row,cells:[...row.querySelectorAll(":scope > th")].filter(cell => !cell.classList.contains("gutter")).map(e => (e.innerText || "").trim()),table:row.closest(".el-table")}))
     .filter(item => ["批次号", "客户", "总数", "已完成"].every(name => item.cells.includes(name)));
-  if (headerRows.length !== 1 || totals.length !== 1 || totals[0] !== 1) return {ok:false};
-  const table = headerRows[0].row.closest(".el-table");
+  const matchingTables = [...new Set(headerRows.map(item => item.table).filter(Boolean))];
+  if (matchingTables.length !== 1) return {ok:false};
+  const table = matchingTables[0];
+  const header = headerRows.find(item => !item.row.closest(".el-table__fixed, .el-table__fixed-right")) || headerRows[0];
+  let totalRows = null;
+  for (let scope = table.parentElement; scope && scope !== document.body; scope = scope.parentElement) {
+    const counts = [...scope.querySelectorAll(".el-pagination")].filter(visible)
+      .flatMap(pager => [...(pager.innerText || "").matchAll(/共\s*(\d+)\s*条/g)].map(match => Number(match[1])));
+    if (counts.length === 1) { totalRows = counts[0]; break; }
+  }
+  if (totalRows === null) {
+    const pageCounts = [...document.querySelectorAll(".el-pagination")].filter(visible)
+      .flatMap(pager => [...(pager.innerText || "").matchAll(/共\s*(\d+)\s*条/g)].map(match => Number(match[1])));
+    if (pageCounts.length === 1) totalRows = pageCounts[0];
+  }
+  if (totalRows !== 1) return {ok:false};
   const bodyTable = table && table.querySelector(".el-table__body-wrapper table.el-table__body");
   if (!bodyTable) return {ok:false};
-  const headers = [headerRows[0].cells];
+  const headers = [header.cells];
   const indexes = Object.fromEntries(["批次号", "客户", "总数", "已完成"].map(name => [name, headers[0].indexOf(name)]));
   const rows = [...bodyTable.querySelectorAll("tbody > tr")].filter(row => visible(row) && row.closest(".el-table") === table && row.querySelectorAll(":scope > td").length === headers[0].length);
   if (rows.length !== 1) return {ok:false};
@@ -818,21 +1031,23 @@ function Invoke-SelectedBatchDownload($selectedRow) {
         if ($null -eq $source) { throw "等待浏览器下载超时，或下载文件未稳定完成。" }
         $coreResultText = & $script:python $corePath "finalize" "--source" $source "--destination" $destination "--customer" ([string]$selectedRow.customer)
         if ($LASTEXITCODE -ne 0) {
-            try { $coreResult = ($coreResultText -join "`n") | ConvertFrom-Json; throw [string]$coreResult.error }
-            catch { if ($_.Exception.Message) { throw $_.Exception.Message }; throw "ZIP 检查或安全命名失败。" }
+            try { $coreResult = ($coreResultText -join "`n") | ConvertFrom-Json }
+            catch { throw "ZIP 检查或安全命名失败。" }
+            if ([string]$coreResult.stage -eq "validation") {
+                $script:currentDownloadFailed = $true
+                $downloadFinalized = $true
+            }
+            throw [string]$coreResult.error
         }
         $coreResult = ($coreResultText -join "`n") | ConvertFrom-Json
         if ($coreResult.status -ne "OK" -or [string]::IsNullOrWhiteSpace($coreResult.path)) { throw "ZIP 校验或归档命名未返回成功结果。" }
-        $script:finalDownloadPath = [string]$coreResult.path
+        $script:finalDownloadPath = [string]$script:batchRunRoot
+        $script:currentBatchEntry.listItem.SubItems[4].Text = [string]$coreResult.count
+        $script:currentBatchEntry.listItem.SubItems[5].Text = "下载完成"
+        $script:batchResults += [pscustomobject]@{ query = [string]$script:currentBatchEntry.query; status = "下载完成"; detail = [string]$coreResult.filename }
         $downloadFinalized = $true
         $script:pendingDownloadStaging = $null
-        $handoffButton.Enabled = $true
         $statusLabel.Text = "下载并校验完成：$($coreResult.filename)（ZIP 内 $($coreResult.count) 个文件）。"
-        if ($autoProcessCheck.Checked) {
-            Invoke-CandidateReviewHandoff -AutoStart
-        } else {
-            $statusLabel.Text += "可点击「交给候选审查」手动启动。"
-        }
     } catch {
         if ($packClicked -and -not $downloadFinalized) {
             $preserveStaging = $true
@@ -854,9 +1069,15 @@ function Invoke-SelectedBatchDownload($selectedRow) {
 }
 
 function Invoke-CandidateReviewHandoff([switch]$AutoStart) {
-    if ([string]::IsNullOrWhiteSpace($script:finalDownloadPath) -or -not (Test-Path -LiteralPath $script:finalDownloadPath -PathType Leaf)) { throw "没有已校验的下载文件可交给候选审查。" }
+    if ([string]::IsNullOrWhiteSpace($script:finalDownloadPath) -or -not ((Test-Path -LiteralPath $script:finalDownloadPath -PathType Leaf) -or (Test-Path -LiteralPath $script:finalDownloadPath -PathType Container))) { throw "没有已校验的下载资料可交给候选审查。" }
     if (-not (Test-Path -LiteralPath $mainGuiPath -PathType Leaf)) { throw "候选审查主界面不存在：$mainGuiPath" }
     $arguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Quote-Argument $mainGuiPath), "-InputPath", (Quote-Argument $script:finalDownloadPath))
+    if (-not [string]::IsNullOrWhiteSpace($DocumentStages)) {
+        $selectedStages = (@($DocumentStages -split '[,\s]+' | Where-Object { $_ }) -join ",")
+        $arguments += @("-DocumentStages", (Quote-Argument $selectedStages))
+    }
+    if ($IncludeTopicMismatch) { $arguments += "-IncludeTopicMismatch" }
+    $arguments += "-OrderDownloads"
     if ($AutoStart) { $arguments += "-AutoStart" }
     Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -WindowStyle Normal | Out-Null
     if ($AutoStart) {
@@ -875,7 +1096,7 @@ $handoffButton.Add_Click({
 
 $openFolderButton.Add_Click({
     try {
-        $path = $destinationBox.Text.Trim()
+        $path = if (-not [string]::IsNullOrWhiteSpace([string]$script:batchRunRoot) -and (Test-Path -LiteralPath $script:batchRunRoot -PathType Container)) { $script:batchRunRoot } else { $destinationBox.Text.Trim() }
         if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "下载目录还不存在。" }
         Start-Process -FilePath "explorer.exe" -ArgumentList (Quote-Argument $path) | Out-Null
     } catch { Show-Error $_.Exception.Message }
