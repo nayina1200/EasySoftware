@@ -7,7 +7,9 @@
 | Windows 双击启动 | `启动EasySoftware.cmd` → `启动EasySoftware.ps1` |
 | GUI、确认弹窗、进度展示 | `启动EasySoftware.ps1` |
 | CLI 路由和公共进度 | `scripts/unified_workflow.py` |
+| 订单资料下载与自动衔接 | `scripts/order_material_downloader_gui.ps1`、`scripts/order_download_core.py` |
 | 说明 + 代码 + TXT 统一编排 | `scripts/combined_document_workflow.py` |
+| 软件名称本地一致性提示 | `scripts/software_name_consistency.py` |
 | 说明 OCR、相关性、正文年份、截图年份 | `scripts/manual_content_stage.py` |
 | RapidOCR 批处理桥接 | `scripts/rapid_ocr_bridge.py` |
 | 旧日期引擎桥接 | `scripts/date_year_rewriter_bridge.py` |
@@ -18,6 +20,8 @@
 | 统一入口测试 | `tests/test_combined_document_workflow.py`、`tests/test_unified_document_entry.py` |
 
 行为边界以 `contracts/document-stage.schema.json` 和 `contracts/code-phase.md` 为准。
+
+2026-10-15 当前状态（Confirmed；证据：提交 `f3622a0`、[HANDOFF](../HANDOFF.md)、`tests/test_combined_document_workflow.py`、`tests/test_progress_reporting.py`）：候选版包含订单下载自动衔接、自定义步骤持久化与重新打开恢复、TXT 检查/主要功能字段修复，以及进度文件占用时继续处理的保护。该提交已推送到 `origin/release/jev-shadow-20260928`。完整单元测试共 321 项，320 通过、1 跳过；真实订单与 Word/PDF 完整批次仍待本版本复验。以下按日期保留的旧状态为历史记录。
 
 2026-09-28：候选版部署封面提速规则 `3.4.27`。空白页修复只复用同一未变动布局的映射；保存后的 Word/PDF 终检仍独立执行。封面末行按需倒扫并保留异常回退，格式化范围限定连续、非表格、非目录封面块。真实速度和全部场景验收待后续模型完成，见 [部署交接](evidence/cover-speed-deployment-20260928.md)。
 

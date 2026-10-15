@@ -1,5 +1,13 @@
 # EasySoftware 任务交接
 
+## 当前接手状态（2026-10-15）
+
+- 唯一继续修改和运行的版本是本目录 `EasySoftware_候选_审查版_20260928`。多个对话累积的 34 个文件改动已在提交 `f3622a0` 中统一提交，并推送到 `origin/release/jev-shadow-20260928`；该次推送后本地与远端一致。
+- 当前主程序支持订单资料下载后自动衔接候选审查、自定义步骤保存与再次打开恢复、说明书/代码/TXT 所选流程、软件名称和抽样图片 OCR 提示。进度文件被 Windows 占用时不会再仅因状态显示失败而终止材料处理。已运行的旧主窗口必须退出并重新启动，才能加载这些修复。
+- 提交前完整回归共运行 321 项，320 通过、1 跳过；5 个修改过的 PowerShell 脚本通过语法解析。测试使用带 `reportlab` 的工作区 Python；便携 Python 缺少这个仅供测试使用的包。真实订单下载、完整 Word/PDF 批次和外部模型调用仍未在本轮重新验收，不要把单元测试结果当作真实交付验收。
+- 项目记忆已同步当前行为，但旧包缺少 `manifest.json` 及多个重建目录，`memoryctl.py check .` 尚未通过；它目前是接手导航，不是已认证的独立重建包。缺口记录在 [.project-memory/gaps.md](.project-memory/gaps.md)。
+- 下文按日期保留当时的调查与验证记录。旧段落中的“未提交”“仅登记 TXT”“未运行测试”等状态只描述其记录日期；以上述当前状态和实际代码为准。运行批次前仍须核对本地设置、材料及输出目录。
+
 ## 2026-10-13 候选审查前置：订单资料下载
 
 ### 目标与入口
@@ -64,8 +72,8 @@
 
 - 原始输入：`D:\360MoveData\Users\ban\Desktop\work_about\order\北京知识产权10件.rar`。
 - **本轮输出**：`D:\360MoveData\Users\ban\Desktop\work_about\order\北京知识产权10件_已处理_20260923_114920`。旧的 `..._20260922_213656` 含年份误改，不可交付。
-- [HTML 报告](.omc/full-batch-corrected-20260923/combined_document_result.html)及[机器可读结果](.omc/full-batch-corrected-20260923/combined_document_result.json)：`DOCUMENT_PROCESSING_OK`、失败 0。报告展示 24 张年份图片的原稿/处理后全图及局部对比；卡片保留“待核验”提示，便于逐张检查。
-- 10/10 份说明书封面 Word QA 为 `OK`。首次全跑发现 7 份仍有独立旧封面页，修复分页/分节边界删除规则后，对现有 DOCX 重跑这 7 份并重导 PDF；[重跑结果](.omc/full-batch-corrected-20260923/cover_retry_seven_result.json)均为 `OK`。[首次失败记录](.omc/full-batch-corrected-20260923/combined_cover_result_initial.json)仅用于追溯。
+- 当时 HTML/JSON 报告记录 `DOCUMENT_PROCESSING_OK`、失败 0；原始 `.omc/full-batch-corrected-20260923/` 报告文件现不在本仓库，不能再作为可点击证据。现存结论见[修复批次证据](.project-memory/evidence/corrected-real-batch-20260923.md)。当时报告展示 24 张年份图片的前后对比，并保留“待核验”提示。
+- 10/10 份说明书封面 Word QA 为 `OK`。首次全跑发现 7 份仍有独立旧封面页，修复分页/分节边界删除规则后，对现有 DOCX 重跑这 7 份并重导 PDF；当时重跑结果均为 `OK`。原始 `.omc` 重跑与首次失败 JSON 现不在本仓库，追溯时应先核对旧备份。
 - 图片日期**仅把早于 2025 的有效日期年份改为 2025**，月、日、时间保留；2025 和未来年份不动。医院说明 11 张（14 个 `2022→2025` 字段）、蓝宝石切片机说明 13 张（13 个 `2024→2025` 字段）。原本误改的编号、图表刻度、毫米波 2026 日期及医院 2033 日期保持原样。[详细复验证据](.project-memory/evidence/corrected-real-batch-20260923.md)。
 - 用户标出的 5 份标题与正文疑似冲突的说明全部在报告中提示**人工复核**；这仍是可解释的主题冲突提示，并非完整语义判定。图片相关性由 OCR 预检和本地多模态模型抽查辅助判断；视觉模型结果只供复核，不参与自动拦截。本地路由为 `http://127.0.0.1:3458/v1/chat/completions`，模型名必须是 `sensenova-6.8-flash-lite`，Key 可为 `proxy`。
 - GUI 的“处理说明和代码”入口可在处理前勾选说明书、代码、TXT 占位；CLI 使用 `--document-stages manual,code,txt_placeholder`。默认全选，预览与执行使用同一选择；未选阶段为 `SKIPPED` 且不扫描/处理，进度只计所选阶段。至少选说明书或代码；TXT 单选无可执行动作。

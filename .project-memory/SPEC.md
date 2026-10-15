@@ -35,3 +35,5 @@ EasySoftware 是 Windows 绿色便携程序，用于批量审计和处理软件�
 - Windows 双击入口为 `启动EasySoftware.cmd`，由其调用 PowerShell GUI。
 - 统一工作流入口为 `scripts/unified_workflow.py`。
 - 运行状态和审计结果写入工作目录；项目源码自身不依赖数据库或后台服务。
+- 自定义步骤及 Jev 通过线写入本版本 `title_body_config.json`；同一主窗口重新打开设置时从该文件恢复，显式 `-DocumentStages` 只在首次打开时优先。证据：`启动EasySoftware.ps1`、`HANDOFF.md` 的 2026-10-15 记录。
+- GUI 读取 `progress.json` 时允许 Windows 替换共享；短暂占用会重试，持续占用不能仅因进度显示中断材料处理。最终结果仍由统一入口输出 JSON。证据：`启动EasySoftware.ps1`、`scripts/unified_workflow.py`、`tests/test_progress_reporting.py`。

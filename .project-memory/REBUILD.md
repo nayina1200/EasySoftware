@@ -24,13 +24,14 @@
 3. 处理正文年份和截图年份。
 4. 串行执行 Word 封面修复和说明 PDF。
 5. 清理代码中文注释并串行导出代码 PDF。
-6. TXT 仅登记，不读写。
+6. 按所选项检查 TXT 名称、字段与主题；仅在选中 `txt_repair` 时修复主要功能字段，保留原编码和其他字段。
 
 ## 验收
 
 ```powershell
-.\python\python.exe -m unittest discover -s .\tests -q
+python -m pip install -r tests/requirements.txt
+python -m unittest discover -s tests -q
 .\python\python.exe -m py_compile .\scripts\combined_document_workflow.py .\scripts\manual_content_stage.py
 ```
 
-布局改动必须以 Word/PDF 渲染首两页复核，不能只看结构化 QA。对输出还应检查 DOCX ZIP、PDF 可读性、TXT 哈希、临时文件和原始压缩包哈希。
+页码审计测试使用 `reportlab` 生成合成 PDF，便携 Python 未预装此测试依赖；已安装依赖的工作区 Python 在 2026-10-15 完成 321 项测试（320 通过、1 跳过）。布局改动必须以 Word/PDF 渲染首两页复核，不能只看结构化 QA。对输出还应检查 DOCX ZIP、PDF 可读性、TXT 编码与非目标字段、临时文件和原始压缩包哈希。
