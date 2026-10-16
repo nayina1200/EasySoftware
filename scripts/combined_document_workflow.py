@@ -174,6 +174,23 @@ class _StageProgress:
         )
 
 
+def _order_download_customer_dirs(source: Path) -> list[Path]:
+    """Find customer archive folders within the order downloader's item wrappers."""
+    if not source.is_dir():
+        return []
+    customer_dirs: list[Path] = []
+    item_dirs = sorted(
+        (path for path in source.iterdir() if path.is_dir() and re.fullmatch(r"item-\d+", path.name, re.IGNORECASE)),
+        key=lambda path: path.name.casefold(),
+    )
+    for item_dir in item_dirs:
+        customer_dirs.extend(
+            path for path in sorted(item_dir.iterdir(), key=lambda item: item.name.casefold())
+            if path.is_dir() and re.search(r"\d+\s*件$", path.name)
+        )
+    return customer_dirs
+
+
 def _material_root(source: Path, work: Path, app_root: Path, *, expand_order_downloads: bool = False) -> tuple[Path, str]:
     source = source.resolve()
     if source.is_file():
@@ -220,21 +237,18 @@ def _order_download_customer_label(source: Path) -> str:
     """Read customer names from validated order folders under an order batch root."""
     if not source.is_dir():
         return ""
+    if re.search(r"\d+\s*件$", source.name):
+        customer = re.sub(r"_?\d+\s*件$", "", source.name).rstrip(" _-")
+        if customer and re.fullmatch(r"item-\d+", source.parent.name, re.IGNORECASE):
+            return customer
     labels: list[str] = []
     seen: set[str] = set()
-    item_dirs = sorted(
-        (path for path in source.iterdir() if path.is_dir() and re.fullmatch(r"item-\d+", path.name, re.IGNORECASE)),
-        key=lambda path: path.name.casefold(),
-    )
-    for item_dir in item_dirs:
-        for customer_dir in sorted(item_dir.iterdir(), key=lambda path: path.name.casefold()):
-            if not customer_dir.is_dir() or not re.search(r"\d+\s*件$", customer_dir.name):
-                continue
-            customer = re.sub(r"_?\d+\s*件$", "", customer_dir.name).rstrip(" _-")
-            key = customer.casefold()
-            if customer and key not in seen:
-                labels.append(customer)
-                seen.add(key)
+    for customer_dir in _order_download_customer_dirs(source):
+        customer = re.sub(r"_?\d+\s*件$", "", customer_dir.name).rstrip(" _-")
+        key = customer.casefold()
+        if customer and key not in seen:
+            labels.append(customer)
+            seen.add(key)
     return "、".join(labels)
 
 
@@ -1942,12 +1956,12 @@ def _unique_output(source: Path, label: str) -> Path:
     return output
 
 
-def _output_customer_label(label: str, qualified_count: int, total_count: int) -> str:
+def _output_customer_label(label: str, qualified_count: int, total_count: int, *, count_separator: str = "") -> str:
     """Add the qualified/total project counts while preserving the customer name."""
     customer = re.sub(r"\d+\s*件$", "", label).rstrip(" _-")
     if not customer:
         customer = label.rstrip(" _-")
-    return f"{customer}{qualified_count}件（共{total_count}件）"
+    return f"{customer}{count_separator}{qualified_count}件（共{total_count}件）"
 
 
 def _relative_material_path(root: Path, value: Any) -> Path | None:
@@ -2056,12 +2070,20 @@ def _copy_qualified_materials(
     source_root: Path,
     output_root: Path,
     plan: tuple[list[Path], set[str], set[str], int, int],
+    *,
+    strip_prefix: Path | None = None,
 ) -> list[str]:
     """Copy only the files selected by a validated MATCH-only project plan."""
     copy_dirs, matched_files, excluded_files, _qualified_count, _total_count = plan
 
     output_root.mkdir(parents=True, exist_ok=False)
     copied: set[str] = set()
+
+    def output_relative(relative: Path) -> Path:
+        if strip_prefix is not None and relative.is_relative_to(strip_prefix):
+            return relative.relative_to(strip_prefix)
+        return relative
+
     for relative_dir in copy_dirs:
         source_dir = (source_root / relative_dir).resolve()
         try:
@@ -2084,7 +2106,7 @@ def _copy_qualified_materials(
                         copied.add(relative)
             return ignored
 
-        destination_dir = output_root / relative_dir
+        destination_dir = output_root / output_relative(relative_dir)
         destination_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(source_dir, destination_dir, dirs_exist_ok=True, ignore=ignore_excluded)
 
@@ -2099,7 +2121,7 @@ def _copy_qualified_materials(
             continue
         if not source_file.is_file():
             continue
-        destination_file = output_root / relative
+        destination_file = output_root / output_relative(relative)
         destination_file.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_file, destination_file)
         copied.add(relative.as_posix())
@@ -2326,15 +2348,24 @@ def run(
         total_project_count = source_manual_count
         qualified_count = source_manual_count
 
-    output_label = _output_customer_label(label, qualified_count, total_project_count)
-    customer_label = re.sub(r"\d+\s*件$", "", label).rstrip(" _-") or label.rstrip(" _-")
-    clipboard_customer_label = customer_label
-    if expand_order_downloads:
-        order_customer_label = _order_download_customer_label(material_root)
-        if order_customer_label:
-            clipboard_customer_label = order_customer_label
+    order_customer_dirs = _order_download_customer_dirs(material_root) if expand_order_downloads else []
+    flatten_order_prefix = (
+        order_customer_dirs[0].relative_to(material_root)
+        if len(order_customer_dirs) == 1
+        else None
+    )
+    order_customer_label = _order_download_customer_label(material_root) if expand_order_downloads else ""
+    output_source_label = order_customer_label or label
+    output_label = _output_customer_label(
+        output_source_label,
+        qualified_count,
+        total_project_count,
+        count_separator="_" if expand_order_downloads else "",
+    )
+    customer_label = re.sub(r"\d+\s*件$", "", output_source_label).rstrip(" _-") or output_source_label.rstrip(" _-")
+    clipboard_customer_label = order_customer_label or customer_label
     recovered_cover_transactions = _recover_processed_outputs(
-        source_path, label, customer_label, total_project_count,
+        source_path, output_source_label, customer_label, total_project_count,
     )
     planned_output = _unique_output(source_path, output_label) if apply else None
     if planned_output is not None:
@@ -2370,7 +2401,14 @@ def run(
         output = planned_output
         assert output is not None
         if output_copy_plan is not None:
-            _copy_qualified_materials(material_root, output, output_copy_plan)
+            _copy_qualified_materials(
+                material_root,
+                output,
+                output_copy_plan,
+                strip_prefix=flatten_order_prefix,
+            )
+        elif flatten_order_prefix is not None:
+            shutil.copytree(material_root / flatten_order_prefix, output)
         else:
             shutil.copytree(material_root, output)
         processing_root = output
