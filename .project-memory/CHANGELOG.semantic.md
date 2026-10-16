@@ -1,5 +1,12 @@
 # 语义变更记录
 
+## 2026-10-16 — 修复统一预览报告的 options 类型错误
+
+状态：Implemented（对截图对应的已保存预览 JSON 做隔离回放，修改前复现、修改后成功；未重跑全文档 OCR/Word 批次）。
+
+- `manual_report.options` 在统一工作流中是步骤名称列表；图片 OCR 公司清除的 HTML 报告渲染器曾将其当作字典读取 `rewrite_company_text`，导致 `AttributeError: 'list' object has no attribute 'get'`。现根据列表是否包含 `manual_company_text` 判断是否选择，并兼容旧字典结构。
+- 截图对应的 `combined_document_preview.json` 回放直接复现错误于 `scripts/combined_document_workflow.py` 的 `_company_text_rewrite_html`，修正后完整生成预览报告；回放只读取已生成报告，未修改源材料或执行 OCR/Word。
+
 ## 2026-10-16 — 启动脚本字符串解析修复
 
 状态：Implemented（提示字符串已改为单引号；当前环境未能启动 PowerShell，解析器复验受阻）。

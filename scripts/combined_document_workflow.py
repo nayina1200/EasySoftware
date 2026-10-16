@@ -1449,7 +1449,13 @@ def _materialize_company_text_comparisons(report: dict[str, Any], manual_report:
 
 def _company_text_rewrite_html(manual_report: dict[str, Any], applied: bool) -> str:
     projects = [item for item in manual_report.get("projects", []) if isinstance(item, dict)]
-    selected = bool((manual_report.get("options") or {}).get("rewrite_company_text"))
+    options = manual_report.get("options")
+    if isinstance(options, dict):
+        selected = bool(options.get("rewrite_company_text"))
+    elif isinstance(options, (list, tuple, set)):
+        selected = "manual_company_text" in options
+    else:
+        selected = False
     if not selected:
         return "<section><h2>图片 OCR 公司名称清除</h2><p>本次未选择此处理步骤。</p></section>"
     if not applied:
