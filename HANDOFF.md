@@ -4,6 +4,7 @@
 
 - 2026-10-16 订单反馈：正式执行时剪贴板不匹配清单的标题现在带输入客户名，例如“商务10.10此批订单不匹配如下：”；预览仍不写剪贴板。另查阅“汽车配件表面喷涂缺陷视觉检测系统说明.docx”：原稿没有 `easysoftware`，处理后它是 `word/document.xml` 开头的普通正文段落，不是 Word 页眉/水印对象。当前处理脚本没有主动写入该字样的规则，具体由何种外部编辑/环境引入无法仅凭文件确认；用户反馈目录按只读样本保护。
 - 2026-10-16 修正订单批次剪贴板标题误用 `订单批量_时间戳_编号` 的问题：现在从 `item-xx` 下客户归档目录取客户名；多个客户会列在同一标题中。另对单客户订单批次，将输出名设为“客户名_匹配件数（共总件数）_已处理_时间戳”，并从输出中移除 `item-xx\客户归档目录` 两层下载包装；客户材料内部项目目录保留。多客户批次仍保留各客户隔离目录以避免同名文件互相覆盖。本次未运行测试。
+- 2026-10-16 新增根目录入口 `启动订单下载专属页.cmd`，双击后直接运行 `scripts/order_material_downloader_gui.ps1`，不经过材料处理主页面；README 已同步说明。本次仅静态检查启动命令和文件路径，未启动 GUI 或连接订单系统。
 - 登录整理与字体对齐已并入本次候选版更新。规则与状态以 [登录模块契约](.project-memory/contracts/login-module.schema.json) 为准；先读 [结构整理证据](.project-memory/evidence/login-module-20261016.md) 和 [字体/速度补充证据](.project-memory/evidence/login-font-20261016.md)。已有小节保留结构，说明文字可局部对齐正文；存疑不新增登录标题。旧主窗口需重启，已有保存勾选不自动加入新项。
 - 本轮已运行完整自动化回归和独立副本 Word/PDF 样例验收；具体范围、通过/跳过数及逐份耗时统一见上述补充证据。真实订单下载、外部模型和所有功能组合的完整订单批次仍未重新验收，不能用本轮登录样例替代。
 - 唯一继续修改和运行的版本是本目录 `EasySoftware_候选_审查版_20260928`。多个对话累积的 34 个文件改动已在提交 `f3622a0` 中统一提交，并推送到 `origin/release/jev-shadow-20260928`；该次推送后本地与远端一致。
@@ -30,7 +31,7 @@
 ### 目标与入口
 
 - 这是候选审查主流程之前的独立下载助手：用户先在专用 Chrome 窗口人工登录，再由助手通过本机 CDP 调试端口 `127.0.0.1:9223` 操作已登录会话，不保存或自动填写账号密码。端口 9222 已被桌面端 ChatGPT 进程占用，禁止让订单助手复用。
-- 候选版主界面的“订单资料下载”入口启动 [scripts/order_material_downloader_gui.ps1](scripts/order_material_downloader_gui.ps1)；入口接线位于 [启动EasySoftware.ps1](启动EasySoftware.ps1)。下载 ZIP 校验、Windows 安全命名和归档位于 [scripts/order_download_core.py](scripts/order_download_core.py)，对应测试为 [tests/test_order_download_core.py](tests/test_order_download_core.py)。
+- 候选版主界面的“订单资料下载”入口启动 [scripts/order_material_downloader_gui.ps1](scripts/order_material_downloader_gui.ps1)；也可双击根目录 `启动订单下载专属页.cmd` 直接进入该页。主界面入口接线位于 [启动EasySoftware.ps1](启动EasySoftware.ps1)。下载 ZIP 校验、Windows 安全命名和归档位于 [scripts/order_download_core.py](scripts/order_download_core.py)，对应测试为 [tests/test_order_download_core.py](tests/test_order_download_core.py)。
 - 用户可设置下载目录，选择按“批次号”或“订单名/编号”搜索。批量清单最多 50 行，一行一个订单，整批共用所选搜索方式；不轮询，用户在订单批次已准备好后手动启动。
 - 每个查询项必须对应唯一结果才会触发一次“打包”。ZIP 校验并归档到本次独立运行目录下的订单子目录，名称为“客户名_文件数件”，ZIP 文件名与目录同名。文件数按 ZIP 内非目录成员计数，嵌套文件也计数；已存在同名文件时拒绝覆盖。
 - 勾选“下载校验后自动开始候选审查处理”时，本次成功下载项合并为一个输入目录交给现有候选审查流程；是否跳过预览由主界面“一键处理”的已保存状态决定。未勾选时保留“交给候选审查”手动入口。下载自动开始默认未勾选。下载验证阶段只会读取 ZIP 并归档；后续候选审查不要误认为已经完成。
