@@ -146,6 +146,99 @@ def _call_adapter(adapter: Callable[..., Any] | None, *args: Any) -> Any:
     return adapter(*args[:count])
 
 
+def _invoke_date_rewriter(
+    adapter: Any,
+    path: Path,
+    target_year: int,
+    *,
+    rewrite_dates: bool,
+    remove_company_text: bool,
+) -> dict[str, Any]:
+    method = getattr(adapter, "rewrite_with_metadata", None)
+    if not callable(method):
+        if not rewrite_dates:
+            return {
+                "status": "UNSUPPORTED_MODE", "changed": False,
+                "reason": "当前图像处理器不支持公司 OCR 清除模式",
+                "company_text_rewrite": {
+                    "status": "UNSUPPORTED_MODE" if remove_company_text else "NOT_SELECTED",
+                    "selected": remove_company_text, "changes": [],
+                    "reason": "当前图像处理器不支持公司 OCR 清除模式" if remove_company_text else "",
+                },
+            }
+        result = _call_adapter(adapter, path, target_year)
+        result = result if isinstance(result, dict) else {}
+        if remove_company_text:
+            result["company_text_rewrite"] = {
+                "status": "UNSUPPORTED_MODE", "selected": True, "changes": [],
+                "reason": "当前图像处理器不支持公司 OCR 清除模式",
+            }
+        return result
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    names = {item.name for item in parameters}
+    has_kwargs = any(item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters)
+    kwargs: dict[str, bool] = {}
+    if "rewrite_dates" in names or has_kwargs:
+        kwargs["rewrite_dates"] = rewrite_dates
+    elif not rewrite_dates:
+        return {
+            "status": "UNSUPPORTED_MODE", "changed": False,
+            "reason": "当前图像处理器不支持独立公司 OCR 清除模式",
+        }
+    if "remove_company_text" in names or has_kwargs:
+        kwargs["remove_company_text"] = remove_company_text
+    elif remove_company_text:
+        if not rewrite_dates:
+            return {
+                "status": "UNSUPPORTED_MODE", "changed": False,
+                "reason": "当前图像处理器不支持公司 OCR 清除模式",
+                "company_text_rewrite": {
+                    "status": "UNSUPPORTED_MODE", "selected": True, "changes": [],
+                    "reason": "当前图像处理器不支持公司 OCR 清除模式",
+                },
+            }
+        result = method(path, target_year, **kwargs)
+        if not isinstance(result, dict):
+            result = {}
+        result["company_text_rewrite"] = {
+            "status": "UNSUPPORTED_MODE", "selected": True, "changes": [],
+            "reason": "当前图像处理器不支持公司 OCR 清除模式",
+        }
+        return result
+    result = method(path, target_year, **kwargs)
+    return result if isinstance(result, dict) else {}
+
+
+def _make_date_rewriter_batch(
+    adapter: Any,
+    factory: Callable[..., Any],
+    paths: list[Path],
+    target_year: int,
+    *,
+    rewrite_dates: bool,
+    remove_company_text: bool,
+):
+    try:
+        parameters = inspect.signature(factory).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    names = {item.name for item in parameters}
+    has_kwargs = any(item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters)
+    supports_modes = has_kwargs or {"rewrite_dates", "remove_company_text"}.issubset(names)
+    if supports_modes:
+        return factory(
+            paths, target_year,
+            rewrite_dates=rewrite_dates,
+            remove_company_text=remove_company_text,
+        )
+    if rewrite_dates and not remove_company_text:
+        return factory(paths, target_year)
+    return None
+
+
 class DefaultOcrAdapter:
     def __init__(self, script_dir: Path):
         self.script_dir = script_dir
@@ -466,21 +559,32 @@ class DefaultDateRewriter:
     def __call__(self, path: Path, target_year: int) -> dict[str, Any]:
         return self.rewrite_with_metadata(path, target_year)
 
-    def rewrite_with_metadata(self, path: Path, target_year: int) -> dict[str, Any]:
+    def rewrite_with_metadata(
+        self,
+        path: Path,
+        target_year: int,
+        rewrite_dates: bool = True,
+        remove_company_text: bool = False,
+    ) -> dict[str, Any]:
         if not self.available:
             return {"status": "UNAVAILABLE", "changed": False, "reason": self.reason, "effective_target_year": target_year, "trigger_date": None, "rollback_reason": None}
         perf_trace = os.getenv("EASYSOFTWARE_PERF_TRACE") == "1"
         started = time.perf_counter() if perf_trace else None
         self._performance["subprocess_calls"] = self._performance.get("subprocess_calls", 0) + 1
         call_started = time.perf_counter()
+        arguments = [str(self.python), str(self.bridge), str(self.tool_root), str(path), str(target_year)]
+        if not rewrite_dates:
+            arguments.append("--no-date-rewrite")
+        if remove_company_text:
+            arguments.append("--remove-company-text")
         try:
             completed = subprocess.run(
-                [str(self.python), str(self.bridge), str(self.tool_root), str(path), str(target_year)],
+                arguments,
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=DATE_REWRITER_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
             self._performance["wall_seconds"] = self._performance.get("wall_seconds", 0.0) + time.perf_counter() - call_started
-            return {"status": "FAILED_TIMEOUT", "changed": False, "reason": "该 DOCX 日期 OCR 超过 900 秒，已终止子进程"}
+            return {"status": "FAILED_TIMEOUT", "changed": False, "reason": "该 DOCX 图片 OCR 超过 900 秒，已终止子进程"}
         lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
         try:
             result = json.loads(lines[-1]) if lines else {}
@@ -503,8 +607,14 @@ class DefaultDateRewriter:
         self._performance["wall_seconds"] = self._performance.get("wall_seconds", 0.0) + time.perf_counter() - call_started
         return result
 
-    def iter_rewrite_many_with_metadata(self, paths: list[Path], target_year: int):
-        """Stream one DOCX at a time through one child with an independent 900s deadline."""
+    def iter_rewrite_many_with_metadata(
+        self,
+        paths: list[Path],
+        target_year: int,
+        rewrite_dates: bool = True,
+        remove_company_text: bool = False,
+    ):
+        """Stream image OCR operations through one child with an independent DOCX deadline."""
         if not self.available:
             for _path in paths:
                 yield {"status": "UNAVAILABLE", "changed": False, "reason": self.reason,
@@ -553,7 +663,11 @@ class DefaultDateRewriter:
 
             for index, path in enumerate(paths):
                 try:
-                    process.stdin.write(json.dumps({"op": "rewrite", "path": str(path)}) + "\n")
+                    process.stdin.write(json.dumps({
+                        "op": "rewrite", "path": str(path),
+                        "rewrite_dates": rewrite_dates,
+                        "remove_company_text": remove_company_text,
+                    }) + "\n")
                     process.stdin.flush()
                     process_deadline = time.perf_counter() + DATE_REWRITER_TIMEOUT_SECONDS
                     response = responses.get(timeout=max(0.01, process_deadline - time.perf_counter()))
@@ -567,7 +681,7 @@ class DefaultDateRewriter:
                     self._close_date_process_pipes(process, reader_thread)
                     process = None
                     record_batch_wall()
-                    retry = self.rewrite_with_metadata(path, target_year)
+                    retry = self.rewrite_with_metadata(path, target_year, rewrite_dates, remove_company_text)
                     if str(retry.get("status", "")).upper() not in {
                         "CHANGED", "UNCHANGED", "CHANGED_WITH_AUTO_SKIPS", "AUTO_SKIPPED_UNCERTAIN_IMAGES",
                     }:
@@ -575,14 +689,14 @@ class DefaultDateRewriter:
                     retry.setdefault("performance", {})["batch_timeout_fallback"] = True
                     yield retry
                     for remaining in paths[index + 1:]:
-                        yield self.rewrite_with_metadata(remaining, target_year)
+                        yield self.rewrite_with_metadata(remaining, target_year, rewrite_dates, remove_company_text)
                     return
                 except Exception as exc:
                     self._stop_date_process(process)
                     self._close_date_process_pipes(process, reader_thread)
                     process = None
                     record_batch_wall()
-                    retry = self.rewrite_with_metadata(path, target_year)
+                    retry = self.rewrite_with_metadata(path, target_year, rewrite_dates, remove_company_text)
                     if str(retry.get("status", "")).upper() not in {
                         "CHANGED", "UNCHANGED", "CHANGED_WITH_AUTO_SKIPS", "AUTO_SKIPPED_UNCERTAIN_IMAGES",
                     }:
@@ -590,7 +704,7 @@ class DefaultDateRewriter:
                     retry.setdefault("performance", {})["batch_interruption_fallback"] = True
                     yield retry
                     for remaining in paths[index + 1:]:
-                        yield self.rewrite_with_metadata(remaining, target_year)
+                        yield self.rewrite_with_metadata(remaining, target_year, rewrite_dates, remove_company_text)
                     return
                 yield result
 
@@ -656,6 +770,15 @@ def _is_ai_hollow_rectangle(width: float, height: float) -> bool:
     return width >= 5_000_000 and height <= 220_000 and width / height >= 24
 
 
+def _vml_dimension_emu(value: str) -> float | None:
+    match = re.fullmatch(r"\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*(pt|px|in|cm|mm)?\s*", value, re.IGNORECASE)
+    if not match:
+        return None
+    factors = {"pt": 12_700, "px": 9_525, "in": 914_400, "cm": 360_000, "mm": 36_000}
+    unit = (match.group(2) or "pt").casefold()
+    return float(match.group(1)) * factors[unit]
+
+
 def find_ai_hollow_lines(path: str | Path) -> list[dict[str, Any]]:
     """Find long, thin outlined rectangles that resemble generated AI divider artifacts."""
     findings: list[dict[str, Any]] = []
@@ -663,6 +786,8 @@ def find_ai_hollow_lines(path: str | Path) -> list[dict[str, Any]]:
         "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
         "wps": "http://schemas.microsoft.com/office/word/2010/wordprocessingShape",
         "w": WORD_NS,
+        "v": "urn:schemas-microsoft-com:vml",
+        "o": "urn:schemas-microsoft-com:office:office",
     }
     with zipfile.ZipFile(path) as archive:
         for part_name in archive.namelist():
@@ -704,6 +829,32 @@ def find_ai_hollow_lines(path: str | Path) -> list[dict[str, Any]]:
                     paragraph = paragraph.getparent()
                 context = "".join(paragraph.xpath(".//w:t/text()", namespaces=namespaces)).strip() if paragraph is not None else ""
                 findings.append({"part": part_name, "width_emu": int(width), "height_emu": int(height), "context": context})
+            for shape in document.xpath(".//v:rect", namespaces=namespaces):
+                # Word stores its built-in horizontal-rule tool as a VML rectangle
+                # marked with o:hr; these older shapes are not wps:sp elements.
+                if shape.get("{%s}hr" % namespaces["o"], "").casefold() not in {"t", "true", "1"}:
+                    continue
+                style = shape.get("style", "")
+                dimensions = {
+                    key.casefold(): _vml_dimension_emu(value)
+                    for key, value in re.findall(
+                        r"(?:^|;)\s*(width|height)\s*:\s*([^;]+)", style, re.IGNORECASE
+                    )
+                }
+                width, height = dimensions.get("width"), dimensions.get("height")
+                if width is None or height is None or not _is_ai_hollow_rectangle(width, height):
+                    continue
+                paragraph = shape
+                while paragraph is not None and paragraph.tag != "{%s}p" % namespaces["w"]:
+                    paragraph = paragraph.getparent()
+                context = "".join(paragraph.xpath(".//w:t/text()", namespaces=namespaces)).strip() if paragraph is not None else ""
+                findings.append({
+                    "part": part_name,
+                    "width_emu": int(width),
+                    "height_emu": int(height),
+                    "context": context,
+                    "format": "vml_horizontal_rule",
+                })
     return findings
 
 
@@ -1008,6 +1159,7 @@ def run_manual_content_stage(
     check_image_vision: bool = True,
     rewrite_body_years: bool = True,
     rewrite_image_dates: bool = True,
+    rewrite_company_text: bool = False,
     check_ai_hollow_lines: bool = False,
 ) -> dict[str, Any]:
     """Preflight every manual, then copy and mutate only after batch gating completes."""
@@ -1165,6 +1317,11 @@ def run_manual_content_stage(
                 "visual_selected_indexes": [],
                 "blocked": False,
                 "status": hold_status,
+                "company_text_rewrite": {
+                    "status": "SKIPPED_QUALIFICATION_HOLD" if rewrite_company_text else "NOT_SELECTED",
+                    "selected": rewrite_company_text,
+                    "changes": [],
+                },
             })
             _progress(progress, "跳过标题正文资格未通过项目", document_index, manual.name)
             continue
@@ -1273,7 +1430,9 @@ def run_manual_content_stage(
     if apply:
         try:
             batch_iterator_factory = getattr(date_adapter, "iter_rewrite_many_with_metadata", None)
-            if callable(batch_iterator_factory) and rewrite_image_dates and not batch_fused:
+            batch_rewrite_dates = rewrite_image_dates and not batch_fused
+            batch_remove_company = rewrite_company_text
+            if callable(batch_iterator_factory) and (batch_rewrite_dates or batch_remove_company):
                 batch_projects = [
                     project for project in projects
                     if not project.get("changes_held") and not project["blocked"]
@@ -1295,7 +1454,11 @@ def run_manual_content_stage(
                     shutil.copy2(destination, stage_path)
                     batch_stages.append(stage_path)
                 if batch_stages:
-                    batch_iterator = iter(batch_iterator_factory(batch_stages, target_year))
+                    batch_iterator = _make_date_rewriter_batch(
+                        date_adapter, batch_iterator_factory, batch_stages, target_year,
+                        rewrite_dates=batch_rewrite_dates,
+                        remove_company_text=batch_remove_company,
+                    )
 
             for document_index, project in enumerate(projects, 1):
                 source = Path(project["source"])
@@ -1306,6 +1469,11 @@ def run_manual_content_stage(
                     hold_status = "SKIPPED_TOPIC_MISMATCH" if project.get("qualification_action") == "SKIP_MISMATCH" else "HELD_QUALIFICATION_NOT_EVALUATED"
                     project["status"] = hold_status
                     project["date_rewrite"] = {"status": hold_status, "changed": False}
+                    project["company_text_rewrite"] = {
+                        "status": "SKIPPED_QUALIFICATION_HOLD" if rewrite_company_text else "NOT_SELECTED",
+                        "selected": rewrite_company_text,
+                        "changes": [],
+                    }
                     project["year_changes"] = []
                     project["year_update_skipped_reason"] = project.get("body_relevance", {}).get("reason") or "项目资格状态要求暂停修改"
                     _progress(progress, "跳过标题正文资格未通过项目", document_index, source.name)
@@ -1323,8 +1491,18 @@ def run_manual_content_stage(
                     year_update_skipped_reason = "项目因截图相关性门控而跳过日期处理，无法确定与截图一致的目标年份"
                 elif not rewrite_image_dates:
                     project["date_rewrite"] = {"status": "SKIPPED_NOT_SELECTED", "changed": False}
-                else:
-                    metadata_rewriter = getattr(date_adapter, "rewrite_with_metadata", None)
+                date_rewrite_enabled = bool(rewrite_image_dates and not batch_fused and not project["blocked"])
+                company_rewrite_enabled = bool(rewrite_company_text and not project["blocked"])
+                if not rewrite_company_text:
+                    project["company_text_rewrite"] = {
+                        "status": "NOT_SELECTED", "selected": False, "changes": [],
+                    }
+                elif project["blocked"]:
+                    project["company_text_rewrite"] = {
+                        "status": "SKIPPED_PROJECT_BLOCKED", "selected": True, "changes": [],
+                        "reason": "项目因截图相关性门控而跳过图片修改",
+                    }
+                if date_rewrite_enabled or company_rewrite_enabled:
                     stage_path = batch_stage_by_source.get(str(source))
                     if stage_path is None:
                         stage_fd, stage_name = tempfile.mkstemp(
@@ -1339,7 +1517,11 @@ def run_manual_content_stage(
                         if batch_iterator is not None and str(source) in batch_stage_by_source:
                             result = next(batch_iterator)
                         else:
-                            result = metadata_rewriter(stage_path, target_year) if callable(metadata_rewriter) else _call_adapter(date_adapter, stage_path, target_year)
+                            result = _invoke_date_rewriter(
+                                date_adapter, stage_path, target_year,
+                                rewrite_dates=date_rewrite_enabled,
+                                remove_company_text=company_rewrite_enabled,
+                            )
                     except StopIteration:
                         result = {"status": "FAILED_BATCH_INTERRUPTED", "changed": False,
                                   "reason": "批处理未返回该 DOCX 的结果"}
@@ -1361,13 +1543,20 @@ def run_manual_content_stage(
                         stage_path.unlink(missing_ok=True)
                         stage_path.with_suffix(stage_path.suffix + ".date-year.tmp").unlink(missing_ok=True)
                         batch_stage_by_source.pop(str(source), None)
-                    project["date_rewrite"] = result
+                    if date_rewrite_enabled:
+                        project["date_rewrite"] = result
+                    company_result = result.get("company_text_rewrite")
+                    if rewrite_company_text and company_rewrite_enabled:
+                        project["company_text_rewrite"] = company_result if isinstance(company_result, dict) else {
+                            "status": "FAILED_INVALID_RESULT", "selected": True, "changes": [],
+                            "reason": "图片处理器没有返回公司 OCR 处理结果",
+                        }
                     project["effective_target_year"] = int(result.get("effective_target_year", target_year))
                     project["trigger_date"] = result.get("trigger_date")
                     project["rollback_reason"] = result.get("rollback_reason")
                     if date_status == "UNAVAILABLE":
                         project["status"] = "DATE_REWRITER_UNAVAILABLE"
-                    if date_status not in successful_date_statuses:
+                    if date_rewrite_enabled and date_status not in successful_date_statuses:
                         detail = result.get("reason") or result.get("error") or date_status
                         year_update_skipped_reason = f"截图日期处理未成功（{detail}），跳过正文年份改写以避免与截图不一致"
                 effective_target_year = int(project.get("effective_target_year", target_year))
@@ -1396,6 +1585,15 @@ def run_manual_content_stage(
         project.setdefault("effective_target_year", target_year)
         project.setdefault("trigger_date", None)
         project.setdefault("rollback_reason", None)
+        if not rewrite_company_text:
+            project.setdefault("company_text_rewrite", {
+                "status": "NOT_SELECTED", "selected": False, "changes": [],
+            })
+        elif not apply:
+            project.setdefault("company_text_rewrite", {
+                "status": "PREVIEW_NOT_SCANNED", "selected": True, "changes": [],
+                "reason": "预览阶段不扫描全部图片；执行时才会进行 OCR 清除并生成前后对比",
+            })
         if not apply and rewrite_image_dates:
             project.setdefault("date_rewrite", {
                 "status": "PREVIEW_NOT_SCANNED",
@@ -1440,6 +1638,7 @@ def run_manual_content_stage(
             "check_image_vision": check_image_vision,
             "rewrite_body_years": rewrite_body_years,
             "rewrite_image_dates": rewrite_image_dates,
+            "rewrite_company_text": rewrite_company_text,
             "check_ai_hollow_lines": check_ai_hollow_lines,
         },
         "disqualified_project_count": len(disqualified),

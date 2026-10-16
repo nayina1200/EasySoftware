@@ -8,6 +8,7 @@
   "prompt_version": "title-body-jev-domain-fit-score-v3",
   "policy_version": "title-body-jev-threshold-policy-v1",
   "score_threshold": 70,
+  "one_click_processing": false,
   "threshold_calibrated": false,
   "coverage_policy": {
     "full_body_required": true,

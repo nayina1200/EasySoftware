@@ -1076,8 +1076,19 @@ function Add-Cover($Document, [string]$Title) {
         try { $paragraph.Range.Style = $Document.Styles.Item($wdStyleNormal) } catch {}
         try { $paragraph.Range.ParagraphFormat.OutlineLevel = $wdOutlineLevelBodyText } catch {}
     }
-    $Document.Sections.Item(1).PageSetup.VerticalAlignment = $wdVerticalCenter
-    if ($Document.Sections.Count -gt 1) { $Document.Sections.Item(2).PageSetup.VerticalAlignment = $wdVerticalTop }
+    Set-CoverVerticalAlignment $Document 1
+}
+
+function Set-CoverVerticalAlignment($Document, [int]$CoverSection) {
+    $sectionCount = [int]$Document.Sections.Count
+    # Default every section to top alignment. Only a confirmed first section
+    # separated from the body may use vertical centering for its cover page.
+    for ($sectionIndex = 1; $sectionIndex -le $sectionCount; $sectionIndex++) {
+        $Document.Sections.Item($sectionIndex).PageSetup.VerticalAlignment = $wdVerticalTop
+    }
+    if ($sectionCount -gt 1 -and $CoverSection -eq 1) {
+        $Document.Sections.Item(1).PageSetup.VerticalAlignment = $wdVerticalCenter
+    }
 }
 
 function Remove-DuplicateCoverBlocks($Document, [string]$Title) {
@@ -1408,8 +1419,13 @@ function Set-CoverTypography($Document, [string]$Title) {
     }
     try {
         $coverSection = [int]$titleRange.Information($wdActiveEndSectionNumber)
-        $Document.Sections.Item($coverSection).PageSetup.VerticalAlignment = $wdVerticalCenter
-    } catch {}
+        Set-CoverVerticalAlignment $Document $coverSection
+    } catch {
+        # A failed or missing section boundary must not leave body pages centered.
+        for ($sectionIndex = 1; $sectionIndex -le $Document.Sections.Count; $sectionIndex++) {
+            $Document.Sections.Item($sectionIndex).PageSetup.VerticalAlignment = $wdVerticalTop
+        }
+    }
     foreach ($paragraph in $titleRange.Paragraphs) {
         try { $paragraph.Range.ListFormat.RemoveNumbers($wdNumberAllNumbers) } catch {}
         try { $paragraph.Range.Style = $Document.Styles.Item($wdStyleNormal) } catch {}

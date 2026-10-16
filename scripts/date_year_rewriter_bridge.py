@@ -37,6 +37,7 @@ CHINESE_MONTHS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "�
                   "十": 10, "十一": 11, "十二": 12}
 SMALL_TEXT_HEIGHT = 24
 OCR_DIGIT_CONFUSIONS = str.maketrans({"O": "0", "o": "0", "Q": "0", "D": "0", "I": "1", "l": "1", "|": "1", "S": "5", "B": "8", "Z": "2"})
+COMPANY_TRAILING_PUNCTUATION = " \t,，.。;；:：!！?？、)]}）】》」』”’\"'"
 
 
 def date_year_spans(
@@ -128,6 +129,45 @@ def _ocr_rows(result) -> list[tuple[str, tuple[int, int, int, int], float]]:
             continue
         rows.append((str(value), rect, score))
     return rows
+
+
+def company_text_fields(result) -> list[tuple[str, tuple[int, int, int, int], float]]:
+    """Return OCR boxes whose complete text line ends with the company suffix."""
+    return [
+        (text, rect, score)
+        for text, rect, score in _ocr_rows(result)
+        if text.strip().rstrip(COMPANY_TRAILING_PUNCTUATION).endswith("公司")
+    ]
+
+
+def remove_company_text_fields(module, source_bgr, fields):
+    """Inpaint only OCR boxes for company-name lines, preserving the source image."""
+    image_height, image_width = source_bgr.shape[:2]
+    mask = module.np.zeros((image_height, image_width), dtype=module.np.uint8)
+    removed = []
+    for text, rect, score in fields:
+        x1, y1, x2, y2 = map(int, rect)
+        line_height = max(1, y2 - y1)
+        padding = max(1, min(4, round(line_height * 0.08)))
+        x1, y1 = max(0, x1 - padding), max(0, y1 - padding)
+        x2, y2 = min(image_width, x2 + padding), min(image_height, y2 + padding)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        module.cv2.rectangle(mask, (x1, y1), (x2 - 1, y2 - 1), 255, thickness=-1)
+        removed.append({
+            "ocr_text": text,
+            "confidence": round(float(score), 4),
+            "bounding_box": [int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])],
+        })
+    if not removed:
+        return source_bgr.copy(), []
+    radius = max(3, min(12, round(float(module.np.median([
+        max(1, int(rect[3]) - int(rect[1])) for _text, rect, _score in fields
+    ])) * 0.45)))
+    output = module.cv2.inpaint(source_bgr, mask, radius, module.cv2.INPAINT_TELEA)
+    if module.np.array_equal(source_bgr, output):
+        return source_bgr.copy(), []
+    return output, removed
 
 
 def _box_overlap_ratio(left: tuple[int, int, int, int], right: tuple[int, int, int, int]) -> float:
@@ -587,7 +627,15 @@ def _select_effective_target_year(
     return target_year, None, None
 
 
-def rewrite_docx(tool_root: Path, docx: Path, target_year: int, runtime=None) -> dict:
+def rewrite_docx(
+    tool_root: Path,
+    docx: Path,
+    target_year: int,
+    runtime=None,
+    *,
+    rewrite_dates: bool = True,
+    remove_company_text: bool = False,
+) -> dict:
     # Scan once against 2026 so both old dates and 2026 candidates are retained.
     # The final target is chosen only after all embedded images have been scanned.
     perf_trace = os.getenv("EASYSOFTWARE_PERF_TRACE") == "1"
@@ -626,9 +674,12 @@ def rewrite_docx(tool_root: Path, docx: Path, target_year: int, runtime=None) ->
     temporary.unlink(missing_ok=True)
     changed_images = 0
     detections_found = 0
+    company_changed_images = 0
+    company_candidate_count = 0
     adaptive_images = 0
     notes: list[str] = []
     changes: list[dict] = []
+    company_changes: list[dict] = []
     auto_skipped_images: list[dict[str, str]] = []
     scanned_images: list[dict] = []
     observed_2026_dates: list[tuple[str, date]] = []
@@ -653,9 +704,14 @@ def rewrite_docx(tool_root: Path, docx: Path, target_year: int, runtime=None) ->
                     if performance is not None:
                         performance["primary_image_ocr_calls"] += 1
                     quick_result = engine.ocr(bgr)
-                fields, adaptive = adaptive_ocr_date_fields(
-                    module, engine, bgr, quick_result, 2026, include_target_year=True
-                )
+                if rewrite_dates:
+                    fields, adaptive = adaptive_ocr_date_fields(
+                        module, engine, bgr, quick_result, 2026, include_target_year=True
+                    )
+                else:
+                    fields, adaptive = [], {"used": False, "needs_skip": False}
+                company_fields = company_text_fields(quick_result) if remove_company_text else []
+                company_candidate_count += len(company_fields)
                 for field in fields:
                     projected_dates = _date_anchors_for_year_field(field[0], field[2], 2026)
                     projected_2026_dates.extend(projected_dates)
@@ -673,7 +729,8 @@ def rewrite_docx(tool_root: Path, docx: Path, target_year: int, runtime=None) ->
                             "reason": str(adaptive.get("reason", "未识别到可信日期，保留原图")),
                         })
                 scanned_images.append({
-                    "item": item, "suffix": suffix, "fields": fields, "adaptive": adaptive,
+                    "item": item, "suffix": suffix, "fields": fields,
+                    "company_fields": company_fields, "adaptive": adaptive,
                 })
             else:
                 target.writestr(item, data)
@@ -696,21 +753,29 @@ def rewrite_docx(tool_root: Path, docx: Path, target_year: int, runtime=None) ->
             # retain only OCR fields and metadata during the project-wide scan.
             data = source.read(item.filename)
             fields = scanned["fields"]
-            if fields:
+            company_fields = scanned["company_fields"]
+            if fields or company_fields:
                 detections_found += len(fields)
                 with module.Image.open(io.BytesIO(data)) as opened:
                     rgb = module.np.asarray(
                         module.ImageOps.exif_transpose(opened).convert("RGB"), dtype=module.np.uint8
                     )[:, :, :3]
                 bgr = module.cv2.cvtColor(rgb, module.cv2.COLOR_RGB2BGR)
-                output_bgr, image_notes, applied_fields = replace_year_fields(
-                    module, engine, bgr, fields, effective_target_year
-                )
+                output_bgr = bgr
+                image_notes, applied_fields = [], []
+                if fields:
+                    output_bgr, image_notes, applied_fields = replace_year_fields(
+                        module, engine, output_bgr, fields, effective_target_year
+                    )
+                removed_fields = []
+                if company_fields:
+                    output_bgr, removed_fields = remove_company_text_fields(module, output_bgr, company_fields)
                 output_rgb = module.cv2.cvtColor(output_bgr, module.cv2.COLOR_BGR2RGB)
                 if not module.np.array_equal(rgb, output_rgb):
                     data = encode_like_source(module, output_rgb, scanned["suffix"])
-                    changed_images += 1
-                    notes.extend(map(str, image_notes))
+                    if applied_fields:
+                        changed_images += 1
+                        notes.extend(map(str, image_notes))
                     changes.extend({
                         "media_path": item.filename,
                         "ocr_text": value,
@@ -719,6 +784,13 @@ def rewrite_docx(tool_root: Path, docx: Path, target_year: int, runtime=None) ->
                         "changed_image": True,
                         "recognition_mode": "adaptive_small_text" if scanned["adaptive"].get("used") else "original_ocr",
                     } for value, span in applied_fields)
+                    if removed_fields:
+                        company_changed_images += 1
+                        company_changes.extend({
+                            "media_path": item.filename,
+                            **field,
+                            "changed_image": True,
+                        } for field in removed_fields)
             target.writestr(item, data)
     os.replace(temporary, docx)
     if performance is not None:
@@ -745,6 +817,18 @@ def rewrite_docx(tool_root: Path, docx: Path, target_year: int, runtime=None) ->
         "rollback_reason": rollback_reason,
         "notes": notes,
         "changes": changes,
+        "company_text_rewrite": {
+            "status": (
+                "NOT_SELECTED" if not remove_company_text
+                else "CHANGED" if company_changes else "UNCHANGED"
+            ),
+            "selected": remove_company_text,
+            "scanned_image_count": len(scanned_images) if remove_company_text else 0,
+            "candidate_count": company_candidate_count,
+            "changed_image_count": company_changed_images,
+            "removed_text_count": len(company_changes),
+            "changes": company_changes,
+        },
     }
     if performance is not None:
         result["performance"] = performance
@@ -771,7 +855,11 @@ def rewrite_docx_stream(tool_root: Path, target_year: int) -> int:
             if not docx.is_file() or docx.suffix.lower() != ".docx":
                 raise ValueError("日期 OCR 批次仅接受已有 DOCX 路径")
             try:
-                result = rewrite_docx(tool_root, docx, target_year, runtime=runtime)
+                result = rewrite_docx(
+                    tool_root, docx, target_year, runtime=runtime,
+                    rewrite_dates=bool(request.get("rewrite_dates", True)),
+                    remove_company_text=bool(request.get("remove_company_text", False)),
+                )
             except Exception as exc:
                 docx.with_suffix(docx.suffix + ".date-year.tmp").unlink(missing_ok=True)
                 result = {"status": "FAILED", "changed": False, "error": str(exc)}
@@ -790,7 +878,12 @@ def main() -> int:
         tool_root = Path(sys.argv[1]).resolve()
         docx = Path(sys.argv[2]).resolve()
         target_year = int(sys.argv[3])
-        result = rewrite_docx(tool_root, docx, target_year)
+        flags = set(sys.argv[4:])
+        result = rewrite_docx(
+            tool_root, docx, target_year,
+            rewrite_dates="--no-date-rewrite" not in flags,
+            remove_company_text="--remove-company-text" in flags,
+        )
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except Exception as exc:

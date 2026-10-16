@@ -546,7 +546,9 @@ $script:workflowOptionMetadata = [ordered]@{
     match_txt = @{ Group = "匹配度检测"; Label = "TXT 名称、字段与主题检查"; Tip = "检查编码、字段、软件名称、主要功能及主题冲突。" }
     manual_body_years = @{ Group = "说明书内容处理"; Label = "检查/修正说明书正文年份"; Tip = "按既有规则处理高置信时效语境中的正文年份。" }
     manual_image_dates = @{ Group = "说明书内容处理"; Label = "检查/修正说明书图片日期"; Tip = "只更新早于目标年份的有效日期年份；自动运行 OCR 相关性预检。" }
+    manual_company_text = @{ Group = "说明书内容处理"; Label = "清除说明书图片中的公司名称（OCR）"; Tip = '扫描说明书内嵌图片，清除 OCR 识别行末以公司结尾的文字；仅修改输出副本，并在报告中提供原图与处理图对比。' }
     manual_ai_hollow_lines = @{ Group = "说明书页面整理"; Label = "检测空心线"; Tip = "检查 DOCX 中参考图所示的横向细长空心矩形；报告会单列说明书名称，并提示将该说明书发给其他人。只检测、不修改文档。" }
+    manual_login_module = @{ Group = "说明书页面整理"; Label = "整理登录模块"; Tip = "同时识别 Word 标题和普通文本标题；在第二个正文一级标题下新增登录页小节，保留原小节并顺延编号。无法可靠定位的文档报人工处理，自动导出配套 PDF。" }
     manual_cover = @{ Group = "说明书页面整理"; Label = "整理说明书封面"; Tip = "检查并整理封面及其与正文的分页边界。" }
     manual_header = @{ Group = "说明书页面整理"; Label = "整理说明书页眉"; Tip = "单独处理页眉内容，不自动补页码。" }
     manual_page_numbers = @{ Group = "说明书页面整理"; Label = "整理说明书页码"; Tip = "单独检查和补齐动态页码，不自动整理页眉。" }
@@ -557,8 +559,8 @@ $script:workflowOptionMetadata = [ordered]@{
 }
 $script:workflowOptionGroups = [ordered]@{
     "匹配度检测" = @("match_title_body", "match_software_name", "match_manual_ocr", "match_manual_vision", "match_code", "match_txt")
-    "说明书内容处理" = @("manual_body_years", "manual_image_dates")
-    "说明书页面整理" = @("manual_ai_hollow_lines", "manual_cover", "manual_header", "manual_page_numbers", "manual_pdf")
+    "说明书内容处理" = @("manual_body_years", "manual_image_dates", "manual_company_text")
+    "说明书页面整理" = @("manual_ai_hollow_lines", "manual_login_module", "manual_cover", "manual_header", "manual_page_numbers", "manual_pdf")
     "代码处理" = @("code_cleanup", "code_pdf")
     "TXT 处理" = @("txt_repair")
 }
@@ -576,7 +578,6 @@ if (-not [string]::IsNullOrWhiteSpace($launchDocumentStages)) {
     $script:documentStages = @($script:allWorkflowStages | Where-Object { $requestedStages -contains $_ })
 }
 if ($AutoStart) {
-    $oneClickProcessingCheck.Checked = $true
     if ($IncludeTopicMismatch) { $skipTopicMismatchCheck.Checked = $false }
 }
 
@@ -640,36 +641,76 @@ function Read-JevSettings {
     return [PSCustomObject]@{ Path = $configPath; Config = $config; Threshold = $threshold }
 }
 
-function Save-WorkflowSettings([decimal]$Threshold, [string[]]$Stages) {
-    if ($Threshold -lt 0 -or $Threshold -gt 100) { throw "Jev 通过线必须在 0～100 之间。" }
-    # 保存时重新读取配置，保留评分模式、请求参数及其他设置。
-    $settings = Read-JevSettings
-    $settings.Config | Add-Member -MemberType NoteProperty -Name score_threshold -Value ([double]$Threshold) -Force
-    $settings.Config | Add-Member -MemberType NoteProperty -Name document_stages -Value ([string[]]@($Stages)) -Force
-    $json = $settings.Config | ConvertTo-Json -Depth 100
-    $tempPath = $settings.Path + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
-    $backupPath = $settings.Path + "." + [Guid]::NewGuid().ToString("N") + ".bak"
+function Write-JevSettings($Settings) {
+    $json = $Settings.Config | ConvertTo-Json -Depth 100
+    $tempPath = $Settings.Path + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
+    $backupPath = $Settings.Path + "." + [Guid]::NewGuid().ToString("N") + ".bak"
     try {
         [IO.File]::WriteAllText($tempPath, $json + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
-        if ([IO.File]::Exists($settings.Path)) {
-            [IO.File]::Replace($tempPath, $settings.Path, $backupPath)
+        if ([IO.File]::Exists($Settings.Path)) {
+            [IO.File]::Replace($tempPath, $Settings.Path, $backupPath)
             try { [IO.File]::Delete($backupPath) } catch {}
         } else {
-            [IO.File]::Move($tempPath, $settings.Path)
+            [IO.File]::Move($tempPath, $Settings.Path)
         }
     } finally {
         if ([IO.File]::Exists($tempPath)) { [IO.File]::Delete($tempPath) }
     }
 }
 
+function Save-OneClickPreference([bool]$Enabled) {
+    # 单独更新此偏好，避免覆盖同时保存的评分线和步骤配置。
+    $settings = Read-JevSettings
+    $settings.Config | Add-Member -MemberType NoteProperty -Name one_click_processing -Value $Enabled -Force
+    Write-JevSettings $settings
+}
+
+function Save-WorkflowSettings([decimal]$Threshold, [string[]]$Stages) {
+    if ($Threshold -lt 0 -or $Threshold -gt 100) { throw "Jev 通过线必须在 0～100 之间。" }
+    # 保存时重新读取配置，保留评分模式、请求参数及其他设置。
+    $settings = Read-JevSettings
+    $settings.Config | Add-Member -MemberType NoteProperty -Name score_threshold -Value ([double]$Threshold) -Force
+    $settings.Config | Add-Member -MemberType NoteProperty -Name document_stages -Value ([string[]]@($Stages)) -Force
+    $settings.Config | Add-Member -MemberType NoteProperty -Name document_stages_version -Value 2 -Force
+    Write-JevSettings $settings
+}
+
+function Get-SavedWorkflowStages($Settings) {
+    $savedStages = $Settings.Config.PSObject.Properties["document_stages"]
+    if ($null -eq $savedStages -or $savedStages.Value -isnot [array]) { return @() }
+    $knownStages = @($script:allWorkflowStages | Where-Object { $savedStages.Value -contains $_ })
+    $versionProperty = $Settings.Config.PSObject.Properties["document_stages_version"]
+    $version = if ($null -ne $versionProperty) { [int]$versionProperty.Value } else { 0 }
+    if ($version -lt 2) {
+        if ($knownStages -notcontains "manual_company_text") { $knownStages += "manual_company_text" }
+        $Settings.Config | Add-Member -MemberType NoteProperty -Name document_stages -Value ([string[]]$knownStages) -Force
+        $Settings.Config | Add-Member -MemberType NoteProperty -Name document_stages_version -Value 2 -Force
+        try { Write-JevSettings $Settings } catch { }
+    }
+    return [string[]]$knownStages
+}
+
+try {
+    $savedOneClick = (Read-JevSettings).Config.PSObject.Properties["one_click_processing"]
+    if ($null -ne $savedOneClick -and $savedOneClick.Value -is [bool]) {
+        $oneClickProcessingCheck.Checked = [bool]$savedOneClick.Value
+    }
+} catch {
+    # 配置读取失败时沿用默认的预览确认流程。
+}
+$oneClickProcessingCheck.Add_CheckedChanged({
+    try {
+        Save-OneClickPreference $oneClickProcessingCheck.Checked
+    } catch {
+        [void][System.Windows.Forms.MessageBox]::Show($form, ("一键处理偏好未能保存：" + $_.Exception.Message), "设置保存失败", "OK", "Error")
+    }
+})
+
 if ([string]::IsNullOrWhiteSpace($launchDocumentStages)) {
     try {
-        $savedStages = (Read-JevSettings).Config.PSObject.Properties["document_stages"]
-        if ($null -ne $savedStages -and $savedStages.Value -is [array]) {
-            $knownStages = @($script:allWorkflowStages | Where-Object { $savedStages.Value -contains $_ })
-            if ($knownStages.Count -gt 0) {
-                $script:documentStages = $knownStages
-            }
+        $knownStages = @(Get-SavedWorkflowStages (Read-JevSettings))
+        if ($knownStages.Count -gt 0) {
+            $script:documentStages = $knownStages
         }
     } catch {
         # 配置错误由自定义流程弹窗提示；主窗口先沿用完整处理默认项。
@@ -684,11 +725,8 @@ function Show-DocumentWorkflowOptions {
         return
     }
     if (-not $script:hasUnsavedLaunchStages) {
-        $savedStages = $jevSettings.Config.PSObject.Properties["document_stages"]
-        if ($null -ne $savedStages -and $savedStages.Value -is [array]) {
-            $knownStages = @($script:allWorkflowStages | Where-Object { $savedStages.Value -contains $_ })
-            if ($knownStages.Count -gt 0) { $script:documentStages = [string[]]$knownStages }
-        }
+        $knownStages = @(Get-SavedWorkflowStages $jevSettings)
+        if ($knownStages.Count -gt 0) { $script:documentStages = $knownStages }
     }
     $dialog = New-Object System.Windows.Forms.Form
     $dialog.Text = "处理说明和代码 - 自定义流程"

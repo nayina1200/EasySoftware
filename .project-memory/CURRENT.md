@@ -15,13 +15,24 @@
 | 旧日期引擎桥接 | `scripts/date_year_rewriter_bridge.py` |
 | 封面修复、Word 保存与说明 PDF | `scripts/word_manual_pipeline_stable.ps1` |
 | 说明预审与动作计划 | `scripts/process_batch.py` |
+| 登录模块结构识别、图文迁移与编号顺延 | `scripts/manual_login_module.py` + `scripts/manual_login_typography.py`（接入统一页面整理与既有 Word/PDF 管线） |
 | 代码中文注释清理 | `scripts/code_comment_cleaner.py` |
 | 说明阶段测试 | `tests/test_manual_content_stage.py`、`tests/test_manual_cover_rules.py` |
 | 统一入口测试 | `tests/test_combined_document_workflow.py`、`tests/test_unified_document_entry.py` |
 
 行为边界以 `contracts/document-stage.schema.json` 和 `contracts/code-phase.md` 为准。
 
+2026-10-16：正式执行的标题正文 MISMATCH 剪贴板清单标题包含规范化客户名（去掉输入标签末尾件数）；用户反馈的 `easysoftware` DOCX 样本中，该字样是处理后 `word/document.xml` 的首段正文，不是水印对象，输入原稿不存在该段。当前处理脚本没有主动写入该字样的规则，具体来源尚不能从 DOCX 单独确认；反馈样本目录保持只读。
+
+2026-10-16：订单批次的 MISMATCH 剪贴板标题从 `item-xx` 下客户归档目录获取客户名，不再显示批次根目录的时间戳编号；多个客户名以顿号列出。未调整订单目录层级，未运行测试。
+
+2026-10-16（Confirmed）：登录整理及说明字体对齐已完成。普通文本标题与 Word 标题共同定位，已有登录小节保留结构；新建和已有小节说明文字均对齐占优普通正文格式，存疑转人工，一致文件跳过 Word。当前规则以 [登录契约](contracts/login-module.schema.json) 为准，最新验证/速度见 [字体补充证据](evidence/login-font-20261016.md)，首轮结构验证见 [原证据](evidence/login-module-20261016.md)。
+
+2026-10-16：下载后自动开始处理不再强制启用“一键处理”；主界面的一键选项写入 `title_body_config.json`，自动衔接时按已保存状态选择直接处理或预览确认。本次实现尚未运行测试，细节见 [HANDOFF](../HANDOFF.md)。
+
 2026-10-15 当前状态（Confirmed；证据：提交 `f3622a0`、[HANDOFF](../HANDOFF.md)、`tests/test_combined_document_workflow.py`、`tests/test_progress_reporting.py`）：候选版包含订单下载自动衔接、自定义步骤持久化与重新打开恢复、TXT 检查/主要功能字段修复，以及进度文件占用时继续处理的保护。该提交已推送到 `origin/release/jev-shadow-20260928`。完整单元测试共 321 项，320 通过、1 跳过；真实订单与 Word/PDF 完整批次仍待本版本复验。以下按日期保留的旧状态为历史记录。
+
+2026-10-15 后续修正（未提交）：空心线检测支持 Word VML `o:hr` 横线；图片 OCR 只提示以“公司”结尾的行，并在统一 HTML 报告输出命中截图；代码页数处理以 60 页为目标，不再按原 PDF 62 页补长，报告显示实际页数、末页行数及第 60 页行数。为保护代码正文，不裁切原文；自然排版超过 60 页时保留并报告实际页数。本轮未运行测试或 Word/PDF 批次。
 
 2026-09-28：候选版部署封面提速规则 `3.4.27`。空白页修复只复用同一未变动布局的映射；保存后的 Word/PDF 终检仍独立执行。封面末行按需倒扫并保留异常回退，格式化范围限定连续、非表格、非目录封面块。真实速度和全部场景验收待后续模型完成，见 [部署交接](evidence/cover-speed-deployment-20260928.md)。
 
@@ -51,9 +62,20 @@
 - 在真实反馈材料的只读副本生成本地预览：17 件原报告 63 条提示变为 1 条醒目报警、2 条折叠待确认，保留“伊甸之扉•永恒的誓约游戏软件”；名称规则本身合计 61.577 毫秒（不含启动和 DOCX 抽取），模型请求 0。最初管道样本仍检出“瑶池阆苑地下管网数字孪生可视化平台”。这些结果不代表独立留出集准确率。
 - 源材料与用户旧报告未改写；新本地预览、比较记录和回退快照在 `../EasySoftware_项目备份/20261013_name_filter_v2/`。本轮未新增/运行测试套件，也未运行完整 Word/PDF 批次。
 
+## 2026-10-16 图片 OCR 公司名称清除
+
+- 新增独立步骤 `manual_company_text`，初始勾选；旧版已保存的步骤设置升级时默认加入此项，之后取消并保存会持续关闭。扫描 DOCX 全部内嵌图片，识别行末为“公司”（允许尾部标点）的 OCR 框，在输出副本中修复，并在统一 HTML 报告保存前后图对比及命中原文。
+- 复用 `date_year_rewriter_bridge.py` 与批处理 OCR 引擎；公司清除/图片日期扫描阶段的一次图片 OCR 供日期识别和公司定位共同使用，命中框合并后每图只做一次 inpaint。既有抽样相关性 OCR 在同时选择时仍单独预检。预览不扫描全部图片，源材料保持不变。
+- 既有 `company_ocr_alerts` 仍只覆盖抽样图片且仅提示，不修改；这一项选择才执行图片清除。修复质量需人工复核。
+
 ## 2026-10-15 图片 OCR“公司”字样红色提示
 
-- 候选审查版统一报告复用说明书主题相关性/视觉复核阶段已经识别的抽样图片 OCR 文本；识别文本包含连续字样“公司”时，报告顶部附近显示醒目红色警告，并逐项列出项目、图片序号/文件名、命中次数和 OCR 原文行。JSON 同步保存 `company_ocr_alerts`。
+- 候选审查版统一报告复用说明书主题相关性/视觉复核阶段已经识别的抽样图片 OCR 文本；仅当 OCR 行末为“公司”（允许末尾标点）时，报告顶部附近显示醒目红色警告，并逐项列出项目、图片序号/文件名、命中次数和 OCR 原文行。JSON 同步保存 `company_ocr_alerts`。
 - 仍只检查既有 OCR 样本，不增加 OCR 图片数量、模型或视觉调用，不启动 Word，不写入材料；没有选择截图 OCR/视觉检查时会明确写未执行。提醒只供人工复核，不自动通过、拦截或修改项目。
 - OCR 为抽样识别，报告明确警告范围仅限实际抽取的样本；未抽取的图片不能据此断言没有“公司”。既有报告不会自动重写，新生成报告才包含此提示。
 - 候选版 `scripts/combined_document_workflow.py` 已通过 Python 静态语法解析。未运行 OCR 批次或测试套件。修改前快照见 `../EasySoftware_项目备份/20261015_company_ocr/before/`。
+
+## 2026-10-15 说明书分节垂直对齐规则
+
+- 处理输出若只有一个 Word 节，不得将该节设置为垂直居中；封面独占第一节时才允许第一节居中，所有正文节保持顶端对齐。原因：封面格式化可能在分节边界缺失时把唯一正文节一起居中。
+- 实现与审计位于 scripts/word_manual_pipeline_stable.ps1、scripts/repair_manual_structure.ps1 和 scripts/process_batch.py。

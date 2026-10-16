@@ -5,12 +5,16 @@
 )
 $ErrorActionPreference = 'Stop'
 $wdSectionBreakNextPage=2;$wdAlignCenter=1;$wdAlignLeft=0;$wdAlignRight=2
-$wdAlignTabRight=2;$wdTabLeaderSpaces=0;$wdVerticalCenter=1;$wdHeaderPrimary=1
+$wdAlignTabRight=2;$wdTabLeaderSpaces=0;$wdVerticalCenter=1;$wdVerticalTop=0;$wdHeaderPrimary=1
 $wdFieldPage=33;$wdCollapseEnd=0;$wdLines=1;$wdExportPDF=17
 
 function Add-Cover($doc,[string]$title){
-  $doc.Range(0,0).InsertBreak($wdSectionBreakNextPage)
   $text=$title+"`r`r`r使用说明书";$doc.Range(0,0).InsertBefore($text)
+  # Insert the section break after the new cover. A break at position zero can
+  # be ignored by Word for some source templates, leaving the whole document
+  # vertically centered when the cover is formatted.
+  $breakPosition=$text.Length
+  $doc.Range($breakPosition,$breakPosition).InsertBreak($wdSectionBreakNextPage)
   $tr=$doc.Paragraphs.Item(1).Range.Duplicate;$sr=$doc.Paragraphs.Item(4).Range.Duplicate
   foreach($r in @($tr,$sr)){
     try{$r.ListFormat.RemoveNumbers()}catch{}
@@ -19,7 +23,13 @@ function Add-Cover($doc,[string]$title){
   }
   $size=26
   while($size -ge 14){$tr.Font.Size=$size;$sr.Font.Size=$size;$doc.Repaginate();if($tr.ComputeStatistics($wdLines)-le 1){break};$size--}
-  $doc.Sections.Item(1).PageSetup.VerticalAlignment=$wdVerticalCenter
+  # Center only a dedicated first (cover) section. If Word did not create the
+  # section boundary, keep the entire document top-aligned so body pages cannot
+  # inherit the cover alignment.
+  for($sectionIndex=1;$sectionIndex -le $doc.Sections.Count;$sectionIndex++){
+    $doc.Sections.Item($sectionIndex).PageSetup.VerticalAlignment=$wdVerticalTop
+  }
+  if($doc.Sections.Count -gt 1){$doc.Sections.Item(1).PageSetup.VerticalAlignment=$wdVerticalCenter}
   return $size
 }
 

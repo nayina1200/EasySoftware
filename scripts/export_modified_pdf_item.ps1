@@ -56,7 +56,7 @@ namespace EasySoftware {
             }
             $supplementLines = [IO.File]::ReadAllLines([IO.Path]::GetFullPath($SupplementPath), [Text.Encoding]::UTF8)
         }
-        for ($attempt = 0; $attempt -lt 4; $attempt++) {
+        for ($attempt = 0; $attempt -lt 100; $attempt++) {
             $doc.Repaginate()
             $pages = [int]$doc.ComputeStatistics(2)
             $pageLines = 0
@@ -66,9 +66,14 @@ namespace EasySoftware {
                 $pageRange = $doc.Range($start, $end)
                 $pageLines = [int]$pageRange.ComputeStatistics(1)
             }
+            $lastPageLines = 0
+            if ($pages -gt 0) {
+                $lastPageStart = [int]$doc.GoTo(1, 1, $pages).Start
+                $lastPageLines = [int]$doc.Range($lastPageStart, [int]$doc.Content.End).ComputeStatistics(1)
+            }
             if (-not $ensureMinimum -or ($pages -ge $MinimumPages -and $pageLines -ge $MinimumPageLines)) { break }
-            if ($attempt -eq 3) { break }
-            $needed = [Math]::Max(80, ($MinimumPages - $pages + 1) * 75)
+            if ($pages -gt $MinimumPages) { break }
+            $needed = if ($pages -lt ($MinimumPages - 3)) { 20 } else { 1 }
             $remaining = $supplementLines.Length - $supplemented
             if ($remaining -le 0) { break }
             $take = [Math]::Min($needed, $remaining)
@@ -87,12 +92,25 @@ namespace EasySoftware {
             $inserted.ParagraphFormat.SpaceAfter = 0
             $inserted.ParagraphFormat.LineSpacingRule = 0
             $supplemented += $take
-            $doc.Save()
+        }
+        $doc.Repaginate()
+        $pages = [int]$doc.ComputeStatistics(2)
+        $pageLines = 0
+        if ($pages -ge 60) {
+            $start = [int]$doc.GoTo(1, 1, 60).Start
+            $end = if ($pages -ge 61) { [int]$doc.GoTo(1, 1, 61).Start } else { [int]$doc.Content.End }
+            $pageLines = [int]$doc.Range($start, $end).ComputeStatistics(1)
+        }
+        $lastPageLines = 0
+        if ($pages -gt 0) {
+            $lastPageStart = [int]$doc.GoTo(1, 1, $pages).Start
+            $lastPageLines = [int]$doc.Range($lastPageStart, [int]$doc.Content.End).ComputeStatistics(1)
         }
         if ($ensureMinimum -and ($pages -lt $MinimumPages -or $pageLines -lt $MinimumPageLines)) {
             throw "补足后仍不足：共 $pages 页，第 60 页 $pageLines 行"
         }
-        Write-Result @{ status = "OK"; docx = [IO.Path]::GetFullPath($DocxPath); pages = $pages; page_60_lines = $pageLines; supplemented_lines = $supplemented }
+        if ($supplemented -gt 0) { $doc.Save() }
+        Write-Result @{ status = "OK"; docx = [IO.Path]::GetFullPath($DocxPath); pages = $pages; page_60_lines = $pageLines; last_page_lines = $lastPageLines; supplemented_lines = $supplemented }
         exit 0
     }
     try { [void]$doc.Fields.Update() } catch {}
@@ -111,6 +129,11 @@ namespace EasySoftware {
             $end = if ($pages -ge 61) { [int]$doc.GoTo(1, 1, 61).Start } else { [int]$doc.Content.End }
             $pageLines = [int]$doc.Range($start, $end).ComputeStatistics(1)
         }
+        $lastPageLines = 0
+        if ($pages -gt 0) {
+            $lastPageStart = [int]$doc.GoTo(1, 1, $pages).Start
+            $lastPageLines = [int]$doc.Range($lastPageStart, [int]$doc.Content.End).ComputeStatistics(1)
+        }
         if ($pages -lt $MinimumPages -or $pageLines -lt $MinimumPageLines) {
             throw "导出前排版不达标：共 $pages 页，第 60 页 $pageLines 行"
         }
@@ -119,7 +142,7 @@ namespace EasySoftware {
     if (-not (Test-Path -LiteralPath $TemporaryPdfPath -PathType Leaf) -or (Get-Item -LiteralPath $TemporaryPdfPath).Length -eq 0) {
         throw "Word 未生成有效 PDF"
     }
-    Write-Result @{ status = "OK"; docx = [IO.Path]::GetFullPath($DocxPath); pdf = [IO.Path]::GetFullPath($TemporaryPdfPath); pages = $pages; page_60_lines = $pageLines }
+    Write-Result @{ status = "OK"; docx = [IO.Path]::GetFullPath($DocxPath); pdf = [IO.Path]::GetFullPath($TemporaryPdfPath); pages = $pages; page_60_lines = $pageLines; last_page_lines = $lastPageLines }
     exit 0
 } catch {
     Write-Result @{ status = "FAILED"; docx = [IO.Path]::GetFullPath($DocxPath); error = $_.Exception.Message }

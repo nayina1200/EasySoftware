@@ -352,6 +352,55 @@ class CombinedDocumentWorkflowTests(unittest.TestCase):
         self.assertTrue(any(row["option"] == "manual_pdf" for row in report["auto_dependencies"]))
         cover.assert_called_once()
 
+    def test_login_module_is_selectable_and_automatically_exports_pdf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = self.make_materials(base)
+            with mock.patch.object(MODULE, "_build_manual_cover_plan", return_value={"packages": [], "audit_errors": []}) as plan, \
+                    mock.patch.object(MODULE.manual_content_stage, "run_manual_content_stage") as content:
+                result = MODULE.preview(source, base / "work", ROOT, document_stages=("manual_login_module",), skip_topic_mismatch=False)
+            report = json.loads(Path(result["report_json"]).read_text(encoding="utf-8"))
+            page = Path(result["report"]).read_text(encoding="utf-8")
+        self.assertEqual(report["selected_stages"], ["manual_login_module"])
+        self.assertEqual(report["effective_stages"], ["manual_login_module", "manual_pdf"])
+        self.assertTrue(any(row["option"] == "manual_pdf" for row in report["auto_dependencies"]))
+        self.assertIn("整理登录模块", page)
+        content.assert_not_called()
+        plan.assert_called_once()
+
+    def test_login_module_unselected_never_scans_or_adds_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_docx(root / "测试说明.docx", ["正文"])
+            with mock.patch.object(MODULE.manual_login_module, "normalize") as normalize:
+                plan = MODULE._build_manual_cover_plan(root, root / "plan.json", selected_options=("manual_pdf",))
+        normalize.assert_not_called()
+        self.assertNotIn("NORMALIZE_LOGIN_MODULE", plan["packages"][0]["actions"])
+
+    def test_login_module_preview_reports_ambiguity_without_writing_docx(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docx = root / "测试说明.docx"
+            make_docx(docx, ["没有可识别的登录说明"])
+            original = docx.read_bytes()
+            plan = MODULE._build_manual_cover_plan(root, root / "plan.json", selected_options=("manual_login_module", "manual_pdf"))
+            self.assertEqual(docx.read_bytes(), original)
+        package = plan["packages"][0]
+        self.assertIn("NORMALIZE_LOGIN_MODULE", package["actions"])
+        self.assertEqual(package["login_module"]["status"], "NEEDS_MANUAL_REVIEW")
+
+    def test_login_only_unchanged_and_ambiguous_documents_never_open_word(self):
+        for state, expected_status in (("ALREADY_COMPLIANT", "DOCUMENT_PROCESSING_OK"), ("NEEDS_MANUAL_REVIEW", "DOCUMENT_PROCESSING_PARTIAL")):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                source = self.make_materials(base)
+                with mock.patch.object(MODULE.manual_login_module, "normalize", return_value={"status": state, "message": "原稿保持原样"}), \
+                        mock.patch.object(MODULE.process_batch, "inspect_docx", return_value={}), \
+                        mock.patch.object(MODULE.process_batch, "invoke_word_pipeline") as word:
+                    result = MODULE.execute(source, base / "work", ROOT, document_stages=("manual_login_module",), skip_topic_mismatch=False)
+                self.assertEqual(result["status"], expected_status)
+                word.assert_not_called()
+
     def test_report_shows_actual_before_after_year_images(self):
         from PIL import Image, ImageDraw
 

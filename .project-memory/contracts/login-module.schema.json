@@ -1,0 +1,79 @@
+{
+  "contract_version": 2,
+  "status": "Confirmed",
+  "evidence": [
+    "../../scripts/manual_login_module.py",
+    "../../tests/test_manual_login_module.py",
+    "../evidence/login-module-20261016.md",
+    "../../scripts/manual_login_typography.py",
+    "../../tests/test_manual_login_typography.py",
+    "../evidence/login-font-20261016.md"
+  ],
+  "option": "manual_login_module",
+  "label": "整理登录模块",
+  "rule_version": "login-module-v3",
+  "group": "说明书页面整理",
+  "automatic_dependency": "manual_pdf",
+  "existing_saved_selection": "preserve; do not silently enable the new option",
+  "heading_sources": [
+    "Word heading and inherited outline",
+    "Word automatic numbering definitions",
+    "typed Arabic or Chinese heading numbers",
+    "unambiguous plain chapter names and bracketed subsection titles"
+  ],
+  "excluded_headings": [
+    "cover name and label",
+    "TOC entries",
+    "sentences and ordinary step lists"
+  ],
+  "target": "second logical top-level body heading; if only one exists, allow an explicit function or operation chapter; otherwise manual review",
+  "existing_login_section": "preserve structure, heading and images; normalize only instruction typography when it differs from the dominant ordinary body signature",
+  "existing_section_priority": "scan Word and plain-text login heading variants before pairing or relocation; existing login sections with intervening introduction text or multiple images remain intact; uncertain or multiple login headings require manual review and prohibit insertion",
+  "candidate": "one explicit login instruction paragraph plus one uniquely adjacent standalone inline image; allow up to three ordinary empty paragraphs; recognize either original order",
+  "write": "insert a 登录页 subsection before the original first subsection; retain that subsection and all its content; move login paragraph then image under the new heading",
+  "numbering": "continue the same Word numbering chain; increment typed sibling prefixes and dependent descendants only within the target chapter; ambiguous or shared body-list numbering requires manual review",
+  "preservation": "move complete OOXML paragraphs and self-contained bookmarks; verify the expected paragraph multiset and non-document.xml member SHA-256 values before atomic replacement",
+  "unsupported": [
+    "multiple plausible login paragraphs or adjacent images",
+    "login paragraph mixed with headings, tables, fields, tracked edits, or drawings",
+    "cross-paragraph bookmarks",
+    "uncertain target or first subsection",
+    "broken or ambiguous numbering chains",
+    "automatic TOC requiring update"
+  ],
+  "results": [
+    "READY",
+    "APPLIED",
+    "ALREADY_COMPLIANT",
+    "NEEDS_MANUAL_REVIEW",
+    "FAILED"
+  ],
+  "review_policy": "preserve login location on uncertainty; report in red; continue other documents and keep unrelated successful repairs; batch status is partial when an item needs manual handling",
+  "performance": {
+    "preview": "read structure XML only; do not load media",
+    "additional_ocr_or_model_calls": 0,
+    "word": "use existing global lock and batch session; one open/save/export per changed document",
+    "login_only_unchanged": "skip Word and retain existing DOCX/PDF unless PDF export was explicitly requested"
+  },
+  "final_checks": [
+    "re-identify the saved independent login section",
+    "readable PDF with page count equal to Word",
+    "idempotence",
+    "saved login instruction typography matches dominant body reference when resolvable"
+  ],
+  "checkpoint_identity": "include rule_version when the option is selected",
+  "typography": {
+    "target": "login instruction runs only; new and existing standalone login sections",
+    "properties": [
+      "resolved script fonts",
+      "size",
+      "bold",
+      "italic"
+    ],
+    "reference": "dominant homogeneous ordinary body paragraphs, minimum 15 characters, at least 2 paragraphs, no tied first place; exclude cover, headings, TOC, tables, drawings, numbered lists and the login instruction",
+    "resolution": "document defaults, paragraph/character style inheritance and toggles, direct run properties, theme fonts with known language/script",
+    "uncertainty": "report manual review without guessing; may retain a completed safe structural repair",
+    "preservation": "keep text, paragraph properties, headings, images, color and other run attributes",
+    "performance": "reuse heading analysis; XML-only; zero extra Word opens/OCR/model calls"
+  }
+}

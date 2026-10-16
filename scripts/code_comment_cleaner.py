@@ -657,7 +657,8 @@ def _write_report(path: Path, report: dict) -> None:
             page_note = ""
             if document.get("target_pages"):
                 page_note = (
-                    f"；最低/实际页数 {document.get('target_pages')}/{document.get('actual_pages', '未读取')}"
+                    f"；目标/实际页数 {document.get('target_pages')}/{document.get('actual_pages', '未读取')}"
+                    f"；最后一页 {document.get('last_page_lines', '未读取')} 行"
                     f"；第 60 页 {document.get('page_60_lines', '未读取')} 行"
                 )
             rows.append(f"<article><h3>{html.escape(document_name)}</h3><p>状态：{html.escape(document.get('status', ''))}；{count_label} {document.get('translated_comments', document.get('deletions', 0))} 处{html.escape(page_note)}</p><ul>{findings}</ul></article>")
@@ -775,9 +776,15 @@ def ensure_code_page_minimum(docx: Path, app_root: Path, work: Path, minimum_pag
             raise RuntimeError(f"第 60 页行数补足失败：{result.get('error', 'Word 未返回结果')}")
         pages = int(result.get("pages", 0))
         lines = int(result.get("page_60_lines", 0))
+        last_page_lines = int(result.get("last_page_lines", 0))
         if pages < max(60, minimum_pages) or lines < 51:
             raise RuntimeError(f"补足后仍不达标：共 {pages} 页，第 60 页 {lines} 行")
-        return {"pages": pages, "page_60_lines": lines, "supplemented_lines": int(result.get("supplemented_lines", 0))}
+        return {
+            "pages": pages,
+            "page_60_lines": lines,
+            "last_page_lines": last_page_lines,
+            "supplemented_lines": int(result.get("supplemented_lines", 0)),
+        }
     finally:
         supplement_path.unlink(missing_ok=True)
 
@@ -826,15 +833,16 @@ def remove_translated_comment_docx(path: Path, comment: dict[str, Any]) -> bool:
 
 
 def translate_and_fit_docx(path: Path, app_root: Path, work: Path, target_pages: int | None = None) -> dict:
-    """Translate once and enforce the minimum without repeatedly restarting Word."""
+    """Translate once and aim for the standard 60-page code submission."""
     if target_pages is None:
-        target_pages = word_page_count(path, app_root, work)
+        target_pages = 60
     target_pages = max(60, target_pages)
     row = translate_docx(path, app_root)
     metrics = ensure_code_page_minimum(path, app_root, work, target_pages)
     row["target_pages"] = target_pages
     row["actual_pages"] = metrics["pages"]
     row["page_60_lines"] = metrics["page_60_lines"]
+    row["last_page_lines"] = metrics["last_page_lines"]
     row["supplemented_lines"] = metrics["supplemented_lines"]
     row["page_match"] = metrics["pages"] >= target_pages
     row["page_attempts"] = 1
@@ -959,14 +967,17 @@ def run(
                     original_docx_bytes = docx.read_bytes()
                     original_pdf_bytes = original_pdf.read_bytes() if original_pdf and original_pdf.is_file() else None
                     try:
-                        target_pages = pdf_page_count(original_pdf)
-                        row = translate_and_fit_docx(docx, app_root, work, target_pages)
+                        row = translate_and_fit_docx(docx, app_root, work, 60)
                         if row["page_match"]:
                             if progress:
                                 progress.update("导出代码PDF", completed, project_name, active=True, failures=failures, archive=archive.name)
                             success, detail = _export_pdf(docx, app_root, work, row.get("target_pages"))
                             row["pdf_status"] = "REPLACED" if success else "PRESERVED"
                             row["pdf_detail"] = detail
+                            if success:
+                                pdf_pages = pdf_page_count(docx.with_suffix(".pdf"))
+                                if pdf_pages is not None:
+                                    row["actual_pages"] = pdf_pages
                             if not success:
                                 row["status"] = "CLEANED_PDF_FAILED"
                                 failures += 1

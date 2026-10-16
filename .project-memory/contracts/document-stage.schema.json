@@ -3,10 +3,11 @@
   "stage_order": ["title_body_qualification", "manual_content", "manual_page_layout_and_pdf", "code_and_pdf", "txt", "unified_report"],
   "selectable_workflow_options": [
     "match_title_body", "match_software_name", "match_manual_ocr", "match_manual_vision", "match_code", "match_txt",
-    "manual_body_years", "manual_image_dates", "manual_cover", "manual_header", "manual_page_numbers", "manual_pdf",
+    "manual_body_years", "manual_image_dates", "manual_company_text", "manual_login_module", "manual_cover", "manual_header", "manual_page_numbers", "manual_pdf",
     "code_cleanup", "code_pdf", "txt_repair"
   ],
   "manual_header_and_page_number_selection_independent": true,
+  "login_module_contract": "login-module.schema.json",
   "word_com_parallel": false,
   "manual": {
     "sample_fraction": 0.25,
@@ -76,7 +77,8 @@
       "trigger": "apply_after_title_body_qualification_before_remaining_stages",
       "owner_window": "valid_temporary_hidden_window",
       "included_status": "MISMATCH",
-      "text_template": "其余材料正在处理，以下材料不匹配：\\n{name_per_line}",
+      "customer_name_source": "normalized_input_label_without_trailing_item_count",
+      "text_template": "{customer_name}此批订单不匹配如下：\\n{name_per_line}",
       "no_mismatch": "do_not_write_clipboard",
       "preview": "report_only_do_not_write_clipboard",
       "write_failure": "record_in_report_and_continue_processing",
@@ -96,12 +98,24 @@
     "affects_material_selection": false
   },
   "ocr_company_keyword_alert": {
-    "trigger": "OCR sample text contains literal 公司",
+    "trigger": "OCR sample line ends with 公司 after trailing punctuation is removed",
     "input": "existing sampled image OCR output",
     "additional_ocr_or_model_calls": 0,
     "display": "red report warning with project, image, matched OCR lines",
     "selection_effect": "review_only_no_automatic_skip_or_write",
     "coverage": "sampled_images_only"
+  },
+  "ocr_company_text_removal": {
+    "option": "manual_company_text",
+    "default_selected": true,
+    "trigger": "complete OCR text row ends with 公司 after trailing punctuation is removed",
+    "input": "all embedded DOCX images, scanned only when this option is selected",
+    "ocr_reuse": "existing image date bridge and one batched OCR engine; share full-image OCR with date rewriting; existing sampled relevance OCR remains separate when selected",
+    "image_repair": "inpaint the union of matched OCR boxes once per image",
+    "write_scope": "staged output copy only; source material remains untouched",
+    "selection_effect": "independent optional processing step",
+    "report": "before_and_after_image_pairs_with_recognized_text",
+    "review_required": true
   },
   "vision": {
     "protocol": "openai_compatible_chat_completions",

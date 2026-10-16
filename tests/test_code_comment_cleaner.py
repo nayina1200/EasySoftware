@@ -197,12 +197,13 @@ class DocxTests(unittest.TestCase):
             make_docx(path, ["// 中文注释一", "// 中文注释二", "run();"])
             translated = ["first complete translation", "second complete translation"]
             with mock.patch.object(MODULE.local_comment_translation, "translate_comment", side_effect=translated), \
-                    mock.patch.object(MODULE, "ensure_code_page_minimum", return_value={"pages": 61, "page_60_lines": 51, "supplemented_lines": 0}):
+                    mock.patch.object(MODULE, "ensure_code_page_minimum", return_value={"pages": 61, "page_60_lines": 51, "last_page_lines": 20, "supplemented_lines": 0}):
                 result = MODULE.translate_and_fit_docx(path, ROOT, base / "work", target_pages=60)
 
             self.assertEqual(read_lines(path), ["// first complete translation", "// second complete translation", "run();"])
             self.assertTrue(result["page_match"])
             self.assertEqual(result["actual_pages"], 61)
+            self.assertEqual(result["last_page_lines"], 20)
             self.assertEqual(result["target_pages"], 60)
             self.assertEqual(result["removed_translated_comments"], 0)
 
@@ -213,7 +214,7 @@ class DocxTests(unittest.TestCase):
             make_docx(path, ["// 中文注释一", "// 中文注释二", "run();"])
             translated = ["first complete translation", "second complete translation"]
             with mock.patch.object(MODULE.local_comment_translation, "translate_comment", side_effect=translated), \
-                    mock.patch.object(MODULE, "ensure_code_page_minimum", return_value={"pages": 60, "page_60_lines": 51, "supplemented_lines": 0}):
+                    mock.patch.object(MODULE, "ensure_code_page_minimum", return_value={"pages": 60, "page_60_lines": 51, "last_page_lines": 51, "supplemented_lines": 0}):
                 result = MODULE.translate_and_fit_docx(path, ROOT, base / "work", target_pages=60)
 
             self.assertEqual(read_lines(path), [

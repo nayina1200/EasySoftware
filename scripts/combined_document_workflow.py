@@ -22,7 +22,9 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import archive_types
 import code_comment_cleaner
+import document_processing_checkpoint
 import manual_content_stage
+import manual_login_module
 import process_batch
 from software_name_consistency import check_software_names, render_name_warnings
 
@@ -31,7 +33,7 @@ VERSION = 1
 PREVIEW_STATUS = "NEEDS_DOCUMENT_PROCESSING_REVIEW"
 WORKFLOW_OPTION_ORDER = (
     "match_title_body", "match_software_name", "match_manual_ocr", "match_manual_vision", "match_code", "match_txt",
-    "manual_body_years", "manual_image_dates", "manual_ai_hollow_lines", "manual_cover", "manual_header", "manual_page_numbers", "manual_pdf",
+    "manual_body_years", "manual_image_dates", "manual_company_text", "manual_ai_hollow_lines", "manual_login_module", "manual_cover", "manual_header", "manual_page_numbers", "manual_pdf",
     "code_cleanup", "code_pdf", "txt_repair",
 )
 WORKFLOW_GROUPS = {
@@ -53,7 +55,9 @@ WORKFLOW_OPTION_LABELS = {
     "match_txt": "TXT 名称、字段与主题检查",
     "manual_body_years": "检查/修正说明书正文年份",
     "manual_image_dates": "检查/修正说明书图片日期",
+    "manual_company_text": "清除说明书图片中的公司名称（OCR）",
     "manual_ai_hollow_lines": "检测空心线",
+    "manual_login_module": "整理登录模块",
     "manual_cover": "整理说明书封面",
     "manual_header": "整理说明书页眉",
     "manual_page_numbers": "整理说明书页码",
@@ -212,6 +216,28 @@ def _material_root(source: Path, work: Path, app_root: Path, *, expand_order_dow
     raise FileNotFoundError(f"输入不存在：{source}")
 
 
+def _order_download_customer_label(source: Path) -> str:
+    """Read customer names from validated order folders under an order batch root."""
+    if not source.is_dir():
+        return ""
+    labels: list[str] = []
+    seen: set[str] = set()
+    item_dirs = sorted(
+        (path for path in source.iterdir() if path.is_dir() and re.fullmatch(r"item-\d+", path.name, re.IGNORECASE)),
+        key=lambda path: path.name.casefold(),
+    )
+    for item_dir in item_dirs:
+        for customer_dir in sorted(item_dir.iterdir(), key=lambda path: path.name.casefold()):
+            if not customer_dir.is_dir() or not re.search(r"\d+\s*件$", customer_dir.name):
+                continue
+            customer = re.sub(r"_?\d+\s*件$", "", customer_dir.name).rstrip(" _-")
+            key = customer.casefold()
+            if customer and key not in seen:
+                labels.append(customer)
+                seen.add(key)
+    return "、".join(labels)
+
+
 def _is_excluded_project(path: Path, root: Path, excluded: list[dict[str, Any]]) -> bool:
     relative = path.relative_to(root)
     normalized = relative.as_posix().casefold()
@@ -258,8 +284,12 @@ def _mismatch_names(projects: list[dict[str, Any]]) -> list[str]:
     return names
 
 
-def _format_mismatch_clipboard(names: list[str]) -> str:
-    return f"{_MISMATCH_CLIPBOARD_HEADING}\n" + "\n".join(names) if names else ""
+def _format_mismatch_clipboard(names: list[str], customer_label: str = "") -> str:
+    if not names:
+        return ""
+    customer = customer_label.strip().rstrip(" _-")
+    heading = f"{customer}此批订单不匹配如下：" if customer else _MISMATCH_CLIPBOARD_HEADING
+    return f"{heading}\n" + "\n".join(names)
 
 
 def _write_windows_clipboard(text: str) -> None:
@@ -359,8 +389,9 @@ def _write_windows_clipboard(text: str) -> None:
 
 def _copy_mismatch_summary(
     names: list[str], *, apply: bool, clipboard_writer: Any = None,
+    customer_label: str = "",
 ) -> dict[str, Any]:
-    text = _format_mismatch_clipboard(names)
+    text = _format_mismatch_clipboard(names, customer_label)
     result: dict[str, Any] = {
         "names": list(names),
         "text": text,
@@ -1023,7 +1054,15 @@ def _manual_failure_count(report: dict[str, Any], apply: bool) -> int:
     if not apply:
         return 0
     failed_statuses = {"BATCH_FUSED", "BLOCKED_IRRELEVANT", "DATE_REWRITER_UNAVAILABLE"}
-    return sum(project.get("status") in failed_statuses for project in report.get("projects", []))
+    company_failure_statuses = {
+        "UNAVAILABLE", "FAILED", "FAILED_TIMEOUT", "FAILED_INVALID_RESULT",
+        "FAILED_BATCH_INTERRUPTED", "FAILED_INVALID_REQUEST", "UNSUPPORTED_MODE",
+    }
+    return sum(
+        project.get("status") in failed_statuses
+        or str((project.get("company_text_rewrite") or {}).get("status", "")).upper() in company_failure_statuses
+        for project in report.get("projects", [])
+    )
 
 
 def _build_manual_cover_plan(
@@ -1059,6 +1098,10 @@ def _build_manual_cover_plan(
             audit_errors.append({"docx": str(docx), "error": audit_error})
 
         actions: list[str] = []
+        login_module = None
+        if "manual_login_module" in selected:
+            login_module = manual_login_module.normalize(docx, title)
+            actions.append("NORMALIZE_LOGIN_MODULE")
         if "manual_cover" in selected:
             # Word pagination details are deferred to a targeted repair only
             # when the exported PDF screen finds a page anomaly. The PDF screen
@@ -1107,6 +1150,8 @@ def _build_manual_cover_plan(
             "pdf": pdf.name,
             "actions": list(dict.fromkeys(actions)),
         }
+        if login_module is not None:
+            package["login_module"] = login_module
         if package["actions"]:
             packages.append(package)
         else:
@@ -1134,7 +1179,7 @@ def _cover_result_failures(report: dict[str, Any]) -> int:
 def _workflow_dependency_warnings(options: tuple[str, ...]) -> list[dict[str, str]]:
     selected = set(options)
     warnings: list[dict[str, str]] = []
-    if selected.intersection({"manual_body_years", "manual_image_dates", "manual_cover", "manual_header", "manual_page_numbers"}) and "manual_pdf" not in selected:
+    if selected.intersection({"manual_body_years", "manual_image_dates", "manual_company_text", "manual_login_module", "manual_cover", "manual_header", "manual_page_numbers"}) and "manual_pdf" not in selected:
         warnings.append({"option": "manual_pdf", "reason": "说明书 DOCX 有修改风险，但未选择重新导出 PDF；DOCX/PDF 可能不一致"})
     if "code_cleanup" in selected and "code_pdf" not in selected:
         warnings.append({"option": "code_pdf", "reason": "代码 DOCX 有修改风险，但未选择重新导出代码 PDF；DOCX/PDF 可能不一致"})
@@ -1260,7 +1305,7 @@ def _year_image_comparisons(path: Path, report: dict[str, Any]) -> str:
 
 
 def _company_ocr_alerts(manual_report: dict[str, Any], effective_stages: list[str]) -> dict[str, Any]:
-    """Find a literal company marker in OCR text already produced for sampled images."""
+    """Find sampled OCR lines that end with the company suffix."""
     if not {"match_manual_ocr", "match_manual_vision"}.intersection(effective_stages):
         return {"status": "NOT_SELECTED", "scanned_image_count": 0, "warning_count": 0, "matches": []}
     matches: list[dict[str, Any]] = []
@@ -1273,16 +1318,21 @@ def _company_ocr_alerts(manual_report: dict[str, Any], effective_stages: list[st
                 continue
             scanned += 1
             text = str(sample.get("ocr_text") or "")
-            count = text.count("公司")
-            if not count:
+            lines = [
+                line.strip()
+                for line in text.splitlines()
+                if line.strip().rstrip(" \t,，.。;；:：!！?？、)]}）】》」』”’\"'").endswith("公司")
+            ]
+            if not lines:
                 continue
-            lines = [line.strip() for line in text.splitlines() if "公司" in line]
+            relative_path = str(project.get("relative_path") or "")
             matches.append({
                 "project": str(project.get("title") or Path(str(project.get("relative_path", ""))).stem.removesuffix("说明")),
-                "relative_path": str(project.get("relative_path") or ""),
+                "relative_path": relative_path,
+                "document_name": PurePosixPath(relative_path.replace("\\", "/")).name,
                 "image": str(sample.get("image") or ""),
                 "sample_number": int(sample.get("index", -1)) + 1,
-                "occurrence_count": count,
+                "occurrence_count": len(lines),
                 "matched_lines": lines[:8],
             })
     return {
@@ -1294,32 +1344,223 @@ def _company_ocr_alerts(manual_report: dict[str, Any], effective_stages: list[st
     }
 
 
+def _materialize_company_ocr_images(alert: dict[str, Any], manual_report: dict[str, Any], html_path: Path) -> None:
+    """Copy only OCR-alerted images beside the report so a reviewer can inspect them."""
+    if alert.get("status") != "FOUND":
+        return
+    projects = {
+        str(project.get("relative_path") or "").replace("\\", "/"): project
+        for project in manual_report.get("projects", [])
+        if isinstance(project, dict)
+    }
+    assets_dir = html_path.parent / f"{html_path.stem}_company_images"
+    for index, item in enumerate(alert.get("matches", []), 1):
+        project = projects.get(str(item.get("relative_path") or "").replace("\\", "/"), {})
+        source = Path(str(project.get("source") or ""))
+        if not source.is_file():
+            input_root = Path(str(manual_report.get("input_root") or ""))
+            relative_path = str(item.get("relative_path") or "").replace("/", os.sep).replace("\\", os.sep)
+            source = input_root / relative_path
+        image_part = PurePosixPath(str(item.get("image") or "").replace("\\", "/"))
+        if not source.is_file() or image_part.parts[:2] != ("word", "media") or ".." in image_part.parts:
+            item["image_output_status"] = "UNAVAILABLE"
+            continue
+        suffix = Path(image_part.name).suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}:
+            item["image_output_status"] = "UNSUPPORTED_FORMAT"
+            continue
+        try:
+            with zipfile.ZipFile(source) as archive:
+                image_bytes = archive.read(image_part.as_posix())
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"company_alert_{index:03d}{suffix}"
+            (assets_dir / filename).write_bytes(image_bytes)
+            item["output_image"] = f"{assets_dir.name}/{filename}"
+            item["image_output_status"] = "EXPORTED"
+        except (OSError, KeyError, zipfile.BadZipFile):
+            item["image_output_status"] = "UNAVAILABLE"
+
+
+def _materialize_company_text_comparisons(report: dict[str, Any], manual_report: dict[str, Any], html_path: Path) -> None:
+    """Write before/after evidence for company OCR removals beside the HTML report."""
+    if not report.get("applied"):
+        return
+    try:
+        from PIL import Image, ImageChops, ImageOps
+    except ImportError:
+        return
+    source_root = Path(str(report.get("material_root") or "")).resolve()
+    output_root = Path(str(report.get("output") or "")).resolve()
+    if not source_root.is_dir() or not output_root.is_dir():
+        return
+    assets_dir = html_path.with_name(html_path.stem + "_assets")
+    supported = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+    project_changes: list[tuple[dict[str, Any], str, list[dict[str, Any]]]] = []
+    grouped: dict[tuple[str, str], tuple[dict[str, Any], list[dict[str, Any]]]] = {}
+    for project in manual_report.get("projects", []):
+        result = project.get("company_text_rewrite") or {}
+        changes = result.get("changes", []) if isinstance(result, dict) else []
+        for change in changes:
+            if isinstance(change, dict) and change.get("changed_image") and change.get("media_path"):
+                key = (str(project.get("relative_path") or ""), str(change.get("media_path")))
+                if key not in grouped:
+                    grouped[key] = (project, [])
+                grouped[key][1].append(change)
+    project_changes = [(project, media, changes) for (relative, media), (project, changes) in grouped.items()]
+    for index, (project, media_path, changes) in enumerate(project_changes, 1):
+        media_part = PurePosixPath(str(media_path or "").replace("\\", "/"))
+        if media_part.parts[:2] != ("word", "media") or ".." in media_part.parts:
+            for change in changes:
+                change["comparison_status"] = "INVALID_MEDIA_PATH"
+            continue
+        suffix = Path(media_part.name).suffix.lower()
+        relative = Path(str(project.get("relative_path") or ""))
+        original = (source_root / relative).resolve()
+        processed = (output_root / relative).resolve()
+        if suffix not in supported or not original.is_relative_to(source_root) or not processed.is_relative_to(output_root):
+            for change in changes:
+                change["comparison_status"] = "UNAVAILABLE"
+            continue
+        try:
+            with zipfile.ZipFile(original) as before_doc, zipfile.ZipFile(processed) as after_doc:
+                before_bytes = before_doc.read(media_part.as_posix())
+                after_bytes = after_doc.read(media_part.as_posix())
+            with Image.open(io.BytesIO(before_bytes)) as image:
+                before_image = ImageOps.exif_transpose(image).convert("RGB")
+            with Image.open(io.BytesIO(after_bytes)) as image:
+                after_image = ImageOps.exif_transpose(image).convert("RGB")
+            if ImageChops.difference(before_image, after_image).getbbox() is None:
+                for change in changes:
+                    change["comparison_status"] = "NO_PIXEL_DIFFERENCE"
+                continue
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            prefix = f"company-remove-{index:03d}"
+            before_name, after_name = f"{prefix}-before.png", f"{prefix}-after.png"
+            before_image.save(assets_dir / before_name, format="PNG")
+            after_image.save(assets_dir / after_name, format="PNG")
+            for change in changes:
+                change["before_image"] = f"{assets_dir.name}/{before_name}"
+                change["after_image"] = f"{assets_dir.name}/{after_name}"
+                change["comparison_status"] = "READY"
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+            for change in changes:
+                change["comparison_status"] = "UNAVAILABLE"
+
+
+def _company_text_rewrite_html(manual_report: dict[str, Any], applied: bool) -> str:
+    projects = [item for item in manual_report.get("projects", []) if isinstance(item, dict)]
+    selected = bool((manual_report.get("options") or {}).get("rewrite_company_text"))
+    if not selected:
+        return "<section><h2>图片 OCR 公司名称清除</h2><p>本次未选择此处理步骤。</p></section>"
+    if not applied:
+        return "<section><h2>图片 OCR 公司名称清除</h2><p>预览阶段不会扫描全部内嵌图片或修改文件；执行处理后会扫描并生成原图与处理图对比。</p></section>"
+    scanned = sum(int((item.get("company_text_rewrite") or {}).get("scanned_image_count", 0) or 0) for item in projects)
+    candidate_count = sum(int((item.get("company_text_rewrite") or {}).get("candidate_count", 0) or 0) for item in projects)
+    grouped: dict[tuple[str, str], tuple[str, list[dict[str, Any]]]] = {}
+    skipped: list[str] = []
+    for project in projects:
+        result = project.get("company_text_rewrite") or {}
+        status = str(result.get("status", ""))
+        relative = str(project.get("relative_path") or "")
+        if status not in {"CHANGED", "UNCHANGED"} and status not in {"NOT_SELECTED"}:
+            skipped.append(f"{relative or '未命名说明书'}：{status} {result.get('reason', '')}".strip())
+        for change in result.get("changes", []):
+            if not isinstance(change, dict):
+                continue
+            key = (relative, str(change.get("media_path") or ""))
+            if key not in grouped:
+                grouped[key] = (str(project.get("title") or Path(relative).stem.removesuffix("说明")), [])
+            grouped[key][1].append(change)
+    cards = []
+    for (relative, media), (title, changes) in grouped.items():
+        first = changes[0]
+        before_image = html.escape(str(first.get("before_image") or ""), quote=True)
+        after_image = html.escape(str(first.get("after_image") or ""), quote=True)
+        recognized = "<br>".join(html.escape(str(item.get("ocr_text") or "")) for item in changes)
+        if first.get("comparison_status") == "READY" and before_image and after_image:
+            pair = (
+                f"<div class='pair'><figure><a href='{before_image}' target='_blank'><img src='{before_image}' alt='清除前原图'></a><figcaption>清除前原图</figcaption></figure>"
+                f"<figure><a href='{after_image}' target='_blank'><img src='{after_image}' alt='OCR 清除后图片'></a><figcaption>OCR 清除后图片</figcaption></figure></div>"
+            )
+            note = ""
+        else:
+            pair = "<p>前后对比图不可用（{}）。</p>".format(html.escape(str(first.get("comparison_status", "UNAVAILABLE"))))
+            note = ""
+        cards.append(
+            f"<article class='comparison'><h3>{html.escape(title)} · {html.escape(media)}</h3>"
+            f"<p>OCR 命中行：{recognized or '（未返回识别文字）'}</p>{note}{pair}</article>"
+        )
+    summary = f"已扫描 {scanned} 张内嵌图片，识别到 {candidate_count} 行以“公司”结尾的 OCR 文本，修改 {len(grouped)} 张图片。"
+    skipped_html = (
+        "<p>部分项目未执行：" + "；".join(html.escape(item) for item in skipped) + "</p>"
+        if skipped else ""
+    )
+    if not cards:
+        no_change_note = (
+            "识别到候选文字，但没有生成可确认的图片变化，请检查上方项目状态。"
+            if candidate_count else "未识别到符合行末规则的文字。"
+        )
+        return f"<section><h2>图片 OCR 公司名称清除</h2><p>{summary}</p>{skipped_html}<p>{no_change_note}</p></section>"
+    return (
+        f"<section class='company-text-rewrite'><h2>图片 OCR 公司名称清除与前后对比</h2><p>{summary}</p>"
+        "<p>仅清除 OCR 识别行末为“公司”（允许末尾标点）的文字，修复结果需对照原图人工复核。</p>"
+        f"{skipped_html}{''.join(cards)}</section>"
+    )
+
+
 def _company_ocr_alert_html(alert: dict[str, Any]) -> str:
     if alert.get("status") == "NOT_SELECTED":
         return "<section><h2>图片 OCR 公司字样检查</h2><p>本次未选择截图 OCR 检查，未执行此项判断。</p></section>"
     if alert.get("status") != "FOUND":
         return (
-            '<section><h2>图片 OCR 公司字样检查</h2><p>已检查 {} 张抽样图片，OCR 文字中未发现“公司”。'
+            '<section><h2>图片 OCR 公司字样检查</h2><p>已检查 {} 张抽样图片，未发现以“公司”结尾的 OCR 行。'
             '此项只检查当前 OCR 抽样结果。</p></section>'
         ).format(int(alert.get("scanned_image_count", 0)))
     rows = []
     for item in alert.get("matches", []):
         evidence = "<br>".join(html.escape(line) for line in item.get("matched_lines", [])) or "OCR 识别到“公司”"
-        rows.append("<tr><td>{}</td><td>第 {} 张（{}）</td><td>{}</td><td>{}</td></tr>".format(
+        image_path = str(item.get("output_image") or "")
+        image_html = (
+            '<a href="{0}" target="_blank"><img src="{0}" alt="{1}" '
+            'style="max-width:260px;max-height:180px;object-fit:contain"></a>'
+        ).format(html.escape(image_path, quote=True), html.escape(str(item.get("image", "")), quote=True)) if image_path else "原图未能导出"
+        rows.append("<tr><td>{}</td><td>第 {} 张（{}）</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
             html.escape(item.get("project", "")), int(item.get("sample_number", 0)),
-            html.escape(item.get("image", "")), int(item.get("occurrence_count", 0)), evidence,
+            html.escape(item.get("image", "")), image_html,
+            int(item.get("occurrence_count", 0)), evidence,
         ))
     return (
-        '<section class="company-word-alert"><h2>⚠ OCR 图片红色警告：发现“公司”字样</h2>'
-        '<p>在 {} 张抽样图片的 OCR 结果中命中 {} 次，涉及 {} 张图片。请核对截图是否包含公司名称或标识。</p>'
-        '<table><thead><tr><th>项目</th><th>图片</th><th>命中次数</th><th>OCR 原文</th></tr></thead><tbody>{}</tbody></table>'
+        '<section class="company-word-alert"><h2>⚠ OCR 图片红色警告：发现以“公司”结尾的文字</h2>'
+        '<p>在 {} 张抽样图片中发现 {} 行以“公司”结尾的 OCR 文本，涉及 {} 张图片。已输出命中截图供复核。</p>'
+        '<table><thead><tr><th>项目</th><th>命中图片</th><th>截图</th><th>命中行数</th><th>OCR 原文</th></tr></thead><tbody>{}</tbody></table>'
         '<p>这是人工复核提示，不会自动跳过或修改材料。</p></section>'
     ).format(int(alert.get("scanned_image_count", 0)), int(alert.get("warning_count", 0)),
              int(alert.get("matching_image_count", 0)), "".join(rows))
 
 
+def _hollow_line_clipboard(alerts: list[dict[str, Any]]) -> dict[str, Any]:
+    documents: list[str] = []
+    seen: set[str] = set()
+    for item in alerts:
+        relative_path = str(item.get("relative_path") or "").replace("\\", "/")
+        name = str(item.get("document_name") or PurePosixPath(relative_path).name or item.get("name") or "").strip()
+        key = name.casefold()
+        if name and key not in seen:
+            documents.append(name)
+            seen.add(key)
+    return {
+        "documents": documents,
+        "text": "含有空心线的文档如下：\n" + "\n".join(documents) if documents else "",
+    }
+
+
 def _write_report(path: Path, report: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    html_path = path.with_suffix(".html")
+    manual_report = report.get("stages", {}).get("manual", {})
+    if isinstance(manual_report, dict):
+        _materialize_company_ocr_images(report.get("company_ocr_alerts", {}), manual_report, html_path)
+        _materialize_company_text_comparisons(report, manual_report, html_path)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, path)
@@ -1340,9 +1581,16 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
     code_rows = []
     for item in report["stages"]["code"].get("documents", []):
         name = item.get("docx") or item.get("pdf") or "代码材料"
+        page_note = ""
+        if item.get("target_pages"):
+            page_note = (
+                f"；目标/实际页数 {item.get('target_pages')}/{item.get('actual_pages', '未读取')}"
+                f"；最后一页 {item.get('last_page_lines', '未读取')} 行"
+            )
         code_rows.append(
             f"<li><b>{html.escape(str(name))}</b>：{html.escape(str(item.get('status', '')))}；"
             f"预计/实际删除 {int(item.get('deletions', 0))} 处"
+            f"{html.escape(page_note)}"
             f"；代码 PDF：{html.escape(str(item.get('pdf_status', '未选择导出')))}"
             f"{('；' + html.escape(str(item.get('pdf_detail'))) ) if item.get('pdf_detail') else ''}"
             f"{('；' + html.escape(str(item.get('acceptance_error'))) ) if item.get('acceptance_error') else ''}"
@@ -1465,6 +1713,9 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
     cover_evidence = []
     year_comparisons = _year_image_comparisons(path, report)
     cover_result = report["stages"]["manual"].get("cover_result", {})
+    login_module_html = manual_login_module.render_report(
+        cover_result.get("packages", []), "manual_login_module" in report.get("effective_stages", []),
+    )
     for item in cover_result.get("packages", []):
         requested = "、".join(map(str, item.get("actions_requested", item.get("actions", [])))) or "无"
         applied = "、".join(map(str, item.get("actions_applied", []))) or ("执行阶段生成" if not report["applied"] else "无")
@@ -1583,6 +1834,7 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
     semantic_projects = qualification_metrics.get("projects", [])
     name_warnings_html = render_name_warnings(semantic_projects if isinstance(semantic_projects, list) else [])
     company_ocr_alert_html = _company_ocr_alert_html(report.get("company_ocr_alerts", {}))
+    company_text_rewrite_html = _company_text_rewrite_html(manual_report, bool(report.get("applied")))
     not_evaluated_count = sum(
         str(item.get("semantic_status", item.get("status", "NOT_EVALUATED"))).upper() == "NOT_EVALUATED"
         for item in semantic_projects if isinstance(item, dict)
@@ -1637,10 +1889,16 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
         )
     hollow_line_alerts = report.get("ai_hollow_line_alerts", [])
     hollow_line_check_selected = "manual_ai_hollow_lines" in report.get("effective_stages", [])
+    hollow_line_clipboard = report.get("hollow_line_clipboard", {})
+    hollow_line_clipboard_text = str(hollow_line_clipboard.get("text") or "") if isinstance(hollow_line_clipboard, dict) else ""
     hollow_line_alert_html = (
         '<section class="name-alert"><h2>空心线检测报告</h2><p>发现参考图所示的横向空心线，请将以下说明书发给其他人：</p><ul>'
-        + "".join(f"<li><b>{html.escape(str(item.get('name', '')))}</b>：{html.escape(str(item.get('message', '')))}</li>" for item in hollow_line_alerts)
-        + "</ul></section>"
+        + "".join(
+            f"<li><b>{html.escape(str(item.get('document_name') or item.get('name', '')))}</b>：{html.escape(str(item.get('message', '')))}</li>"
+            for item in hollow_line_alerts
+        )
+        + f'</ul><p>可复制的文档清单：</p><textarea id="hollowLineClipboard" readonly rows="6" style="width:100%">{html.escape(hollow_line_clipboard_text)}</textarea>'
+        + '<button type="button" onclick="var t=document.getElementById(\'hollowLineClipboard\');t.focus();t.select();document.execCommand(\'copy\')">复制文档清单</button></section>'
         if hollow_line_alerts else (
             "<section><h2>空心线检测报告</h2><p>未发现参考图所示的横向空心线。</p></section>"
             if hollow_line_check_selected else "<section><h2>空心线检测报告</h2><p>本次未选择此项检测。</p></section>"
@@ -1656,7 +1914,7 @@ def _write_report(path: Path, report: dict[str, Any]) -> None:
 <section><h2>软件名称一致性检查</h2>{name_warnings_html}</section>
 <section><h2>标题与正文语义资格（全部项目）</h2><p>资格模式：{html.escape(str(qualification_metrics.get('mode', 'unknown')))}；Jev 成功返回 Score 后按唯一配置阈值二分为 MATCH/MISMATCH，置信度只用于监控。API、输入或配对故障显示为 NOT_EVALUATED。只有 MATCH 项目进入本次处理副本；MISMATCH 与 NOT_EVALUATED 留在原输入。Jev 的有序等级分数归一为 0–100，阈值初值尚未校准。{html.escape(qualification_summary)}</p>{mismatch_clipboard_html}<table><thead><tr><th>项目名称</th><th>Jev匹配分与置信度</th><th>检测结果</th><th>流程决定</th><th>理由、概率、token、耗时</th></tr></thead><tbody>{''.join(similarity_rows) or '<tr><td colspan="5">未扫描说明书</td></tr>'}</tbody></table></section>
 <section><h2>未纳入项目</h2><p>MISMATCH 与 NOT_EVALUATED 项目不会复制到处理后文件夹，也不会进入后续修改；原始输入保持完整。</p><table><thead><tr><th>项目名称</th><th>流程决定</th><th>理由与正文证据</th></tr></thead><tbody>{''.join(disqualified_rows) or '<tr><td colspan="3">无</td></tr>'}</tbody></table></section>
-{hollow_line_alert_html}{company_ocr_alert_html}<section><h2>说明书相关性、正文年份与图片年份</h2><p>标题正文资格使用配对 TXT 文件名与说明书正文证据；视觉复核仅提供人工审核证据，不参与现有 OCR 拦截及批量熔断。</p><p>{vision_details}</p><table><thead><tr><th>说明书</th><th>处理状态</th><th>标题正文资格</th><th>抽样图片 OCR</th><th>视觉复核</th><th>正文年份</th><th>图片年份</th></tr></thead><tbody>{''.join(manual_rows)}</tbody></table>{''.join(visual_rows)}</section>
+{hollow_line_alert_html}{company_ocr_alert_html}{company_text_rewrite_html}{login_module_html}<section><h2>说明书相关性、正文年份与图片年份</h2><p>标题正文资格使用配对 TXT 文件名与说明书正文证据；视觉复核仅提供人工审核证据，不参与现有 OCR 拦截及批量熔断。</p><p>{vision_details}</p><table><thead><tr><th>说明书</th><th>处理状态</th><th>标题正文资格</th><th>抽样图片 OCR</th><th>视觉复核</th><th>正文年份</th><th>图片年份</th></tr></thead><tbody>{''.join(manual_rows)}</tbody></table>{''.join(visual_rows)}</section>
 <section><h2>TXT 明细（逐件）</h2><p>自动修改仅限主要功能字段；编码、字段名、功能字段以外的文字均保留。</p><table><thead><tr><th>文件</th><th>原编码</th><th>处理结果</th><th>检查结果</th><th>主要功能修改前后</th></tr></thead><tbody>{''.join(txt_rows) or '<tr><td colspan="5">未处理 TXT</td></tr>'}</tbody></table></section>
 <section><h2>图片变化前后对比（待核验）</h2>{year_comparisons}</section>
 <section><h2>封面、页眉、页码与说明书 PDF</h2><p>逐本显示名称来源、名称冲突、Word/PDF 页数、全书疑似空白页复核、修复尝试及项目快照回退情况。点击异常页截图可查看原尺寸。</p><table><thead><tr><th>项目与验收</th><th>计划动作</th><th>实际动作</th><th>仍需处理</th></tr></thead><tbody>{''.join(cover_rows) or '<tr><td colspan="4">未选择页面整理或 PDF 导出</td></tr>'}</tbody></table><div class="pair">{''.join(cover_evidence)}</div></section>
@@ -1898,13 +2156,16 @@ def run(
     if "manual_cover" in effective and "manual_pdf" not in effective:
         effective.add("manual_pdf")
         auto_dependencies.append({"option": "manual_pdf", "reason": "封面修复需要导出并逐页验收与 DOCX 同步的 PDF"})
+    if "manual_login_module" in effective and "manual_pdf" not in effective:
+        effective.add("manual_pdf")
+        auto_dependencies.append({"option": "manual_pdf", "reason": "整理登录模块后需从当前 DOCX 重新导出配套 PDF"})
     needs_qualification_gate = skip_topic_mismatch and bool(effective - {"match_software_name"})
     if needs_qualification_gate and "match_title_body" not in effective:
         effective.add("match_title_body")
         auto_dependencies.append({"option": "match_title_body", "reason": "默认资格门禁需要筛出标题正文主题冲突项目"})
     selected_stages = tuple(option for option in WORKFLOW_OPTION_ORDER if option in effective)
-    manual_content_options = {"match_title_body", "match_manual_ocr", "match_manual_vision", "manual_body_years", "manual_image_dates", "manual_ai_hollow_lines"}
-    manual_format_options = {"manual_cover", "manual_header", "manual_page_numbers", "manual_pdf"}
+    manual_content_options = {"match_title_body", "match_manual_ocr", "match_manual_vision", "manual_body_years", "manual_image_dates", "manual_company_text", "manual_ai_hollow_lines"}
+    manual_format_options = {"manual_login_module", "manual_cover", "manual_header", "manual_page_numbers", "manual_pdf"}
     code_options = {"match_code", "code_cleanup", "code_pdf"}
     txt_options = {"match_txt", "txt_repair"}
     manual_content_selected = bool(effective.intersection(manual_content_options - {"match_title_body"}))
@@ -1919,6 +2180,20 @@ def run(
     require_validation_path(work_path, kind="workspace")
     work_path.mkdir(parents=True, exist_ok=True)
     material_root, label = _material_root(source_path, work_path, app_root_path, expand_order_downloads=expand_order_downloads)
+    checkpoint_file = document_processing_checkpoint.checkpoint_path(work_path)
+    checkpoint_identity = document_processing_checkpoint.build_identity(
+        source_path, material_root, list(requested_options), skip_topic_mismatch,
+    )
+    checkpoint = document_processing_checkpoint.load(checkpoint_file, checkpoint_identity) if apply else None
+    if apply and checkpoint is None:
+        checkpoint = {
+            "version": document_processing_checkpoint.CHECKPOINT_VERSION,
+            "identity": checkpoint_identity,
+            "phase": "PREPARING_OUTPUT",
+            "output": None,
+            "copy_complete": False,
+            "completed_stages": {},
+        }
     all_manuals = list(material_root.rglob("*说明.docx"))
     qualification_requested = "match_title_body" in effective or needs_qualification_gate
     name_check_requested = "match_software_name" in effective
@@ -2047,6 +2322,11 @@ def run(
 
     output_label = _output_customer_label(label, qualified_count, total_project_count)
     customer_label = re.sub(r"\d+\s*件$", "", label).rstrip(" _-") or label.rstrip(" _-")
+    clipboard_customer_label = customer_label
+    if expand_order_downloads:
+        order_customer_label = _order_download_customer_label(material_root)
+        if order_customer_label:
+            clipboard_customer_label = order_customer_label
     recovered_cover_transactions = _recover_processed_outputs(
         source_path, label, customer_label, total_project_count,
     )
@@ -2057,6 +2337,7 @@ def run(
     mismatch_names = _mismatch_names(qualification_report.get("projects", []))
     mismatch_clipboard = _copy_mismatch_summary(
         mismatch_names, apply=apply, clipboard_writer=clipboard_writer,
+        customer_label=clipboard_customer_label,
     )
     qualification_report["mismatch_names"] = mismatch_names
     qualification_report["mismatch_clipboard"] = mismatch_clipboard
@@ -2098,6 +2379,7 @@ def run(
         options["check_image_vision"] = "match_manual_vision" in effective
         options["rewrite_body_years"] = "manual_body_years" in effective
         options["rewrite_image_dates"] = "manual_image_dates" in effective
+        options["rewrite_company_text"] = "manual_company_text" in effective
         options["check_ai_hollow_lines"] = "manual_ai_hollow_lines" in effective
         options["title_body_inputs_by_relative_path"] = title_body_inputs if qualification_requested else None
         options["title_body_mode"] = title_body_mode
@@ -2123,14 +2405,41 @@ def run(
             "audit_errors": cover_plan.get("audit_errors", []),
         }
         cover_failures = len(cover_plan.get("audit_errors", []))
-        if apply and cover_plan.get("packages"):
+        execution_plan_path = cover_plan_path
+        execution_packages = cover_plan.get("packages", [])
+        login_unchanged = []
+        login_only = effective.intersection(manual_format_options) == {"manual_login_module", "manual_pdf"} and "manual_pdf" not in requested_options
+        if apply and login_only:
+            # A PDF is needed only when this sole repair actually changes DOCX.
+            # Existing login sections and ambiguous inputs never open Word.
+            execution_packages = []
+            for item in cover_plan.get("packages", []):
+                result = item.get("login_module", {})
+                if result.get("status") == "READY":
+                    execution_packages.append(item)
+                    continue
+                compliant = result.get("status") == "ALREADY_COMPLIANT" and result.get("typography", {}).get("status") != "NEEDS_MANUAL_REVIEW"
+                login_unchanged.append({
+                    **item, "status": "OK" if compliant else "NEEDS_MANUAL_REVIEW",
+                    "changed": False, "actions_requested": item.get("actions", []), "actions_applied": [],
+                    "failures": [] if compliant else ["登录模块：" + str(result.get("typography", {}).get("message") or result.get("message", "需人工处理"))],
+                    "pdf_export": "DOCX 未修改，配套 PDF 保持原样",
+                })
+            execution_plan_path = work_path / "combined_login_active_plan.json"
+            process_batch.atomic_json(execution_plan_path, {**cover_plan, "packages": execution_packages})
+            cover_report = {**cover_report, "packages": login_unchanged}
+        if apply and execution_packages:
             _publish_progress(progress, "说明书Word封面与PDF处理", 0, failures=cover_failures, active=True)
             cover_report = process_batch.invoke_word_pipeline(
-                processing_root, cover_plan_path, work_path / "combined_cover_result.json",
+                processing_root, execution_plan_path, work_path / "combined_cover_result.json",
                 SCRIPT_DIR / "word_manual_pipeline_stable.ps1", progress=progress, module="说明书处理",
             )
-            cover_failures += _cover_result_failures(cover_report)
             _publish_progress(progress, "说明书Word封面与PDF处理完成", manual_count, failures=cover_failures, active=False)
+        if apply:
+            if login_unchanged and execution_packages:
+                by_key = {(row.get("name"), row.get("folder")): row for row in cover_report.get("packages", []) + login_unchanged}
+                cover_report["packages"] = [by_key[(row.get("name"), row.get("folder"))] for row in cover_plan.get("packages", []) if (row.get("name"), row.get("folder")) in by_key]
+            cover_failures += _cover_result_failures(cover_report)
         manual_failures = (
             (_manual_failure_count(manual_report, apply) if manual_content_selected else 0)
             + int(qualification_report.get("failure_count", 0) or 0)
@@ -2171,6 +2480,16 @@ def run(
     failures = manual_failures + code_failures + int(txt_stage.get("failures", 0))
     status = PREVIEW_STATUS if not apply else ("DOCUMENT_PROCESSING_PARTIAL" if failures else "DOCUMENT_PROCESSING_OK")
     company_ocr_alerts = _company_ocr_alerts(manual_stage, selected_stages)
+    ai_hollow_line_alerts = [
+        {
+            "name": project.get("title") or Path(str(project.get("relative_path", "")).replace("\\", "/")).stem.removesuffix("说明"),
+            "document_name": PurePosixPath(str(project.get("relative_path", "")).replace("\\", "/")).name,
+            "relative_path": project.get("relative_path"),
+            "message": project.get("ai_hollow_line_alert"),
+        }
+        for project in manual_stage.get("projects", []) if project.get("ai_hollow_line_findings")
+    ]
+    hollow_line_clipboard = _hollow_line_clipboard(ai_hollow_line_alerts)
     report = {
         "version": VERSION,
         "created_at": datetime.now().astimezone().isoformat(),
@@ -2203,10 +2522,8 @@ def run(
             **qualification_report,
         },
         "company_ocr_alerts": company_ocr_alerts,
-        "ai_hollow_line_alerts": [
-            {"name": project.get("title") or Path(str(project.get("relative_path", "")).replace("\\", "/")).stem.removesuffix("说明"), "relative_path": project.get("relative_path"), "message": project.get("ai_hollow_line_alert")}
-            for project in manual_stage.get("projects", []) if project.get("ai_hollow_line_findings")
-        ],
+        "ai_hollow_line_alerts": ai_hollow_line_alerts,
+        "hollow_line_clipboard": hollow_line_clipboard,
         "stages": {"manual": manual_stage, "code": code_stage, "txt": txt_stage},
     }
     report_path = work_path / ("combined_document_result.json" if apply else "combined_document_preview.json")

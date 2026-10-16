@@ -1220,9 +1220,21 @@ def inspect_docx(path: Path, title: str, check_login: bool) -> dict:
             and title_props["sizes_half_points"] == label_props["sizes_half_points"]
         )
         style_ok = fonts_ok and sizes_ok and title_props["bold"] is True and label_props["bold"] is True
-        vertically_centered = bool(root.xpath(".//w:sectPr/w:vAlign[@w:val='center']", namespaces=NS))
+        section_properties = root.xpath(".//w:sectPr", namespaces=NS)
+        section_alignments = []
+        for section_property in section_properties:
+            values = section_property.xpath("./w:vAlign/@w:val", namespaces=NS)
+            section_alignments.append(values[0] if values else "top")
+        body_sections_top_aligned = bool(section_alignments) and all(
+            alignment == "top" for alignment in section_alignments[1:]
+        )
+        cover_alignment_valid = bool(section_alignments) and (
+            section_alignments[0] == "top"
+            or (len(section_alignments) > 1 and section_alignments[0] == "center")
+        )
+        vertical_alignment_ok = body_sections_top_aligned and cover_alignment_valid
         layout_ok = (
-            vertically_centered
+            vertical_alignment_ok
             and title_props.get("alignment") == "center"
             and label_props.get("alignment") == "center"
             and label_props.get("spacing_before_points", 0) >= 36
@@ -3099,6 +3111,67 @@ def _cover_pdf_findings(pdf_audit: dict[str, Any], word_pages: int, expected_lab
     return findings
 
 
+def _prepare_login_modules(modified: Path, packages: list[dict]) -> None:
+    """Runs under the existing Word lock, after the original pair is backed up."""
+    import manual_login_module
+
+    for row in packages:
+        if "NORMALIZE_LOGIN_MODULE" not in row.get("actions", []):
+            continue
+        started = time.perf_counter()
+        docx = modified / str(row.get("folder", "")) / str(row.get("docx", ""))
+        row["login_module"] = manual_login_module.normalize(docx, str(row.get("name", "")), apply=True)
+        row["login_module"]["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)
+
+
+def _attach_login_module_results(modified: Path, packages: list[dict], report: dict) -> None:
+    """Keep login ambiguity separate from rollback of unrelated Word repairs."""
+    import manual_login_module
+
+    sources = {(str(row.get("name", "")), str(row.get("folder", ""))): row for row in packages}
+    for result_row in report.get("packages", []):
+        row = sources.get((str(result_row.get("name", "")), str(result_row.get("folder", ""))), {})
+        if "login_module" not in row:
+            continue
+        login = dict(row["login_module"])
+        if login.get("status") == "APPLIED":
+            if result_row.get("snapshot_restored"):
+                login.update(status="NEEDS_MANUAL_REVIEW", changed=False, verified=False, message="Word/PDF 验收失败已恢复原快照，登录模块仍需整理")
+            else:
+                docx = modified / str(row.get("folder", "")) / str(row.get("docx", ""))
+                final = manual_login_module.normalize(docx, str(row.get("name", "")))
+                if final["status"] != "ALREADY_COMPLIANT":
+                    login.update(status="FAILED", verified=False, message="Word 保存后登录小节复检失败：" + final["message"])
+                elif login.get("typography", {}).get("reference") and final.get("typography", {}).get("status") != "ALREADY_COMPLIANT":
+                    login.update(status="FAILED", verified=False, message="Word 保存后登录说明字体格式复检失败")
+                else:
+                    try:
+                        from pypdf import PdfReader
+
+                        pdf = docx.parent / str(row["pdf"]) if row.get("pdf") else docx.with_suffix(".pdf")
+                        pages = len(PdfReader(str(pdf)).pages)
+                        if pages < 1 or pages != int(result_row.get("word_pages", 0)):
+                            raise ValueError(f"Word/PDF 页数不一致：{result_row.get('word_pages', 0)}/{pages}")
+                        login["pdf_pages"] = pages
+                        result_row["pdf_page_count"] = pages
+                        result_row.setdefault("pdf_audit", {})["pages"] = pages
+                        applied = result_row.setdefault("actions_applied", [])
+                        if "NORMALIZE_LOGIN_MODULE" not in applied:
+                            applied.append("NORMALIZE_LOGIN_MODULE")
+                    except Exception as exc:
+                        login.update(status="FAILED", verified=False, message=f"登录整理后的 PDF 验证失败：{exc}")
+        if login.get("typography", {}).get("status") == "NEEDS_MANUAL_REVIEW" and login.get("status") not in {"FAILED", "NEEDS_MANUAL_REVIEW"}:
+            login.update(status="NEEDS_MANUAL_REVIEW", message=login.get("message", "") + "；" + login["typography"]["message"])
+        result_row["login_module"] = login
+        if login.get("status") in {"NEEDS_MANUAL_REVIEW", "FAILED"}:
+            failure = "登录模块：" + str(login.get("message", "需要人工处理"))
+            failures = result_row.setdefault("failures", [])
+            if failure not in failures:
+                failures.append(failure)
+            if result_row.get("status") == "OK":
+                result_row["status"] = "NEEDS_MANUAL_REVIEW"
+
+
 def invoke_word_pipeline(
     modified: Path,
     plan_path: Path,
@@ -3154,6 +3227,7 @@ def invoke_word_pipeline(
         set(row.get("actions", [])) & {
             "ENSURE_COVER_FIRST_PAGE", "AUDIT_ALL_PAGES", "AUDIT_PAGE_LABELS", "ADD_COVER",
             "REPAIR_TRUNCATED_PAGE_LABELS",
+            "NORMALIZE_LOGIN_MODULE",
         }
         for row in packages
     )
@@ -3217,6 +3291,7 @@ def invoke_word_pipeline(
             "-ProgressPhase", module or "Word处理",
         ])
     with word_automation_lock(progress, module):
+        _prepare_login_modules(modified, packages)
         word_pids_before = list_word_pids()
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
@@ -3261,6 +3336,7 @@ def invoke_word_pipeline(
                             (str(row.get("name", "")), str(row.get("folder", ""))),
                             "RESTORED", docx, pdf,
                         )
+            _attach_login_module_results(modified, packages, report)
             if transaction_path is not None:
                 _close_cover_transaction(transaction_path, report_path, report)
             else:
@@ -3466,6 +3542,7 @@ def invoke_word_pipeline(
                     transaction_state = "RESTORED"
                 if transaction_path is not None:
                     _mark_cover_transaction_item(transaction_path, key, transaction_state, docx, pdf)
+        _attach_login_module_results(modified, packages, report)
         if transaction_path is not None:
             _close_cover_transaction(transaction_path, report_path, report)
         else:
@@ -3491,6 +3568,7 @@ def invoke_word_pipeline(
                     (str(row.get("name", "")), str(row.get("folder", ""))),
                     "RESTORED", docx, pdf,
                 )
+    _attach_login_module_results(modified, packages, report)
     if transaction_path is not None:
         _close_cover_transaction(transaction_path, report_path, report)
     else:
