@@ -2,9 +2,10 @@
 
 ## 2026-10-16 — 增加订单下载专属页双击入口
 
-状态：Implemented（启动脚本与目标路径静态检查；未启动 GUI 或连接订单系统）。
+状态：Implemented（复现并修复 CMD 换行问题；本环境无法初始化 PowerShell，未启动 GUI 或连接订单系统）。
 
 - 根目录新增 `启动订单下载专属页.cmd`，调用现有 `scripts/order_material_downloader_gui.ps1`，双击可直接打开订单下载助手。
+- 双击闪退由 CMD 文件使用 LF 换行导致命令被拆坏；转换为 Windows 所需的 CRLF 后，回放确认命令可完整执行，异常提示和暂停逻辑正常。`.gitattributes` 固定 `.cmd/.bat` 使用 CRLF，防止后续检出或创建时复发。
 - 保留现有 `启动EasySoftware.cmd` 主页面入口和主界面内“下载订单资料”入口；没有复制或改造订单下载流程。
 - README 与 HANDOFF 补充入口说明。
 

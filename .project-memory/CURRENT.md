@@ -26,7 +26,7 @@
 
 2026-10-16：订单批次的 MISMATCH 剪贴板标题从 `item-xx` 下客户归档目录获取客户名，不再显示批次根目录的时间戳编号；多个客户名以顿号列出。单客户正式输出名使用 `客户名_匹配件数（共总件数）_已处理_时间戳`，移除 `item-xx` 与客户归档两层包装，保留材料内项目目录；多客户批次仍分客户隔离以避免重名覆盖。未运行测试，详见 [HANDOFF](../HANDOFF.md)。
 
-2026-10-16：新增 `启动订单下载专属页.cmd`，双击直接打开订单资料下载助手，不进入材料处理主窗口；脚本复用 `scripts/order_material_downloader_gui.ps1`，未改下载流程。仅静态检查，未启动 GUI 或连接订单系统。
+2026-10-16：新增 `启动订单下载专属页.cmd`，双击直接打开订单资料下载助手，不进入材料处理主窗口；脚本复用 `scripts/order_material_downloader_gui.ps1`，未改下载流程。闪退根因是 CMD 文件为 LF 换行，已改 CRLF，并在 `.gitattributes` 固定 `.cmd/.bat` 的换行。修复后的终端回放可执行到 PowerShell 并保留错误提示。当前环境被注册表权限阻止初始化 PowerShell，未启动 GUI 或连接订单系统。
 
 2026-10-16（Confirmed）：登录整理及说明字体对齐已完成。普通文本标题与 Word 标题共同定位，已有登录小节保留结构；新建和已有小节说明文字均对齐占优普通正文格式，存疑转人工，一致文件跳过 Word。当前规则以 [登录契约](contracts/login-module.schema.json) 为准，最新验证/速度见 [字体补充证据](evidence/login-font-20261016.md)，首轮结构验证见 [原证据](evidence/login-module-20261016.md)。
 
